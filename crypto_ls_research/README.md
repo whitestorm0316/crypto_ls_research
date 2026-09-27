@@ -10,6 +10,12 @@
 
 ## 0. 快速开始
 
+> **从 git clone 下来的仓库不含数据**：`data_cache/`（305M）与 `artifacts/**`（692M）都在
+> `.gitignore` 里，需要按下面的步骤 1)–2) 重新生成；`artifacts/` 顶层的三份交付文档
+> （`FINDINGS.md` / `OPTIMIZATION_RESULTS.md` / `FINAL_REPORT.md`）随仓库一起带走。
+> **`config/okx_creds.json` 也不在仓库里**（内含真实 API Key）——
+> 复制 `config/okx_creds.example.json` 后自行填写。
+
 ```bash
 # 1) 下载 K 线（约 5.5 万次请求，1.5 小时）
 python -m crypto_ls_research.data.download --dry-run      # 先看预算
