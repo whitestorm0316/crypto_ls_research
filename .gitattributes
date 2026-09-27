@@ -1,0 +1,19 @@
+# 统一换行：仓库内一律存 LF，检出时按平台转换（Windows 变 CRLF）
+* text=auto
+
+# 明确文本类型
+*.py   text
+*.js   text
+*.html text
+*.css  text
+*.md   text
+*.json text
+*.csv  text
+*.yaml text
+*.yml  text
+
+# 二进制（不要做任何换行转换）
+*.png  binary
+*.jpg  binary
+*.pkl  binary
+*.parquet binary

@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>流动性流向 × 趋势 · 横截面研究中台</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <h1>流动性流向 × 趋势</h1>
+      <span>横截面市场中性 · 参数中台</span>
+    </div>
+    <span class="pill ghost" title="下单粒度约束（报告 §16）：OKX 每张合约有固定最小下单额（$0.02–$15.4）。本金低于 $500 时每期约 13 个有效名字只有 9 个落得下，粒度噪声大于信号；$2000–5000 才接近回测口径。">资金门槛 ≥ $500</span>
+    <span id="optPill" class="pill ghost">加载中…</span>
+    <div class="spacer"></div>
+    <span id="queuePill" class="pill ghost" style="display:none"></span>
+    <button id="themeBtn" class="btn ghost sm" title="切换明暗">◑</button>
+    <button id="runBtn" class="btn primary">▶ 运行回测</button>
+  </header>
+
+  <div class="main">
+    <aside class="side" id="side"></aside>
+    <section class="content" id="content">
+      <div class="empty">正在加载参数规格…</div>
+    </section>
+  </div>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
