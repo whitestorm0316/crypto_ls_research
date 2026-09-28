@@ -48,6 +48,10 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, Optional, Tuple
 
+# Same clock as the console -- see `store.display_ts` for why the offset lives
+# there and not here.
+from .store import display_ts
+
 ROOT = os.path.abspath(
     os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".."))
 CONFIG_PATH = os.path.join(ROOT, "config", "notify.json")
@@ -409,6 +413,19 @@ def _num(x: Any) -> str:
         return "—"
 
 
+def _display_ts(v: Any) -> str:
+    """Render a UTC timestamp in the operator's display timezone.
+
+    Thin alias over `store.display_ts`: the push body and the console must show
+    the same clock, so the offset lives in exactly one place.  Everything
+    internal is UTC (the rebalance grid is anchored at UTC 02:00 = Beijing
+    10:00), so a raw `decision_ts` put "信号日 2026-09-29 02:00" on the operator's
+    phone for a decision taken at 10:00 -- an 8-hour error in the one surface
+    read without opening the console.
+    """
+    return display_ts(v)
+
+
 def _pct(x: Any, d: int = 2) -> str:
     try:
         return f"{float(x) * 100:.{d}f}%"
@@ -436,9 +453,12 @@ def format_rebalance(out: dict) -> Tuple[str, str]:
 
     lines = []
     if out.get("decision_ts"):
-        d = str(out["decision_ts"])[:16].replace("T", " ")
-        nxt = str(out.get("next_decision_ts") or "")[:16].replace("T", " ")
-        lines.append(f"信号日 {d}" + (f" · 下次 {nxt}" if nxt else ""))
+        d = _display_ts(out["decision_ts"])
+        nxt = _display_ts(out.get("next_decision_ts"))
+        # 明确写「北京」，否则收件人无法判断这串是本地时间还是 UTC —— 这正是
+        # 「信号日 2026-09-28 15:00」那次误读的来源（15:00 其实是最新 K 线，
+        # 被当成了调仓时点）。
+        lines.append(f"信号日 {d}（北京）" + (f" · 下次调仓 {nxt}（北京）" if nxt else ""))
     if out.get("nav") is not None:
         lines.append(f"净值 {_f(out['nav'])} USDT")
     if out.get("target_gross") is not None:

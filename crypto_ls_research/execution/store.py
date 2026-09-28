@@ -15,6 +15,7 @@ must not be readable as a valid-but-wrong book.
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import threading
@@ -35,6 +36,49 @@ MODES = ("paper", "demo", "live")
 #: rebalance takes tens of seconds; 15 minutes is far above that and still short
 #: enough that a crashed holder cannot wedge the desk for a day.
 REBALANCE_LOCK_TTL = 900.0
+
+# ---------------------------------------------------------------------------
+# Timestamps for humans
+# ---------------------------------------------------------------------------
+# Everything internal is UTC: the panel bar index is UTC, the rebalance grid is
+# anchored at UTC 02:00, and every stored `ts` is `time.time()`.  That is the
+# right storage format and the wrong display format -- the grid anchor is
+# Beijing 10:00, so rendering a raw timestamp put "信号日 2026-09-29 02:00" in the
+# console, the log and the phone push for a decision taken at 10:00 local.
+#
+# China has a single timezone and no DST, so the offset is a constant rather
+# than a tz-database lookup (`zoneinfo` has no data on a bare Windows Python).
+# Display-only: nothing that is persisted, signed or compared may use this.
+DISPLAY_TZ_OFFSET_HOURS = 8.0
+DISPLAY_TZ_LABEL = "北京"
+
+
+def display_ts(v: Any, fmt: str = "%Y-%m-%d %H:%M") -> str:
+    """UTC timestamp (ISO string, `Z`/offset, or epoch seconds) -> display time.
+
+    Unparseable input is returned as-is instead of raising: every caller is a
+    rendering path (log line, progress step, push body) where a bad value must
+    degrade to something readable, never take down the rebalance.
+    """
+    s = v if isinstance(v, str) else None
+    if s is not None:
+        s = s.strip()
+        if not s:
+            return ""
+    try:
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            t = datetime.datetime.fromtimestamp(float(v), tz=datetime.timezone.utc)
+        else:
+            t = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=datetime.timezone.utc)
+        t = t.astimezone(datetime.timezone.utc) + datetime.timedelta(
+            hours=DISPLAY_TZ_OFFSET_HOURS)
+        return t.strftime(fmt)
+    except (TypeError, ValueError, AttributeError, OSError):
+        if s is None:
+            return "" if v is None else str(v)
+        return s[:16].replace("T", " ") if len(s) >= 16 else s
 
 
 class RebalanceBusy(RuntimeError):

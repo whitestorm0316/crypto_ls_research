@@ -654,7 +654,12 @@ def test_a_trade_message_carries_the_numbers_a_person_needs():
     assert "6.35%" in text                       # 换手
     assert "1.109×" in text                      # 目标毛敞口
     assert "54,010" in text                      # 净值
-    assert "2026-09-29 02:00" in text            # 信号日
+    # 信号日按**北京时间**渲染：`decision_ts` 是 UTC 02:00，也就是本地 10:00。
+    # 回测网格锚在 UTC 02:00 = 北京 10:00，所以把 ISO 原样截断会在推送里写出
+    # 一个差 8 小时的时间，而这是操作者不用打开控制台就会看到的那一面。
+    assert "2026-09-29 10:00" in text            # 信号日（北京）
+    assert "2026-10-02 10:00" in text            # 下次调仓（北京）
+    assert "2026-09-29 02:00" not in text        # 不得回退成 UTC 直显
     assert "demo_20260929_020000_ab12cd" in text
 
 
@@ -695,3 +700,58 @@ def test_missing_fields_do_not_produce_the_string_none():
     """Half a payload must degrade to dashes, not to `None` in the message."""
     _, text = format_rebalance({"mode": "demo", "action": "traded"})
     assert "None" not in text and "nan" not in text
+
+
+# ---------------------------------------------------------------------------
+# 北京时间渲染
+# ---------------------------------------------------------------------------
+# 全部内部时间戳都是 UTC：面板 bar 索引是 UTC，回测网格锚在 UTC 02:00，推送里
+# 的 `decision_ts` 也是 UTC。把 ISO 串直接截断，就等于在北京时间 10:00 做出的
+# 决策上写「02:00」——而这恰好是操作者不打开控制台就会看到的那一行。
+
+def test_display_ts_renders_utc_as_beijing():
+    d = store_mod.display_ts
+    assert d("2026-09-29T02:00:00+00:00") == "2026-09-29 10:00"   # 网格锚点
+    assert d("2026-09-28T14:00:00+00:00") == "2026-09-28 22:00"
+    assert d("2026-09-26T23:00:00Z") == "2026-09-27 07:00"        # 跨日
+    assert d(1790560800) == "2026-09-28 10:00"                    # epoch 秒
+
+
+def test_display_ts_does_not_depend_on_the_process_timezone(monkeypatch):
+    """同一时刻在任何机器上必须是同一串 —— 这正是不能依赖本地时区的原因。
+
+    直接用 `time.localtime` / 无 tzinfo 的 `strptime` 就会在 CI（通常 UTC）与
+    本地（UTC+08:00）之间飘 8 小时，而两边都"看起来对"。
+    """
+    original = os.environ.get("TZ")
+
+    def render():
+        return store_mod.display_ts("2026-09-29T02:00:00+00:00")
+
+    first = render()
+    monkeypatch.setenv("TZ", "America/New_York")
+    time.tzset() if hasattr(time, "tzset") else None
+    second = render()
+    if original is None:
+        monkeypatch.delenv("TZ", raising=False)
+    else:
+        monkeypatch.setenv("TZ", original)
+    time.tzset() if hasattr(time, "tzset") else None
+    assert first == second == "2026-09-29 10:00"
+
+
+def test_display_ts_degrades_instead_of_raising():
+    """渲染路径不能因为一个坏字段就抛出 —— 丢一条推送比显示原始串糟得多。"""
+    d = store_mod.display_ts
+    assert d("") == "" and d(None) == ""
+    assert d("garbage") == "garbage"
+    assert d("2026-09-29T02:00:00") == "2026-09-29 10:00"   # 无 tzinfo 视为 UTC
+
+
+def test_a_naked_iso_string_is_still_converted_not_truncated():
+    """最容易漏的形态：后端在某些路径上给出不带偏移的 ISO 串。
+
+    按「无 tzinfo = UTC」解释，所以仍然要 +8 —— 如果实现退化成
+    `s[:16].replace('T',' ')`，这一条会失败。
+    """
+    assert store_mod.display_ts("2026-09-29T02:00:00") == "2026-09-29 10:00"

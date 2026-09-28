@@ -47,7 +47,8 @@ from .okx_private import (MAX_LEVERAGE_BATCH, MAX_ORDER_BATCH, AmbiguousError,
 from .planner import Order, Plan, build_plan, prices_from_cache
 from .signal import LiveTarget, compute_live_target
 from .specs import InstSpec, load_specs
-from .store import RebalanceBusy, Store, new_run_id, rebalance_lock  # noqa: F401
+from .store import (RebalanceBusy, Store, display_ts, new_run_id,  # noqa: F401
+                    rebalance_lock)
 
 #: The v3 verified configuration.  Kept here (not in webapp/spec.py) so the
 #: execution layer does not depend on the UI.
@@ -547,7 +548,7 @@ class LiveEngine:
         t0 = time.time()
         p("① 计算策略目标权重（复用回测引擎，首次约 40–60 秒）")
         target = self.target(force_signal=force_signal)
-        p(f"② 信号日 {target.decision_ts[:16]} · 池宽 "
+        p(f"② 信号日 {display_ts(target.decision_ts)} · 池宽 "
           f"{target.diagnostics.get('n_universe')} · 目标毛敞口 {target.gross:.4f}")
         p("③ 读取账户与持仓")
         acct = self.account()
@@ -611,7 +612,7 @@ class LiveEngine:
         t0 = time.time()
         p("① 计算策略目标权重")
         target = self.target(force_signal=force_signal)
-        p(f"② 信号日 {target.decision_ts[:16]} · 目标毛敞口 {target.gross:.4f}")
+        p(f"② 信号日 {display_ts(target.decision_ts)} · 目标毛敞口 {target.gross:.4f}")
         acct = self.account()
         p(f"③ 净值 {acct['nav']:.2f} USDT · 现有持仓 {len(acct['cur_sz'])} 个")
         plan, acct, px = self.build(target, acct, only=only)

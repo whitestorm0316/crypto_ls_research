@@ -11,6 +11,64 @@ const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) =>
 const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/* ============================== 时间（北京时间） ==============================
+ * 后端所有时间都是 **UTC**：面板 bar 索引是 UTC，`decision_ts` / `exec_ts` /
+ * `newest_bar` 是 UTC ISO 串，订单/成交/日志的 `ts` 是 UTC 秒。回测网格锚在
+ * UTC 02:00 = 北京 10:00，所以「信号日」这类字段按 UTC 直显会整整差 8 小时
+ * —— 一个 10:00 的决策在界面上看起来像凌晨 2:00。
+ *
+ * 这里**不使用** `toLocaleString()`：那个跟浏览器时区走，同一份数据在不同
+ * 机器上会显示成不同时间（CI 上通常是 UTC，看不出和北京时间的差别）。
+ * 改成手工加 8 小时再用 `getUTC*` 取值 —— 绝对时刻 + 固定偏移，结果与
+ * 运行环境无关。中国全境单一时区、无夏令时，+08:00 是常量。
+ * ==================================================================== */
+const CN_OFFSET_MS = 8 * 3600 * 1000;
+const TZ_LABEL = '北京';
+
+/* 任意输入 -> 绝对毫秒数，无法解析时返回 null。
+ * 认三种：epoch 秒（后端 `time.time()`）、epoch 毫秒（图表轴）、ISO 串。 */
+function _ms(v) {
+  if (v == null || v === '') return null;
+  if (typeof v === 'number') {
+    if (!isFinite(v)) return null;
+    return v < 1e11 ? v * 1000 : v;       // < 1e11 视为秒（1e11 秒 ≈ 公元 5138 年）
+  }
+  const s = String(v).trim();
+  if (!s || s === '—') return null;
+  if (/^-?\d+(\.\d+)?$/.test(s)) return _ms(parseFloat(s));
+  const t = Date.parse(s);
+  return isFinite(t) ? t : null;
+}
+
+const _p2 = (n) => String(n).padStart(2, '0');
+
+/* 绝对毫秒 -> 北京时间的各字段。 */
+function _bjParts(ms) {
+  const d = new Date(ms + CN_OFFSET_MS);
+  return {
+    y: d.getUTCFullYear(), mo: d.getUTCMonth() + 1, d: d.getUTCDate(),
+    h: d.getUTCHours(), mi: d.getUTCMinutes(), s: d.getUTCSeconds(),
+  };
+}
+
+/* 统一的显示入口。`w`（宽度）只有三种：
+ *   'min'  -> `2026-09-29 10:00`
+ *   'sec'  -> `2026-09-29 10:00:03`
+ *   'time' -> `10:00:03`
+ *   'date' -> `2026-09-29`
+ * 解析不出来时原样返回输入（`—` 仍是 `—`，空串仍是空串）。 */
+function fmtCN(v, w = 'min') {
+  const ms = _ms(v);
+  if (ms == null) return (v == null || v === '') ? '' : String(v);
+  const p = _bjParts(ms);
+  const day = `${p.y}-${_p2(p.mo)}-${_p2(p.d)}`;
+  if (w === 'date') return day;
+  const hms = `${_p2(p.h)}:${_p2(p.mi)}`;
+  if (w === 'time') return `${hms}:${_p2(p.s)}`;
+  if (w === 'sec') return `${day} ${hms}:${_p2(p.s)}`;
+  return `${day} ${hms}`;
+}
+
 /* ---- 已验收最优（唯一事实来源在 webapp/spec.py） ---- */
 const OPT = {
   cli: { bar: '1h', rebalance_days: 3, asset_class: 'crypto' },
@@ -66,6 +124,9 @@ const fmt = {
   },
   dol: (v) => (v == null || !isFinite(v)) ? '—' : '$' + Math.round(v).toLocaleString('en-US'),
   int: (v) => (v == null || !isFinite(v)) ? '—' : Math.round(v).toLocaleString('en-US'),
+  /* 时间一律走 `fmtCN`（北京时间）。放在这里是为了和其余格式化函数同名前缀，
+   * 让「界面上还有没有裸 toLocaleString」可以用 grep 一次查干净。 */
+  ts: (v, w) => fmtCN(v, w),
   val(v, k) {
     if (v == null) return '—';
     if (k === 'pct') return fmt.pct(v);
@@ -483,7 +544,7 @@ function renderContent() {
     const su = run.summary || {};
     h += `<div class="runrow ${S.selected === run.id ? 'sel' : ''}" data-run="${esc(run.id)}">
       <div class="lbl"><b>${esc(run.label || run.id)}</b>
-        <small>${esc(run.tag)} · ${new Date(run.created * 1000).toLocaleString('zh-CN')}${run.elapsed ? ' · ' + run.elapsed + 's' : ''}${run.n_stage_errors ? ` · <span style="color:var(--danger)">${run.n_stage_errors} 个 stage 报错</span>` : ''}</small></div>
+        <small>${esc(run.tag)} · ${fmtCN(run.created, 'sec')}${run.elapsed ? ' · ' + run.elapsed + 's' : ''}${run.n_stage_errors ? ` · <span style="color:var(--danger)">${run.n_stage_errors} 个 stage 报错</span>` : ''}</small></div>
       <div class="m">${su.sharpe != null ? 'Sharpe ' + fmt.n(su.sharpe) : ''}</div>
       <div class="m">${su.cagr != null ? 'CAGR ' + fmt.pct(su.cagr) : ''}</div>
       <div class="state ${esc(run.status)}"><span class="dot2"></span>${esc(statusText(run.status))}</div>
@@ -831,7 +892,7 @@ function blotterTableHtml() {
     <th class="num">本段毛收益</th><th class="num">本段净收益</th><th class="num">本段资金费</th>
     <th class="num">缩放</th><th class="num">替换</th></tr></thead><tbody>`;
   for (const r of d.rows) {
-    h += `<tr><td class="mono">${esc(r.ts)}</td><td class="mono muted">${esc(r.exec_ts)}</td>
+    h += `<tr><td class="mono">${esc(fmtCN(r.ts))}</td><td class="mono muted">${esc(fmtCN(r.exec_ts))}</td>
       <td class="num">${r.n_universe}</td>
       <td class="num">${r.n_long}</td><td class="num">${r.n_short}</td>
       <td class="num">${fmt.n(r.exposure, 3)}</td>
@@ -873,7 +934,7 @@ function fillsTableHtml() {
   for (const f of d.rows) {
     const up = f.dw > 0;
     h += `<tr class="${f.dust ? 'dustrow' : ''}">
-      <td class="mono muted">${esc(f.exec_ts)}</td>
+      <td class="mono muted">${esc(fmtCN(f.exec_ts))}</td>
       <td class="mono">${esc(f.inst.replace('-USDT-SWAP', ''))}</td>
       <td>${f.side === '多' ? '<span class="tag long">多</span>' : '<span class="tag short">空</span>'}</td>
       <td>${esc(f.action)}</td>
@@ -1247,9 +1308,9 @@ async function drawChart() {
   }
 
   ctx.fillStyle = cMuted; ctx.textAlign = 'left'; ctx.font = '10.5px system-ui';
-  ctx.fillText(new Date(t0).toISOString().slice(0, 10), P.l, H - 7);
+  ctx.fillText(fmtCN(t0, 'date'), P.l, H - 7);
   ctx.textAlign = 'right';
-  ctx.fillText(new Date(t1).toISOString().slice(0, 10), W - P.r, H - 7);
+  ctx.fillText(fmtCN(t1, 'date'), W - P.r, H - 7);
 
   const last = shown[shown.length - 1];
   ctx.fillStyle = cText; ctx.textAlign = 'left'; ctx.font = '11.5px system-ui';
@@ -1826,7 +1887,7 @@ function liveAcctHtml() {
   }
   const ds = st.data_staleness;
   if (ds && ds.stale) {
-    const nb = (ds.newest_bar || '').slice(0, 16).replace('T', ' ');
+    const nb = fmtCN(ds.newest_bar);
     h += `<div class="banner warn" style="margin-top:11px"><div class="ico">!</div><div>
       <b>行情数据已过期</b>
       <p>最新已收盘 bar：<span class="mono">${esc(nb || '未知')}</span>
@@ -1872,9 +1933,9 @@ function liveSignalHtml() {
   const t = pl.target;
   const dg = t.diagnostics || {};
   h += `<div class="kv" style="margin-top:11px">
-    <div class="cell"><div class="k">信号日</div><div class="v" style="font-size:12.5px">${esc((t.decision_ts || '').slice(0, 16).replace('T', ' '))}</div>
-      <div class="s">bar ${esc((t.panel_last_ts || '').slice(0, 16).replace('T', ' '))}</div></div>
-    <div class="cell"><div class="k">下次调仓</div><div class="v" style="font-size:12.5px">${esc((t.next_decision_ts || '').slice(0, 16).replace('T', ' '))}</div>
+    <div class="cell"><div class="k">信号日</div><div class="v" style="font-size:12.5px">${esc(fmtCN(t.decision_ts))}</div>
+      <div class="s">bar ${esc(fmtCN(t.panel_last_ts))}</div></div>
+    <div class="cell"><div class="k">下次调仓</div><div class="v" style="font-size:12.5px">${esc(fmtCN(t.next_decision_ts))}</div>
       <div class="s">${t.rebalance_due ? '<b style="color:var(--danger)">已到调仓日</b>' : `还需 ${Math.max(0, (t.rebalance_bars || 0) - (t.bars_since_decision || 0))} 根 bar`}</div></div>
     <div class="cell"><div class="k">可选池宽</div><div class="v">${dg.n_universe != null ? dg.n_universe : '—'}</div>
       <div class="s">多 ${dg.n_long ?? '—'} / 空 ${dg.n_short ?? '—'}</div></div>
@@ -2041,7 +2102,7 @@ function liveJobHtml() {
     <span class="spacer"></span>
     <button class="btn sm ghost" id="liveJobClear">清空</button></div>`;
   h += `<div class="joblog" id="liveJobLog">` + (j.log || []).map((l) =>
-    `<span class="t">${new Date(l.t * 1000).toLocaleTimeString('zh-CN')}</span>${esc(l.msg)}`).join('\n')
+    `<span class="t">${fmtCN(l.t, 'time')}</span>${esc(l.msg)}`).join('\n')
     + `</div>`;
   if (j.error) h += `<div class="gate block" style="margin-top:8px"><span class="ico2">⛔</span>
     <div><b>${esc(j.error)}</b>${j.trace ? `<pre class="mono" style="max-height:150px;overflow:auto;margin:5px 0 0">${esc(j.trace)}</pre>` : ''}</div></div>`;
@@ -2123,15 +2184,20 @@ function liveAutoHtml() {
     ${cell('通知', (st.notify || {}).ready ? esc((st.notify || {}).provider) : '未启用',
            (st.notify || {}).ready ? '' : '配 config/notify.json 后自动生效')}
     ${cell('下一次决策',
-           `<span class="mono">${esc((last.next_decision_ts || '—').slice(0, 16).replace('T', ' '))}</span>`,
+           `<span class="mono">${esc(fmtCN(last.next_decision_ts) || '—')}</span>`,
            last.rebalance_due ? '<b style="color:var(--danger)">已到调仓日</b>' : '未到')}
+    ${cell('最新已收盘 K 线',
+           `<span class="mono" style="font-size:12.5px">${esc(fmtCN(last.newest_bar) || '未知')}</span>`,
+           last.bar_age_hours != null
+             ? `落后 <b>${fmt.n1(last.bar_age_hours)}</b> 小时 · 这只是数据新鲜度，不是调仓时点`
+             : '数据新鲜度，不是调仓时点')}
   </div>`;
 
   if (last.reason) {
     h += `<div class="muted" style="font-size:11.5px;margin-top:8px">
       最近一次决策：<b>${esc(LIVE_ACTION_LABEL[last.action] || last.action || '—')}</b>
       / ${esc(LIVE_SKIP_LABEL[last.reason] || last.reason)}
-      · 信号日 ${esc((last.decision_ts || '—').slice(0, 16).replace('T', ' '))}
+      · 信号日 ${esc(fmtCN(last.decision_ts) || '—')}
       · 目标毛敞口 ${last.target_gross != null ? fmt.n(last.target_gross, 3) : '—'}</div>`;
   }
 
@@ -2173,7 +2239,7 @@ function liveHistHtml() {
     let h = `<div class="tblwrap"><table class="ordtable"><thead><tr><th>时间</th><th>合约</th><th>方向</th>
       <th>动作</th><th>张数</th><th>名义额</th><th>状态</th><th>clOrdId</th></tr></thead><tbody>`;
     for (const r of rows) {
-      h += `<tr><td class="mono">${r.ts ? new Date(r.ts * 1000).toLocaleString('zh-CN') : '—'}</td>
+      h += `<tr><td class="mono">${r.ts ? fmtCN(r.ts, 'sec') : '—'}</td>
         <td class="mono">${esc(r.instId)}</td>
         <td class="${r.side === 'buy' ? 'long' : 'short'}">${r.side === 'buy' ? '买' : '卖'}</td>
         <td>${esc(r.action || '')}</td><td class="num">${fmt.n(r.sz, 5)}</td>
@@ -2188,7 +2254,7 @@ function liveHistHtml() {
       <th>成交价</th><th>张数</th><th>名义额</th><th>费用</th></tr></thead><tbody>`;
     for (const r of rows) {
       const not = (r.notional != null && isFinite(r.notional)) ? Number(r.notional) : null;
-      h += `<tr><td class="mono">${r.ts ? new Date(r.ts * 1000).toLocaleString('zh-CN') : '—'}</td>
+      h += `<tr><td class="mono">${r.ts ? fmtCN(r.ts, 'sec') : '—'}</td>
         <td class="mono">${esc(r.instId)}</td>
         <td class="${r.side === 'buy' ? 'long' : 'short'}">${r.side === 'buy' ? '买' : '卖'}</td>
         <td class="num">${fmt.n(r.px, 6)}</td><td class="num">${fmt.n(r.sz, 5)}</td>
@@ -2200,7 +2266,7 @@ function liveHistHtml() {
   let h = `<div class="tblwrap"><table class="ordtable"><thead><tr><th>时间</th><th>动作</th><th>净值</th>
     <th>订单</th><th>名义额</th><th>覆盖率</th><th>权重误差</th><th>拦截</th></tr></thead><tbody>`;
   for (const r of rows) {
-    h += `<tr><td class="mono">${r.ts ? new Date(r.ts * 1000).toLocaleString('zh-CN') : '—'}</td>
+    h += `<tr><td class="mono">${r.ts ? fmtCN(r.ts, 'sec') : '—'}</td>
       <td>${esc(r.action || '')}${r.dry_run ? ' <span class="muted">(预演)</span>' : ''}</td>
       <td class="num">${fmt.dol(r.nav)}</td>
       <td class="num">${r.n_ok}/${r.n_orders}</td>
@@ -2291,8 +2357,7 @@ function limitsStateHtml() {
       它们对<b>本次计划</b>已经生效，但<b>不会</b>在重启后保留——点「保存限额」写入磁盘。</p>
       </div></div>`;
   }
-  const ts = saved && saved._saved
-    ? new Date(saved._saved * 1000).toLocaleString('zh-CN') : null;
+  const ts = saved && saved._saved ? fmtCN(saved._saved, 'sec') : null;
   return `<p class="desc" style="margin:9px 0 0;color:var(--ok)">
     ✓ 已保存${ts ? `（${esc(ts)}）` : ''}到 <span class="mono">${esc(path)}</span>，
     重启控制台后仍然生效。这份是 <b>${esc(LIVE_LABEL[L.mode] || L.mode)}</b> 模式专用的

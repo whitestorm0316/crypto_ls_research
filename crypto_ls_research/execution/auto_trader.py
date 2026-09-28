@@ -77,7 +77,7 @@ from .credentials import kill_switch_on
 from .engine import DEFAULT_SIGNAL, LiveEngine
 from .limits import LiveLimits, live_confirm_phrase
 from .notify import Notifier, notify_for
-from .store import RebalanceBusy, Store
+from .store import RebalanceBusy, Store, display_ts
 
 #: Below this the loop would hammer the exchange on a typo (`--interval 0.01`).
 MIN_INTERVAL_MIN = 1.0
@@ -465,12 +465,12 @@ class AutoTrader:
                 # audit log and the console -- not buried in a debug field.
                 self._log(
                     f"⚠ 执行窗口 {self._window_label()} 触发强制调仓："
-                    f"信号日 {target.decision_ts[:16]}，信号已旧 {age_h:.1f} 小时。"
+                    f"信号日 {display_ts(target.decision_ts)}，信号已旧 {age_h:.1f} 小时。"
                     f"本次下单偏离回测网格（锚点 UTC02:00/北京10:00），"
                     f"策略绩效不再是 v3 口径。")
             else:
-                self._log(f"未到调仓日（信号日 {target.decision_ts[:16]}，"
-                          f"下次 {target.next_decision_ts[:16]}），不下单")
+                self._log(f"未到调仓日（信号日 {display_ts(target.decision_ts)}，"
+                          f"下次 {display_ts(target.next_decision_ts)}），不下单")
                 if self.exec_window_min is not None:
                     self._log(f"     执行窗口：{self._window_label()}（当前不在窗口内）")
                 return self._finish(out, "skip", "not_due", t0)
@@ -478,7 +478,7 @@ class AutoTrader:
         if forced:
             self._write_state(True)
         else:
-            self._log(f"到调仓日（信号日 {target.decision_ts[:16]}），"
+            self._log(f"到调仓日（信号日 {display_ts(target.decision_ts)}），"
                       f"目标毛敞口 {target.gross:.3f}，提交执行…")
         # `force=False` always: the only thing `force` does is silence the
         # off-schedule warning, and we have already decided we are on-schedule.
