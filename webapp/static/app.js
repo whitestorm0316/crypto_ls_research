@@ -23,9 +23,10 @@ const OPT = {
 
 const S = {
   spec: null, presets: [], bundles: [], lib: {}, baseline: null,
+  acceptance: null, headline: null,
   cli: {}, ov: {}, stages: ['base', 'charts'], bundleId: 'fast', preset: 'custom',
   warnings: [], runs: [], active: null, queued: [],
-  selected: null, detail: null, logOffset: 0, logTimer: null, chartTimer: null,
+  selected: null, detail: null, logOffset: 0, logTimer: null, logRunId: null, chartTimer: null,
   /* 回测曲线：视图（净值 / 对数净值 / 回撤）+ 每条曲线的显隐 */
   chartView: 'equity', chartOff: {}, chartOffInit: false,
   equity: {}, equityErr: {},
@@ -35,10 +36,14 @@ const S = {
   attrSort: 'net',
   /* 交易台 */
   live: {
-    meta: null, status: null, statusErr: null, plan: null, planErr: null,
+    meta: null, status: null, statusErr: null, statusLoading: false,
+    plan: null, planErr: null,
     job: null, jobTimer: null, mode: 'paper', sub: 'orders',
     orders: null, fills: null, runs: null, sel: {}, confirm: '', force: false,
     limits: null, limitsOpen: false, credsOpen: false, busy: false, note: '',
+    /* 磁盘上保存的那份限额（`null` = 从未保存过）与「表单被改过」的标记。
+     * 两者一起决定限额面板要不要提示「有未保存的改动」。 */
+    savedLimits: null, limitsTouched: false,
   },
 };
 
@@ -77,6 +82,7 @@ async function boot() {
     const d = await r.json();
     S.spec = d.spec; S.presets = d.presets; S.bundles = d.bundles;
     S.lib = d.lib_defaults || {}; S.baseline = d.baseline; S.optimalTag = d.optimal_tag;
+    S.acceptance = d.acceptance || null; S.headline = d.optimal_headline || null;
   } catch (e) {
     $('#content').innerHTML = `<div class="banner danger"><div class="ico">!</div>
       <div><b>无法连接本地服务</b><p>${esc(e)}</p></div></div>`;
@@ -320,6 +326,38 @@ function diffFromOptimal() {
   return out;
 }
 
+/* ---- 「当前最优」指标的唯一来源 ----
+ * 这些数字以前在源码里写死了三份（横幅、pill 的 title、年度表下面那句），
+ * 而 KPI 卡与年度对比用的是服务端按产物实算的 `S.baseline`。数据一重建，
+ * 同一个页面就同时宣称 Sharpe 1.937 和 1.758 —— 页头自相矛盾。
+ * 现在一律走这里，取不到就明说「基线数据缺失」，绝不回退到某个记忆里的数字。 */
+function baselineHeadline() {
+  const b = S.baseline;
+  if (!b || b.sharpe == null) return null;
+  return {
+    sharpe: fmt.n(b.sharpe),
+    cagr: fmt.pct(b.cagr),
+    mdd: fmt.pct(b.mdd),
+    tag: b.tag || S.optimalTag || '基线',
+    span: (b.start && b.end) ? `${b.start} → ${b.end}` : '',
+  };
+}
+
+function baselineHeadlineText() {
+  const h = baselineHeadline();
+  if (!h) return '基线数据缺失（未找到已验收配置的产物）';
+  return `Sharpe ${h.sharpe} / CAGR ${h.cagr} / MDD ${h.mdd}`;
+}
+
+/* 验收条数由服务端按产物现算（见 server.py::_acceptance）。以前这里写死
+ * 「验收 16/16 通过」，而本机只重跑过 base 阶段，大部分判据根本没有产物可读。 */
+function acceptanceText() {
+  const a = S.acceptance;
+  if (!a || !a.n_gate) return '验收判据暂不可评估';
+  const head = `验收 ${a.n_pass}/${a.n_gate} 通过`;
+  return a.complete ? head : `${head}（证据不全，完整需 ${a.expected} 项）`;
+}
+
 function updateOptPill() {
   const el = $('#optPill');
   if (!el) return;
@@ -327,7 +365,7 @@ function updateOptPill() {
   if (!n) {
     el.className = 'pill ok';
     el.textContent = '已验收最优 v3 ✓';
-    el.title = 'Sharpe 1.937 / CAGR 25.09% / MDD −12.72%';
+    el.title = baselineHeadlineText();
   } else {
     el.className = 'pill warn';
     el.textContent = `偏离最优 ${n} 处`;
@@ -355,10 +393,20 @@ function renderContent() {
 
   const diffs = diffFromOptimal();
   if (!diffs.length) {
-    h += banner('ok', '✓', '当前参数 = 已验收最优配置（v3）',
-      `Sharpe <b>1.937</b> / CAGR <b>25.09%</b> / 最大回撤 <b>−12.72%</b>，
-       验收 16/16 通过。因子子集 = range_pos + hitrate；换手预算 20%；单名上限 20%；
-       1h 频率、3 天调仓、crypto 池。直接点右上角即可复现。`);
+    const bh = baselineHeadline();
+    if (bh) {
+      h += banner('ok', '✓', '当前参数 = 已验收最优配置（v3）',
+        `Sharpe <b>${esc(bh.sharpe)}</b> / CAGR <b>${esc(bh.cagr)}</b> / 最大回撤 <b>${esc(bh.mdd)}</b>，`
+        + `${esc(acceptanceText())}。<br><span class="muted">指标来自 <span class="mono">`
+        + `${esc(bh.tag)}</span> 的产物（${esc(bh.span)}），随数据重建自动更新，不再写死在页面里。`
+        + `</span> 因子子集 = range_pos + hitrate；换手预算 20%；单名上限 20%；
+           1h 频率、3 天调仓、crypto 池。直接点右上角即可复现。`);
+    } else {
+      h += banner('warn', '⚠', '当前参数 = 已验收最优配置（v3）',
+        `<b>${esc(baselineHeadlineText())}</b>——页头的指标全部取自产物，`
+        + `而 <span class="mono">artifacts/${esc(S.optimalTag || 'v3')}/tables/01_headline_metrics.json</span> 读不到。`
+        + `先跑一次回测把基线产物生成出来，这里就会显示真实数值。`);
+    }
   } else {
     h += banner('info', 'i', `当前参数与最优配置有 ${diffs.length} 处不同`,
       `只改这些的话，跑完可以直接看 Δ 列。<br>` +
@@ -544,7 +592,7 @@ function yearTable(d) {
   }
   h += `<p class="desc" style="margin:7px 0 0">2026 是结构性离群段（CAGR +6.2σ、波动 +5.8σ，
     平均总敞口反而更低、日胜率不变），对外应拿 2021–2025 的分年 Sharpe 校准预期，
-    而不是全样本的 <b>1.937</b>。年度 Sharpe 按本项目口径：先日频求和，再 ×√365。</p>`;
+    而不是全样本的 <b>${esc(fmt.n((S.baseline || {}).sharpe))}</b>。年度 Sharpe 按本项目口径：先日频求和，再 ×√365。</p>`;
   return h;
 }
 
@@ -1258,7 +1306,36 @@ function isTyping(el) {
   return !NON_TYPING_INPUT.has(String(el.type || 'text').toLowerCase());
 }
 
+/* 运行列表的渲染签名。
+ * 刻意**不含 `elapsed`** —— 它每轮都在变，带上它「没变化」就永远不成立。
+ * 也不含 `summary` 的浮点全精度：只取展示用的量级即可。 */
+function runsSig() {
+  const parts = S.runs.map((r) => {
+    const su = r.summary || {};
+    return [r.id, r.status, r.n_stage_errors || 0,
+            su.sharpe == null ? '' : su.sharpe.toFixed ? su.sharpe.toFixed(6) : su.sharpe,
+            su.cagr == null ? '' : su.cagr.toFixed ? su.cagr.toFixed(6) : su.cagr].join('~');
+  });
+  return parts.join('|') + '#' + (S.selected || '');
+}
+
+/* `setInterval` 不会等上一轮结束。`pollRuns()` 里有 `await fetch`，一旦某轮慢过
+ * 2.5s（交易所慢、或正好在重建一张 300 行的表），tick 就会叠起来：多个
+ * `renderContent()` 并发跑，互相把对方的 DOM 覆盖掉 —— 表现就是"抖一下、卡一下、
+ * 偶尔点了没反应"。互斥锁比调长间隔好：正常情况下节奏不变，只在真堵住时跳过。 */
+let runsInFlight = false;
+
 async function pollRuns() {
+  if (runsInFlight) return;
+  runsInFlight = true;
+  try {
+    await pollRunsOnce();
+  } finally {
+    runsInFlight = false;
+  }
+}
+
+async function pollRunsOnce() {
   try {
     const d = await (await fetch('/api/runs')).json();
     S.runs = d.runs || []; S.active = d.active; S.queued = d.queued || [];
@@ -1275,6 +1352,17 @@ async function pollRuns() {
     startLog(S.detail);
   }
   if (isTyping(document.activeElement)) return;   /* 用户正在输入：别动 DOM */
+
+  /* `renderContent()` 会把整个 #content（含交易台里最多 300 行的历史表）拆掉重建。
+   * 以前这里每 2.5s 无条件重建一次，于是：
+   *   · 滚动位置被反复重置 —— 表现为"滑着滑着页面自己跳走"；
+   *   · 用户正按下的那个按钮在 mousedown 与 click 之间被换掉，click 落空 ——
+   *     表现为"子标签点了没反应"。
+   * 现在只在列表真的变了（或有任务在跑，那时用户就是要看进度）时才重建。
+   * 日志面板不依赖这里：它由 startLog() 自己的定时器增量追加。 */
+  const sig = runsSig();
+  if (!S.active && !S.queued.length && sig === S.runsSig) return;
+  S.runsSig = sig;
   renderContent();
 }
 
@@ -1301,9 +1389,14 @@ async function selectRun(id) {
 }
 
 function startLog(d) {
-  clearInterval(S.logTimer);
   const live = () => d.status === 'running' || d.status === 'queued';
   if (!live()) { stopLog(); return; }
+  /* 这里被 pollRuns() 每 2.5s 调一次，而它原来是「先 clearInterval 再 setInterval」：
+   * 于是 1.1s 的日志轮询每 2.5s 被推倒重建一次，节奏被拉成 1.1s/1.4s 交替，正在
+   * 飞行中的那一次也被丢掉。只有换了被观察的对象才需要重启。 */
+  if (S.logTimer && S.logRunId === d.id) return;
+  stopLog();
+  S.logRunId = d.id;
   S.logTimer = setInterval(async () => {
     try {
       const lp = await (await fetch(`/api/runs/${encodeURIComponent(S.selected)}/log?offset=${S.logOffset}`)).json();
@@ -1315,7 +1408,7 @@ function startLog(d) {
     } catch { /* ignore */ }
   }, 1100);
 }
-function stopLog() { clearInterval(S.logTimer); S.logTimer = null; }
+function stopLog() { clearInterval(S.logTimer); S.logTimer = null; S.logRunId = null; }
 
 function logHtml(txt) {
   return esc(txt)
@@ -1352,7 +1445,7 @@ const LIVE_LIMIT_FIELDS = [
   ['max_gross_notional', '总名义额上限 (USD)', '绝对上限，不随本金缩放——唯一能挡住「连错账户」的闸门'],
   ['max_order_notional', '单笔上限 (USD)', '任何一笔订单超过即整批拒绝'],
   ['max_orders', '单次订单笔数上限', '超出通常意味着 target 或持仓读数有误'],
-  ['max_turnover_frac', '单次换手上限 (× 净值)', '策略每期只换 20% 毛敞口'],
+  ['max_turnover_frac', '单次换手硬上限 (× 净值)', '超过即整批拒绝。它是闸门，不是节流——每期实际换多少由账户区的「换手预算（策略节流）」决定'],
   ['max_adv_participation', '单笔 ADV 参与率上限', '冲击成本会显著偏离模型'],
   ['min_nav_usd', '净值下限 (USD)', '低于此值下单粒度噪声大于信号'],
   ['max_nav_usd', '净值上限 (USD，可空)', '连到不打算交易的账户时挡住自己'],
@@ -1420,7 +1513,15 @@ async function ensureLive() {
   if (L.statusErr) return;
   try {
     L.meta = await liveApi('/api/live/meta');
-    if (L.meta.limits_default) L.limits = Object.assign({}, L.meta.limits_default);
+    /* 优先用**磁盘上保存的**限额；只有从未保存过时才退回出厂默认。
+     * 以前这里无条件写 `limits_default`，而服务端的限额又只活在内存里，
+     * 于是「保存了重启不生效」——两个半张的缺陷叠在一起。 */
+    const savedAll = L.meta.limits_saved || {};
+    const saved = savedAll[L.mode] || null;
+    if (saved || L.meta.limits_default) {
+      L.limits = Object.assign({}, saved || L.meta.limits_default);
+    }
+    L.savedLimits = saved;
     if (L.limits && L.meta.default_signal) {
       const sg = L.meta.default_signal;
       L.signal = L.signal || sg;
@@ -1436,13 +1537,25 @@ async function ensureLive() {
 
 async function liveLoadStatus() {
   const L = S.live;
+  /* 这一步是三次签名请求（config / positions / balance），实测约 1.4s。调用点包括
+   * 进入交易台、切模式、以及**每一个动作之后**（保存限额、熔断、对账、重置…）。
+   * 以前这里全程不动 DOM，看起来就是"点了没反应"。先把「正在读取账户…」画出来，
+   * 让等待可见 —— 这不会让它更快，但会让它不像卡死。 */
+  L.statusLoading = true;
+  livePaintAll();
   try {
     const st = await liveApi('/api/live/status?mode=' + encodeURIComponent(L.mode));
     L.status = st;
     L.statusErr = null;
     if (st.limits && !L.limitsTouched) L.limits = Object.assign({}, st.limits);
+    /* 磁盘上那份始终要刷新：它和表单值不一样时，面板要能说出「有未保存的改动」。
+     * 以前 `L.limitsTouched` 一旦置 true 就再不复位，于是切模式后新模式的限额
+     * 永远不会被读进来，限额表只剩一排空格子。 */
+    L.savedLimits = st.limits_saved || null;
   } catch (e) {
     L.statusErr = String(e && e.message || e);
+  } finally {
+    L.statusLoading = false;
   }
 }
 
@@ -1506,7 +1619,10 @@ function preserveUi(fn) {
   const again = document.getElementById(id);
   if (!again) return;
   try {
-    again.focus();
+    /* preventScroll：focus() 默认会把元素滚进视口，而这里恰好在整块 #content
+     * 重建之后恢复焦点——那一下滚动会把用户刚滑到的位置顶走。
+     * 老浏览器不认 options 对象，所以失败后退回无参调用。 */
+    try { again.focus({ preventScroll: true }); } catch (e2) { again.focus(); }
     if (pos != null && again.setSelectionRange) again.setSelectionRange(pos, pos);
   } catch (e) { /* 只关心输入焦点，失败不影响功能 */ }
 }
@@ -1514,7 +1630,17 @@ function preserveUi(fn) {
 function livePaintAll() {
   preserveUi(() => {
     const L = S.live;
-    const put = (id, html) => { const el = document.getElementById(id); if (el) el.innerHTML = html; };
+    const put = (id, html) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      /* #liveHist 最多 300 行 × 8 列。livePaintAll() 有三十来个调用点，其中大多数
+       * 跟历史表毫无关系（切子标签、改杠杆、勾一行…），却每次都把整张表重建一遍：
+       * 白做一遍解析与布局，还会把用户的滚动位置弹回去。内容没变就不写。
+       * 元素每次被 renderContent() 重建时是新对象，所以这个标记不需要手动失效。 */
+      if (el.__lastHtml === html) return;
+      el.innerHTML = html;
+      el.__lastHtml = html;
+    };
     put('liveMode', liveModeHtml());
     put('liveAcct', liveAcctHtml());
     put('liveSignal', liveSignalHtml());
@@ -1522,6 +1648,12 @@ function livePaintAll() {
     put('livePlan', livePlanHtml());
     put('liveJob', liveJobHtml());
     put('liveHist', liveHistHtml());
+    /* 子标签高亮必须在这里同步。以前它只出现在 liveSkeleton() 里，而
+     * livePaintAll() 只重绘 #liveHist —— 于是点「成交」表格换了、按钮还亮在
+     * 「订单」上，看起来就是"切不过去"。 */
+    const seg = document.getElementById('liveSeg');
+    if (seg) $$('.segbtn', seg).forEach((b) =>
+      b.classList.toggle('on', b.dataset.lsub === L.sub));
     const pm = document.getElementById('livePlanMeta');
     if (pm) pm.textContent = L.plan && L.plan.plan
       ? `${L.plan.plan.n_orders} 笔 · ${fmt.dol(L.plan.plan.order_notional)}`
@@ -1618,6 +1750,11 @@ const posNotional = (p) => (p && p.notional != null && isFinite(p.notional)
 function liveAcctHtml() {
   const L = S.live;
   const st = L.status;
+  /* 加载中且还没有本模式的账户快照时，宁可说「正在读取」也不要画一排「—」：
+   * 一排 0/— 看起来像"账户是空的"，比空白更容易被当真。 */
+  if (L.statusLoading && !(st && st.account)) {
+    return `<div class="empty">正在读取账户…（模拟盘约 1 秒）</div>`;
+  }
   if (!st) return `<div class="empty">正在读取账户…</div>`;
   if (st.account_error) {
     return `<div class="banner warn"><div class="ico">!</div><div><b>账户不可用</b>
@@ -1628,16 +1765,32 @@ function liveAcctHtml() {
   const nav = a.nav;
   const gross = (a.positions || []).reduce((s, p) => s + (posNotional(p) || 0), 0);
   const missing = (a.positions || []).filter((p) => posNotional(p) == null).length;
-  const used = store.turnover_used_today;
+  /* 「换手」在本页有两个长得很像的数字，必须说清是哪一个（用户报的「对不上」）：
+   *   · `turnover_budget` = **策略每期的节流预算**，来自信号参数
+   *     `execution.max_daily_turnover`（v3 = 20%）。它决定每期只执行目标变动的百分之几。
+   *   · 风控限额表里的 `max_turnover_frac` = **硬闸门**，超过就整批拒绝，不参与节流。
+   * 改限额不会、也不该改这里的预算——以前两处都不说来源，只列数字，看起来就是矛盾。
+   *
+   * 「已用」必须取**按 UTC 日重置后**的值。`store.turnover_used_today` 曾经是原始值
+   * （不重置），于是日切之后面板显示的是昨天的用量，而规划器按空预算下单。
+   * 现在两处同源，并把「剩余」写出来，让「预算 − 已用 = 剩余」在页面上自洽。 */
+  const used = st.turnover_used_today != null ? st.turnover_used_today
+    : store.turnover_used_today;
   const budget = st.turnover_budget;
+  const remain = (budget != null && used != null) ? Math.max(0, budget - used) : null;
+  const usedNote = [
+    used != null ? `已用 ${fmt.pct(used, 1)}` : null,
+    remain != null ? `剩余 ${fmt.pct(remain, 1)}` : null,
+    store.turnover_stale ? '（UTC 日已切换，上一日用量已归零）' : null,
+  ].filter(Boolean).join(' · ');
   let h = `<div class="kv">
     <div class="cell"><div class="k">净值</div><div class="v">${fmt.dol(nav)}</div>
       ${a.unrealised != null ? `<div class="s">未实现 ${fmt.dol(a.unrealised)}</div>` : ''}</div>
     <div class="cell"><div class="k">持仓数</div><div class="v">${(a.positions || []).length}</div>
       <div class="s">${esc(a.pos_mode || '')}</div></div>
-    <div class="cell"><div class="k">今日换手预算</div>
+    <div class="cell"><div class="k">换手预算（策略节流）</div>
       <div class="v">${budget != null ? fmt.pct(budget, 0) : '不限制'}</div>
-      <div class="s">已用 ${used != null ? fmt.pct(used, 1) : '—'}</div></div>
+      <div class="s" title="来自信号参数 execution.max_daily_turnover，按 UTC 日重置。它不是风控限额表里的「单次换手硬上限」——那个是超过即整批拒绝的闸门。">${esc(usedNote)}</div></div>
     <div class="cell"><div class="k">行情来源</div><div class="v" style="font-size:12.5px">${esc(st.prices_source || '—')}</div>
       <div class="s">持仓名义 ${fmt.dol(gross)}${gross > 0 && nav > 0 ? ` (${fmt.n(gross / nav, 3)}×)` : ''}</div></div>
   </div>`;
@@ -1749,11 +1902,17 @@ function livePlanHtml() {
   </div>`;
 
   if (p.turnover_scale < 0.999) {
+    /* 这一段里的数字同样全部实算：回测实际毛敞口取 baseline，原始目标取本次计划。
+     * 以前写死「0.472 / 1.032 / 2.2 倍 / Sharpe 1.937」，四个数字都会随数据重建失效。 */
+    const gAvg = (S.baseline || {}).gross_avg;
+    const rawTgt = (p.raw_target_gross || 0) / (p.nav || 1);
+    const mult = (gAvg && gAvg > 0) ? rawTgt / gAvg : null;
+    const sharpeTxt = fmt.n((S.baseline || {}).sharpe);
     h += `<div class="banner info" style="margin-top:11px"><div class="ico">i</div><div>
       <b>本次只执行目标变动的 ${esc(fmt.pct(p.turnover_scale))}</b>
       <p>目标变动需换手 ${esc(fmt.n(p.turnover_wanted, 2))}× 净值，而策略每期预算只有 ${esc(fmt.pct(p.turnover_budget, 0))}。
-      这不是 bug：回测里 v3 的<b>实际持仓毛敞口均值 0.472</b>，而原始目标均值 <b>1.032</b>——
-      报告的 Sharpe 1.937 来自被预算拖住的账。照原始目标下单会让敞口变成 2.2 倍。</p></div></div>`;
+      这不是 bug：回测里 v3 的<b>实际持仓毛敞口均值 ${esc(fmt.n(gAvg))}</b>，而本次原始目标 <b>${esc(fmt.n(rawTgt))}</b>——
+      报告的 Sharpe ${esc(sharpeTxt)} 来自被预算拖住的账${mult == null ? '' : `。照原始目标下单会让敞口变成 ${esc(mult.toFixed(1))} 倍`}。</p></div></div>`;
   }
   for (const w of (p.warnings || [])) {
     h += `<div class="gate warn" style="margin-top:7px"><span class="ico2">⚠</span><div>${w}</div></div>`;
@@ -1794,6 +1953,22 @@ function livePlanHtml() {
     h += p.skips.slice(0, 12).map((s) =>
       `<span class="chip" title="${esc(s.detail)}">${esc(s.instId)} · ${esc(s.reason)}</span>`).join(' ');
     h += `</p>`;
+  }
+
+  /* --- 本次实际消耗的换手预算 ---
+   * 计划值与实际扣减值分开显示。以前无论订单是否被受理都按计划值扣满，
+   * 一次全部被拒的下单也会把当日额度吃光，下一次的金额就被缩到几美分，
+   * 而页面上没有任何东西解释这件事。 */
+  const rec = pl.record;
+  if (rec && rec.turnover_charged != null) {
+    const planned = rec.turnover_frac;
+    const charged = rec.turnover_charged;
+    const uncharged = (planned != null) ? planned - charged : 0;
+    h += `<p class="desc" style="margin:9px 0 0">本次实际扣减当日换手预算
+      <b>${esc(fmt.pct(charged))}</b>${planned == null ? ''
+    : `（计划 ${esc(fmt.pct(planned))}${uncharged > 1e-9
+      ? `，<b>${esc(fmt.pct(uncharged))}</b> 因订单未被受理而未扣` : ''}）`}。
+      <span class="muted">只有交易所受理的订单才占用预算：被拒的订单没有成交，不该吃掉额度。</span></p>`;
   }
 
   /* --- 执行区 --- */
@@ -1864,7 +2039,9 @@ function liveHistHtml() {
   if (rows == null) return `<div class="empty">正在读取…</div>`;
   if (!rows.length) return `<div class="empty">暂无记录</div>`;
   if (key === 'orders') {
-    let h = `<table class="ordtable"><thead><tr><th>时间</th><th>合约</th><th>方向</th>
+    /* limit=300，所以这里必须包 .tblwrap 限高：否则三张表能撑到 8000px，
+     * 而 pollRuns 每 2.5s 重建一次整页，滚动位置就一直在跳。 */
+    let h = `<div class="tblwrap"><table class="ordtable"><thead><tr><th>时间</th><th>合约</th><th>方向</th>
       <th>动作</th><th>张数</th><th>名义额</th><th>状态</th><th>clOrdId</th></tr></thead><tbody>`;
     for (const r of rows) {
       h += `<tr><td class="mono">${r.ts ? new Date(r.ts * 1000).toLocaleString('zh-CN') : '—'}</td>
@@ -1875,10 +2052,10 @@ function liveHistHtml() {
         <td>${esc(r.state || '')}${r.error ? ` <span class="muted" title="${esc(r.error)}">!</span>` : ''}</td>
         <td class="mono muted">${esc(r.clOrdId || '')}</td></tr>`;
     }
-    return h + `</tbody></table>`;
+    return h + `</tbody></table></div>`;
   }
   if (key === 'fills') {
-    let h = `<table class="ordtable"><thead><tr><th>时间</th><th>合约</th><th>方向</th>
+    let h = `<div class="tblwrap"><table class="ordtable"><thead><tr><th>时间</th><th>合约</th><th>方向</th>
       <th>成交价</th><th>张数</th><th>名义额</th><th>费用</th></tr></thead><tbody>`;
     for (const r of rows) {
       const not = (r.notional != null && isFinite(r.notional)) ? Number(r.notional) : null;
@@ -1889,9 +2066,9 @@ function liveHistHtml() {
         <td class="num">${not == null ? '<span class="muted" title="缺 ctVal，不估算">—</span>' : fmt.dol(not)}</td>
         <td class="num">${fmt.n(r.fee, 4)}</td></tr>`;
     }
-    return h + `</tbody></table>`;
+    return h + `</tbody></table></div>`;
   }
-  let h = `<table class="ordtable"><thead><tr><th>时间</th><th>动作</th><th>净值</th>
+  let h = `<div class="tblwrap"><table class="ordtable"><thead><tr><th>时间</th><th>动作</th><th>净值</th>
     <th>订单</th><th>名义额</th><th>覆盖率</th><th>权重误差</th><th>拦截</th></tr></thead><tbody>`;
   for (const r of rows) {
     h += `<tr><td class="mono">${r.ts ? new Date(r.ts * 1000).toLocaleString('zh-CN') : '—'}</td>
@@ -1903,7 +2080,7 @@ function liveHistHtml() {
       <td class="num">${fmt.n(r.weight_err, 5)}</td>
       <td>${(r.violations || []).filter((v) => v.sev === 'block').length || '—'}</td></tr>`;
   }
-  return h + `</tbody></table>`;
+  return h + `</tbody></table></div>`;
 }
 
 /* 杠杆单独一块，因为它是最容易被误用的旋钮。
@@ -1915,6 +2092,11 @@ function liveLeverageHtml(lim) {
   const cur = st.leverage;                     // 将要请求的杠杆（null = 不改）
   const cap = (lim.max_leverage != null) ? lim.max_leverage : (st.leverage_cap);
   const td = st.td_mode || 'cross';
+  /* 这两个数字以前是写死的「0.47× / 20%」，数据一重建就会自相矛盾（和页头横幅
+   * 那次是同一个缺陷）。毛敞口取 baseline 的实算均值，换手取当前生效的预算。 */
+  const gAvg = (S.baseline || {}).gross_avg;
+  const gAvgTxt = (gAvg != null && isFinite(gAvg)) ? `${fmt.n(gAvg, 2)}×` : '—';
+  const turnTxt = (st.turnover_budget != null) ? fmt.pct(st.turnover_budget, 0) : '不限制';
   let h = `<div class="split" style="margin-top:12px;border-top:1px solid var(--border);padding-top:11px">
       <div><b style="font-size:12.5px">保证金模式</b></div>
       <select id="lvTdMode" class="liveinput" style="width:150px">
@@ -1933,7 +2115,7 @@ function liveLeverageHtml(lim) {
       每次下单的结果会写进运行记录，设置失败会明确提示，不会静默跳过。</p>
     <div class="banner warn" style="margin-top:9px"><div class="ico">!</div><div>
       <b>提高杠杆不放大收益</b>
-      <p>敞口由目标权重与换手预算决定（毛敞口约 0.47× 净值、每期换手 20%），
+      <p>敞口由目标权重与换手预算决定（毛敞口约 ${esc(gAvgTxt)} 净值、每期换手 ${esc(turnTxt)}），
       <b>与账户杠杆无关</b>。只把杠杆从 1× 调到 5× 而敞口不变，
       收益完全不变，只是维持保证金降到 1/5 —— <b>等于用零预期收益换来更高的爆仓风险</b>。</p>
       <p style="margin-top:5px">真正想放大收益，要调的是<b>毛敞口上限</b>
@@ -1942,6 +2124,50 @@ function liveLeverageHtml(lim) {
       <b>4× → −42.9%</b>，10× → −77.2%，且交易成本同步放大（4× 时 8.3%/yr）。</p>
     </div></div>`;
   return h;
+}
+
+/* 「保存了没生效」的另一半原因是：没有任何东西告诉你保存落在了哪。
+ * 这里把「表单当前值」与「磁盘上那份」逐字段比一遍，三种状态各自说清楚：
+ *   从未保存 → 现在用的是出厂默认，重启后仍会回到这里；
+ *   有差异   → 点名是哪几个字段还没保存（点了「生成计划」并不等于保存）；
+ *   已保存   → 报出文件路径与时间戳，用户能自己去核对。 */
+function limitsDiff(saved) {
+  const cur = S.live.limits || {};
+  const keys = LIVE_LIMIT_FIELDS.map((f) => f[0])
+    .concat(['max_gross_frac', 'require_rebalance_due']);
+  if (!saved) return { never: true, changed: true, keys: keys };
+  const norm = (v) => (v == null || v === '' ? null : v);
+  const changed = keys.filter((k) => norm(cur[k]) !== norm(saved[k]));
+  return { never: false, changed: changed.length > 0, keys: changed };
+}
+
+function limitsStateHtml() {
+  const L = S.live;
+  const st = L.status || {};
+  const saved = L.savedLimits || st.limits_saved || null;
+  const d = limitsDiff(saved);
+  const path = st.limits_path || `artifacts/live/${L.mode}/limits.json`;
+  if (d.never) {
+    return `<div class="banner warn" style="margin-top:9px"><div class="ico">!</div><div>
+      <b>这些限额从未保存过</b>
+      <p>现在显示的是<b>出厂默认值</b>。重启控制台后会回到这里——点「保存限额」才会写入
+      <span class="mono">${esc(path)}</span>，之后重启仍然生效。</p></div></div>`;
+  }
+  if (d.changed) {
+    return `<div class="banner warn" style="margin-top:9px"><div class="ico">!</div><div>
+      <b>有未保存的改动</b>
+      <p>${d.keys.length === LIVE_LIMIT_FIELDS.length + 2
+        ? '表单里的值与磁盘上那份不同'
+        : `以下字段与已保存的值不同：<span class="mono">${esc(d.keys.join('、'))}</span>`}。
+      它们对<b>本次计划</b>已经生效，但<b>不会</b>在重启后保留——点「保存限额」写入磁盘。</p>
+      </div></div>`;
+  }
+  const ts = saved && saved._saved
+    ? new Date(saved._saved * 1000).toLocaleString('zh-CN') : null;
+  return `<p class="desc" style="margin:9px 0 0;color:var(--ok)">
+    ✓ 已保存${ts ? `（${esc(ts)}）` : ''}到 <span class="mono">${esc(path)}</span>，
+    重启控制台后仍然生效。这份是 <b>${esc(LIVE_LABEL[L.mode] || L.mode)}</b> 模式专用的
+    ——绝对金额上限与账户规模有关，三个模式各存一份。</p>`;
 }
 
 function liveLimitsHtml() {
@@ -1962,6 +2188,7 @@ function liveLimitsHtml() {
       <label class="split" style="gap:5px;font-size:12.5px">
         <input type="checkbox" id="lvRequireDue" ${lim.require_rebalance_due ? 'checked' : ''}> 仅调仓日允许下单</label>
     </div>
+    ${limitsStateHtml()}
     ${liveLeverageHtml(lim)}
     <p class="desc" style="margin:9px 0 0">重置会计<b>归档</b>本地账本（<span class="mono">archive/&lt;时间戳&gt;/</span>），
       不删除任何东西——账本是证据。只保留最近 10 份快照，只影响 <span class="mono">paper</span> 模式。</p>
@@ -1981,6 +2208,14 @@ function liveBind() {
     L.mode = b.dataset.lmode;
     L.plan = null; L.sel = {}; L.job = null; L.orders = null; L.fills = null; L.runs = null;
     L.limits = null; L.credsOpen = false;
+    /* 限额是**按模式**存的（绝对金额上限与账户规模有关），所以切模式时
+     * 「被编辑过」的标记也要复位，否则新模式的限额读不进来。 */
+    L.limitsTouched = false; L.savedLimits = null;
+    /* 上一个模式的账户快照必须丢掉：liveLoadStatus() 要 ~1.4s，这期间若还留着它，
+     * 账户面板就会拿 paper 的净值（$1,000）去顶 demo 的位置（$54,000）——
+     * 一个看得见、却完全属于另一个账户的数字。凭据状态与 mode 无关，保留。 */
+    const keepCreds = L.status && L.status.creds;
+    L.status = keepCreds ? { creds: keepCreds } : null;
     await liveLoadStatus();
     await liveLoadHist();
     livePaintAll();
@@ -2034,7 +2269,11 @@ function liveBind() {
     livePaintAll();
   });
   const ls = $('#liveLimitsSave');
-  if (ls) ls.onclick = liveSaveLimits;
+  /* 包一层：`liveSaveLimits` 的第一个参数是 `requireDue`，而 onclick 会把
+   * MouseEvent 传进来（恒真）——于是「取消勾选『仅调仓日允许下单』再点保存」
+   * 会把 true 又存回去，勾选框静默失效。和「保存了不生效」是同一类缺陷：
+   * 界面上改得动、存下去却不是那个值。 */
+  if (ls) ls.onclick = () => liveSaveLimits();
   const lrd = $('#lvRequireDue');
   if (lrd) lrd.onchange = () => liveSaveLimits(lrd.checked);
   const ltm = $('#lvTdMode');
@@ -2266,6 +2505,13 @@ async function liveSaveLimits(requireDue) {
     lim[k] = (v === '') ? null : Number(v);
     if (v !== '' && !isFinite(lim[k])) lim[k] = L.limits ? L.limits[k] : null;
   });
+  if (requireDue == null) {
+    /* 没显式传就读**屏幕上的勾选框**：保存按钮送出的必须是用户此刻看到的状态。
+     * 以前 onclick 直接把 MouseEvent 当成了这个参数（恒真），于是「取消勾选后再点
+     * 保存」会把 true 又存回去——勾选框静默失效。 */
+    const box = $('#lvRequireDue');
+    if (box) requireDue = !!box.checked;
+  }
   if (requireDue != null) lim.require_rebalance_due = !!requireDue;
   L.limits = lim; L.limitsTouched = true;
   try {
@@ -2274,7 +2520,12 @@ async function liveSaveLimits(requireDue) {
       body: JSON.stringify({ mode: L.mode, limits: lim }),
     });
     if (d.error) throw new Error(d.error);
-    L.note = '限额已生效';
+    /* 保存成功后把「被编辑过」的标记清掉：服务端现在就是这份值的权威来源，
+     * 之后的 status 刷新应当能覆盖表单。以前它一直是 true，切模式后新模式的
+     * 限额就再也读不进来了。 */
+    L.limitsTouched = false;
+    L.savedLimits = d.limits || lim;
+    L.note = `限额已保存到 ${d.saved_to || '本机'}（重启后仍生效）`;
     await liveLoadStatus();
   } catch (e) { L.note = String(e && e.message || e); }
   livePaintAll();

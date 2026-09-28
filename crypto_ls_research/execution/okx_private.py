@@ -47,7 +47,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Deque, Dict, List, Optional, Sequence
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from ..data.okx_client import RateLimiter
 
@@ -93,6 +93,7 @@ ERROR_TEXT: Dict[str, str] = {
     "51010": "当前账户模式不支持该操作",
     "51011": "重复的 clOrdId",
     "51020": "委托张数必须大于 0",
+    "51087": "该币种在本场所已下架（模拟盘通常不提供该合约）",
     "51121": "该合约无持仓可平",
     "51131": "可用保证金不足",
     "51169": "当前不存在该币种的持仓",
@@ -106,6 +107,33 @@ def describe_code(code: str, msg: str = "") -> str:
     if t:
         return f"{t}（{code}: {msg}）" if msg else f"{t}（{code}）"
     return f"OKX 错误 {code}: {msg}"
+
+
+#: Envelope codes that mean "the request-level code is not the answer -- the
+#: rows below carry the real one".  `1` = all operations failed, `2` = bulk
+#: operation *partially* successful.  Both are normal, expected answers from the
+#: batch endpoints; neither says anything about any individual order.
+PER_ROW_CODES = ("1", "2")
+
+
+def rows_carry_verdict(data: Any) -> bool:
+    """True when `data` is a per-order batch payload (one `{sCode, ...}` per order).
+
+    OKX answers a batch at two levels: the envelope `code` describes the
+    *request*, each row's `sCode` describes *that order*.  So `code: "2"`
+    ("Bulk operation partially successful") is what a perfectly healthy batch
+    looks like when 11 of 19 orders fill -- the envelope is saying "don't trust
+    me, read the rows".
+
+    Treating that as a failure is expensive in a specific way: the caller never
+    sees the rows, so it can only report one identical reason for every order in
+    the batch (`n_ok = 0`, `error = "OKX 错误 2: Bulk operation partially
+    successful"`), and because OKX does not keep rejected orders, the per-order
+    reason is then unrecoverable -- not from `orders-pending`, not from
+    `orders-history`.  The diagnosis is destroyed at the moment it is created.
+    """
+    return (isinstance(data, list) and bool(data)
+            and all(isinstance(r, dict) and "sCode" in r for r in data))
 
 
 class OKXError(RuntimeError):
@@ -211,6 +239,8 @@ class OKXPrivate:
         self.stats = {"req": 0, "err": 0, "retry": 0, "slow": 0}
         self._rtt: Deque[float] = collections.deque(maxlen=64)
         self._lock = threading.Lock()
+        #: `(ts, config_row)` for `account_config()`.  See its docstring.
+        self._cfg: Tuple[float, Optional[dict]] = (0.0, None)
         #: Optional sink for human-readable notices (slow call, retry).  Wired to
         #: the job log by the engine, because a 40-second freeze with no output
         #: is indistinguishable from a hang -- which is exactly what "卡顿" is.
@@ -354,13 +384,44 @@ class OKXPrivate:
             raise RuntimeError(f"{path}: 响应不是 JSON: {raw[:200]!r}") from e
         code = str(js.get("code", ""))
         if code != "0":
-            raise OKXError(code, js.get("msg", ""), path, js.get("data"))
+            data = js.get("data")
+            # A batch endpoint that partially succeeded is not an error: the
+            # envelope says so, and the rows are the only place the per-order
+            # verdicts exist.  Returning them keeps `place_batch` /
+            # `set_leverage_batch` able to judge each order on its own `sCode`;
+            # raising here would replace 19 different outcomes with one opaque
+            # string.  Anything *without* per-row verdicts (auth failures,
+            # bad parameters) still raises exactly as before.
+            if code in PER_ROW_CODES and rows_carry_verdict(data):
+                return data
+            raise OKXError(code, js.get("msg", ""), path, data)
         return js.get("data", [])
 
     # -- account -----------------------------------------------------------
-    def account_config(self) -> dict:
+    def account_config(self, ttl: float = 120.0) -> dict:
+        """Account-level config: `posMode`, `acctLv`, `uid`.
+
+        Cached, because it is a full signed round trip -- measured at ~390ms
+        through this machine's proxy -- for three fields that only move when
+        *we* move them.  `set_position_mode()` clears the cache; nothing else
+        can change them.  The trading desk reloads status after every action
+        (save limits, arm the kill switch, reconcile), and without this each of
+        those paid for the same unchanged answer again.
+
+        Pass `ttl=0` to force a fresh read.
+        """
+        now = time.time()
+        ts, cached = self._cfg
+        if cached is not None and (now - ts) < ttl:
+            return dict(cached)
         d = self.request("GET", "/api/v5/account/config")
-        return d[0] if d else {}
+        row = dict(d[0]) if d else {}
+        self._cfg = (now, row)
+        return dict(row)
+
+    def invalidate_config(self) -> None:
+        """Drop the `account_config()` cache after changing account settings."""
+        self._cfg = (0.0, None)
 
     def balance(self, ccy: str = "USDT") -> dict:
         d = self.request("GET", "/api/v5/account/balance", {"ccy": ccy})
@@ -431,6 +492,9 @@ class OKXPrivate:
         """`net_mode` | `long_short_mode`.  OKX refuses while positions exist."""
         d = self.request("POST", "/api/v5/account/set-position-mode",
                          body={"posMode": pos_mode}, idempotent=True)
+        # The cached config now says the *old* mode; anything reading it would
+        # size orders against the wrong position model.
+        self.invalidate_config()
         return d[0] if d else {}
 
     # -- orders ------------------------------------------------------------
@@ -460,6 +524,10 @@ class OKXPrivate:
         `sCode`/`sMsg`.  A batch can therefore succeed at the HTTP level while
         every single order inside it is rejected -- so both must be checked, and
         the result rows are what the caller records.
+
+        The usual shape of a *partly* filled rebalance is envelope `code: "2"`
+        with a full set of rows; `_unwrap` returns those rows rather than
+        raising, which is the only reason the loop below gets to run.
         """
         orders = list(orders)
         if not orders:
@@ -472,12 +540,27 @@ class OKXPrivate:
             row = {k: (str(v) if not isinstance(v, bool) else v)
                    for k, v in o.items() if v is not None}
             clean.append(row)
-        d = self.request("POST", "/api/v5/trade/orders", body=clean, idempotent=False)
+        # OKX V5 places a batch at /api/v5/trade/batch-orders.  There is no
+        # /api/v5/trade/orders endpoint -- posting there returns a bare
+        # HTTP 404 with an empty envelope, which surfaced as "response lost,
+        # reconcile" on every order of a demo rebalance.
+        d = self.request("POST", "/api/v5/trade/batch-orders", body=clean,
+                         idempotent=False)
         out = []
         for i, r in enumerate(d):
             rr = dict(r)
-            rr["_instId"] = clean[i].get("instId") if i < len(clean) else None
-            rr["_clOrdId"] = clean[i].get("clOrdId") if i < len(clean) else None
+            # Bind the row to the request that produced it.  OKX echoes
+            # `clOrdId` in every row, and that is authoritative; the index is
+            # only a fallback.  Relying on position alone would mislabel a
+            # rejection as belonging to a neighbouring instrument -- an error
+            # that is worse than no report at all, because it looks like data.
+            echoed = str(rr.get("clOrdId") or "")
+            req = next((c for c in clean if c.get("clOrdId") == echoed), None) \
+                if echoed else None
+            if req is None:
+                req = clean[i] if i < len(clean) else {}
+            rr["_instId"] = req.get("instId")
+            rr["_clOrdId"] = req.get("clOrdId") or echoed or None
             sc = str(rr.get("sCode", "0"))
             rr["_ok"] = sc == "0"
             if sc != "0":

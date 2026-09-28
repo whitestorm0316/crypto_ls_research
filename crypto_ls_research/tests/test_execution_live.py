@@ -658,10 +658,52 @@ def test_status_does_not_pay_for_the_same_endpoint_twice(tmp_live, monkeypatch):
     eng = LiveEngine(mode="demo")
     st = eng.status()
 
-    assert calls == ["config", "positions", "equity"]
+    # 断言的是「每个端点只打一次」，**不是**调用顺序：`positions` 与
+    # `equity_usdt` 现在并行发出（见 test_positions_and_equity_are_fetched_concurrently），
+    # 谁先 append 取决于线程调度。原来这里写的是精确序列，一并行就变成偶发红灯。
+    assert sorted(calls) == ["config", "equity", "positions"]
     assert st["connected"] is True and st["ok"] is True and st["uid"] == "1"
     assert st["account"]["nav"] == pytest.approx(1000.0)
     assert "diagnosis" not in st                 # probe() only runs on failure
+
+
+def test_positions_and_equity_are_fetched_concurrently(tmp_live, monkeypatch):
+    """持仓与净值是**两次互相独立**的签名往返（本机实测各 ~0.3s），而交易台在
+    **每一个动作之后**都要重读账户（保存限额、熔断、对账、重置…）。串行发就等于
+    让用户等两者之和 —— 那正是他感觉到的那个「延迟」。
+
+    下面这个会合点是断言的核心：每次调用都要等对方先起跑，所以只有两次请求
+    **同时在飞**时测试才会通过。它也不会挂死：超时 2s 后断言失败并抛回主线程
+    （`fut.result()` 会把工作线程里的异常原样抛出），退化成串行时报红而不是卡住。
+    """
+    import threading
+
+    class C:
+        api_key, secret_key, passphrase = "k", "s", "p"
+
+    monkeypatch.setattr(engine_mod, "load_creds", lambda mode: C())
+    pos_up = threading.Event()
+    nav_up = threading.Event()
+
+    class Cli:
+        def account_config(self):
+            return {"posMode": "net_mode", "acctLv": "2", "uid": "1"}
+
+        def positions(self, t):
+            pos_up.set()
+            assert nav_up.wait(2.0), "净值请求没有和持仓请求同时在飞（退化成串行了）"
+            return []
+
+        def equity_usdt(self):
+            nav_up.set()
+            assert pos_up.wait(2.0), "持仓请求没有和净值请求同时在飞（退化成串行了）"
+            return 1000.0
+
+    monkeypatch.setattr(engine_mod.LiveEngine, "_private", lambda self: Cli())
+    acct = LiveEngine(mode="demo").account()
+
+    assert acct["nav"] == pytest.approx(1000.0)
+    assert acct["source"] == "okx"
 
 
 def test_slow_and_retried_calls_are_measured_and_reported(monkeypatch):
@@ -857,6 +899,164 @@ def test_store_turnover_resets_on_a_new_day(tmp_live, monkeypatch):
     assert st.turnover_state()[1] == 0.0
 
 
+# ---------------------------------------------------------------------------
+# desk settings: the save path has to end on disk
+#
+# Reported as「风控限额相关保存了 重启不生效」+「今日换手预算 也对不上」.  Both
+# were real, and both were invisible from inside one process:
+#
+# * the caps lived in `live_api._ENGINES` (the engine cache) and nowhere else,
+#   so "saved" and "still running" were the same state until a restart;
+# * `summary()` reported the *raw* `turnover_used_today` while
+#   `turnover_state()` -- the one the planner sizes against -- reset it on the
+#   UTC date, so one page carried two different numbers under one heading.
+#
+# Every test below therefore asserts against a **fresh** `LiveEngine`/`Store`,
+# which is the only honest way to simulate the restart the user performed.
+# ---------------------------------------------------------------------------
+def _live_api(monkeypatch):
+    """The console's route layer, with the process-wide engine cache emptied.
+
+    `_ENGINES` is precisely the thing that hid the bug, so no test here may
+    inherit an engine built by an earlier test.
+    """
+    from webapp import live_api as mod
+    monkeypatch.setattr(mod, "_ENGINES", {})
+    return mod
+
+
+def test_saving_limits_puts_them_on_disk_and_a_new_engine_reads_them(tmp_live, monkeypatch):
+    """「保存了重启不生效」.
+
+    The POST used to assign `eng.limits` in memory and return `{"ok": True}`.
+    Nothing was written anywhere, so a restart rebuilt the engine from
+    `LiveLimits()` -- byte-for-byte indistinguishable from "the save button does
+    nothing".  Assert the file first, then assert a brand-new engine reads it.
+    """
+    api = _live_api(monkeypatch)
+    out, code = api.route_post("/api/live/limits", {
+        "mode": "paper",
+        "limits": {"max_gross_notional": 1234.0, "max_leverage": 3.0,
+                   "max_turnover_frac": 0.4}})
+    assert code == 200 and out["ok"] is True
+
+    # 1. it is on disk, at the path the response advertises
+    assert out["saved_to"] == store_mod.Store("paper").limits_path()
+    assert os.path.exists(out["saved_to"])
+    assert store_mod.Store("paper").load_limits()["max_gross_notional"] == 1234.0
+
+    # 2. a *new* engine (what a restart builds) reads it back
+    fresh = LiveEngine(mode="paper")
+    assert fresh.limits.max_gross_notional == 1234.0
+    assert fresh.limits.max_leverage == 3.0
+    assert fresh.limits.max_turnover_frac == 0.4
+
+    # 3. and the file is genuinely the source, not a coincidence with a default:
+    #    a saved field differs from the factory value, an unsaved one matches it.
+    assert fresh.limits.max_gross_notional != LiveLimits().max_gross_notional
+    assert fresh.limits.max_orders == LiveLimits().max_orders
+
+
+def test_never_saved_limits_stay_none_and_fall_back_to_defaults(tmp_live, monkeypatch):
+    """`None` must stay distinguishable from `{}`.
+
+    "never configured" falls back to the factory caps; "the user cleared every
+    cap" must not.  Collapsing the two would make the very first `LiveEngine`
+    adopt an all-zero limit set -- i.e. refuse every trade, for no stated reason.
+    """
+    api = _live_api(monkeypatch)
+    assert store_mod.Store("paper").load_limits() is None
+
+    meta, _ = api.route_get("/api/live/meta", {})
+    assert meta["limits_saved"]["paper"] is None
+    assert LiveEngine(mode="paper").limits.to_dict() == LiveLimits().to_dict()
+
+    # An explicitly emptied payload is *not* "never saved": it round-trips as an
+    # all-default object, which is what `from_dict({})` means.
+    api.route_post("/api/live/limits", {"mode": "paper", "limits": {}})
+    assert store_mod.Store("paper").load_limits() is not None
+
+
+def test_limits_are_saved_per_mode_not_shared(tmp_live, monkeypatch):
+    """Absolute caps are account-specific: a $1k paper book and a $54k demo
+    account cannot share a `max_gross_notional`.  One file per mode, or saving
+    on the desk silently re-arms the other mode's guardrail."""
+    api = _live_api(monkeypatch)
+    api.route_post("/api/live/limits", {"mode": "paper",
+                                       "limits": {"max_gross_notional": 111.0}})
+    api.route_post("/api/live/limits", {"mode": "demo",
+                                       "limits": {"max_gross_notional": 222.0}})
+    assert store_mod.Store("paper").load_limits()["max_gross_notional"] == 111.0
+    assert store_mod.Store("demo").load_limits()["max_gross_notional"] == 222.0
+    assert LiveEngine(mode="paper").limits.max_gross_notional == 111.0
+    assert LiveEngine(mode="demo").limits.max_gross_notional == 222.0
+    # live was never touched -> still the factory value, still "never saved"
+    assert store_mod.Store("live").load_limits() is None
+
+
+def test_limits_post_rejects_an_unknown_mode(tmp_live, monkeypatch):
+    """A typo'd mode must not silently write to `paper`'s file."""
+    api = _live_api(monkeypatch)
+    out, code = api.route_post("/api/live/limits", {"mode": "nope", "limits": {}})
+    assert code == 400 and "error" in out
+    assert store_mod.Store("paper").load_limits() is None
+
+
+def test_an_explicit_limits_argument_still_beats_the_saved_file(tmp_live, monkeypatch):
+    """`LiveEngine(limits=...)` is the caller saying "use these now".  The saved
+    caps are a *fallback* for construction, not an override of an explicit
+    argument -- otherwise a programmatic run could never tighten a cap."""
+    store_mod.Store("paper").save_limits({"max_gross_notional": 999.0})
+    assert LiveEngine(mode="paper").limits.max_gross_notional == 999.0
+    explicit = LiveEngine(mode="paper", limits=LiveLimits(max_gross_notional=7.0))
+    assert explicit.limits.max_gross_notional == 7.0
+
+
+def test_a_new_utc_day_zeroes_used_turnover_and_status_agrees(tmp_live, monkeypatch):
+    """「今日换手预算 也对不上」.
+
+    `summary()` used to report the *raw* `turnover_used_today` while
+    `turnover_state()` -- the figure the planner sizes against -- reset it on the
+    UTC date.  The account panel read one, the planner used the other: two
+    numbers, one heading, and no way to tell which was right.
+
+    They now share `_turnover_from`, so the assertion is that the two are *the
+    same value*, plus that the discarded figure is disclosed rather than
+    silently dropped.
+    """
+    st = store_mod.Store("paper")
+    st.write_state({"mode": "paper", "turnover_day": "2000-01-01",
+                    "turnover_used_today": 0.19})
+    s = st.summary()
+    assert s["turnover_used_today"] == 0.0                  # reset, not 0.19
+    assert s["turnover_day"] == store_mod.Store.today_utc()
+    assert s["turnover_stale"] is True                      # ...and disclosed
+    assert st.turnover_state()[1] == s["turnover_used_today"]
+
+    monkeypatch.setattr(engine_mod, "newest_cached_bar", lambda bar="1h": None)
+    stt = LiveEngine(mode="paper").status()
+    assert stt["turnover_used_today"] == s["turnover_used_today"]
+    assert stt["store"]["turnover_used_today"] == stt["turnover_used_today"]
+
+
+def test_todays_turnover_is_not_flagged_stale(tmp_live, monkeypatch):
+    """The staleness flag has to be able to be *false*, or it says nothing.
+
+    Covers both legitimate non-stale shapes: a state file stamped today, and one
+    that has never recorded a day at all (fresh ledger).
+    """
+    st = store_mod.Store("paper")
+    st.write_state({"mode": "paper", "turnover_day": store_mod.Store.today_utc(),
+                    "turnover_used_today": 0.07})
+    s = st.summary()
+    assert s["turnover_used_today"] == pytest.approx(0.07)
+    assert s["turnover_stale"] is False
+
+    store_mod.Store("demo").write_state({"mode": "demo"})   # no day recorded
+    d = store_mod.Store("demo").summary()
+    assert d["turnover_used_today"] == 0.0 and d["turnover_stale"] is False
+
+
 def test_store_survives_a_truncated_file(tmp_live):
     st = store_mod.Store("demo")
     st.add_run({"run_id": "r1"})
@@ -1028,6 +1228,110 @@ def test_paper_execute_updates_cash_positions_and_turnover(tmp_live, monkeypatch
     # NAV now reflects the entry cost, not the notional
     acct2 = eng.account()
     assert 995.0 < acct2["nav"] < 1000.0
+
+
+# ---------------------------------------------------------------------------
+# turnover budget: charged for what went out, not for what we hoped to send
+# ---------------------------------------------------------------------------
+def _budgeted_plan(monkeypatch, budget=0.20):
+    """A two-name paper plan that actually has a turnover budget attached."""
+    px = {"A-USDT-SWAP": 10.0, "B-USDT-SWAP": 20.0}
+    eng = LiveEngine(mode="paper", limits=LiveLimits(
+        max_gross_notional=1e9, max_gross_frac=99.0, max_turnover_frac=99.0,
+        min_nav_usd=0.0, require_rebalance_due=False))
+    monkeypatch.setattr(eng, "specs", lambda: {i: _spec() for i in px})
+    monkeypatch.setattr(eng, "prices", lambda insts=None, force=False: dict(px))
+    eng.store.write_state({"mode": "paper", "cash": 1000.0, "nav0": 1000.0,
+                           "positions": {}, "pos_mode": "net_mode"})
+    target = _minimal_target({"A-USDT-SWAP": 0.10, "B-USDT-SWAP": -0.10})
+    plan, acct, _ = eng.build(target, turnover_budget=budget)
+    assert plan.turnover_budget == pytest.approx(budget)
+    assert plan.n_orders == 2 and plan.turnover_frac > 0
+    return eng, target, plan
+
+
+def _turnover_record(plan, results, nav, run_id="runT"):
+    """A run record shaped exactly like the one `execute()` persists."""
+    return {
+        "run_id": run_id, "mode": "paper", "ts": time.time(),
+        "action": "rebalance", "dry_run": False, "nav": nav,
+        "n_orders": plan.n_orders,
+        "n_ok": sum(1 for r in results if r.get("ok")),
+        "n_fail": sum(1 for r in results if not r.get("ok")),
+        "order_notional": plan.order_notional,
+        "turnover_frac": plan.turnover_frac,
+        "turnover_charged": LiveEngine._charged_turnover(plan, results, nav),
+        "violations": [], "results": results, "errors": [], "elapsed": 1.0,
+    }
+
+
+def test_an_all_rejected_rebalance_does_not_burn_the_daily_budget(tmp_live, monkeypatch):
+    """The bug this exists to prevent.
+
+    `_after_execute` used to bump by `plan.turnover_frac` unconditionally, so a
+    rebalance whose every order was *rejected* still ate the whole day's budget.
+    One failed demo run left `turnover_used_today = 0.19994` of 0.20; the next
+    plan came out scaled by ~5e-5 -- orders of a few cents -- and nothing in the
+    UI explained why.  Rejected orders moved nothing.
+    """
+    eng, target, plan = _budgeted_plan(monkeypatch)
+    rows = [{"instId": o.inst_id, "ok": False, "notional": o.delta_notional,
+             "error": "51008 余额不足"} for o in plan.orders]
+    rec = _turnover_record(plan, rows, 1000.0)
+    assert rec["turnover_charged"] == 0.0
+    eng._after_execute(target, {"nav": 1000.0}, plan, rec)
+    assert eng.store.turnover_state()[1] == pytest.approx(0.0), \
+        "被拒的订单没有成交，不该占用换手预算"
+
+
+def test_accepted_orders_charge_exactly_the_planned_turnover(tmp_live, monkeypatch):
+    """All accepted -> the charge equals the plan (paper always fills)."""
+    eng, target, plan = _budgeted_plan(monkeypatch)
+    rows = [{"instId": o.inst_id, "ok": True, "notional": o.delta_notional}
+            for o in plan.orders]
+    rec = _turnover_record(plan, rows, 1000.0)
+    assert rec["turnover_charged"] == pytest.approx(plan.turnover_frac)
+    eng._after_execute(target, {"nav": 1000.0}, plan, rec)
+    assert eng.store.turnover_state()[1] == pytest.approx(plan.turnover_frac)
+
+
+def test_a_partly_rejected_rebalance_charges_only_what_went_out(tmp_live, monkeypatch):
+    eng, target, plan = _budgeted_plan(monkeypatch)
+    rows = [{"instId": o.inst_id, "ok": (i == 0), "notional": o.delta_notional}
+            for i, o in enumerate(plan.orders)]
+    rec = _turnover_record(plan, rows, 1000.0)
+    want = sum(r["notional"] for r in rows if r["ok"]) / 1000.0
+    assert rec["turnover_charged"] == pytest.approx(want)
+    assert 0.0 < rec["turnover_charged"] < plan.turnover_frac
+    eng._after_execute(target, {"nav": 1000.0}, plan, rec)
+    assert eng.store.turnover_state()[1] == pytest.approx(want)
+
+
+def test_a_lost_batch_is_charged_in_full(tmp_live, monkeypatch):
+    """An ambiguous batch may well have gone through.
+
+    Charging nothing would let the same budget be spent twice before
+    reconciliation, so for a risk limit the safe side is "assume it happened".
+    """
+    eng, target, plan = _budgeted_plan(monkeypatch)
+    rows = [{"instId": o.inst_id, "ok": False, "ambiguous": True,
+             "notional": o.delta_notional, "error": "响应丢失，需对账"}
+            for o in plan.orders]
+    rec = _turnover_record(plan, rows, 1000.0)
+    assert rec["turnover_charged"] == pytest.approx(plan.turnover_frac)
+    eng._after_execute(target, {"nav": 1000.0}, plan, rec)
+    assert eng.store.turnover_state()[1] == pytest.approx(plan.turnover_frac)
+
+
+def test_no_budget_and_no_nav_charge_nothing():
+    """Guards on the pure helper: no budget, or an unusable NAV."""
+    p = build_plan({"A-USDT-SWAP": 0.10}, 1000.0, current_sz={},
+                   prices={"A-USDT-SWAP": 10.0}, specs=_specs("A-USDT-SWAP"),
+                   turnover_budget=None)
+    rows = [{"instId": "A-USDT-SWAP", "ok": True, "notional": 100.0}]
+    assert LiveEngine._charged_turnover(p, rows, 1000.0) == 0.0
+    assert LiveEngine._charged_turnover(p, rows, 0.0) == 0.0
+    assert LiveEngine._charged_turnover(p, [], 1000.0) == 0.0
 
 
 def test_paper_flatten_returns_to_flat(tmp_live, monkeypatch):
@@ -1467,3 +1771,253 @@ def test_env_var_overrides_the_file(tmp_path, monkeypatch):
     c = creds_mod.load_creds("live")
     assert c.source == "env" and c.api_key.startswith("ENVKEY")
     assert creds_mod.creds_status()["live"]["env_override"] is True
+
+
+# ---------------------------------------------------------------------------
+# a batch is answered twice: once for the request, once per order
+# ---------------------------------------------------------------------------
+def _okx_with_envelope(monkeypatch, envelope: dict):
+    """An `OKXPrivate` whose only stubbed layer is the socket.
+
+    `request()` is redirected through the real `_unwrap`, so what is under test
+    is the production envelope -> rows contract rather than a paraphrase of it.
+    `__new__` skips `__init__` because none of this needs credentials.
+    """
+    cli = OKXPrivate.__new__(OKXPrivate)
+    raw = json.dumps(envelope)
+    monkeypatch.setattr(cli, "request",
+                        lambda method, path, params=None, body=None, **kw:
+                        OKXPrivate._unwrap(raw, path))
+    return cli
+
+
+def test_a_partly_successful_batch_keeps_every_per_order_verdict(monkeypatch):
+    """`code: "2"` is a healthy batch, not a failure.
+
+    OKX answers batch endpoints at two levels: the envelope `code` describes the
+    *request* ("Bulk operation partially successful"), each row's `sCode`
+    describes *that order*.  `_unwrap` raised on any non-zero envelope, so
+    `place_batch`'s row loop never ran.
+
+    What that cost, measured on a real demo rebalance: 19 orders sent, 11 of
+    them filled, and the ledger recorded `n_ok = 0` with the identical error
+    `OKX 错误 2: Bulk operation partially successful` on every row.  OKX does not
+    keep rejected orders, so once the response was discarded the per-order
+    reasons were unrecoverable -- not from `orders-pending`, not from
+    `orders-history`.  The diagnosis was destroyed at the moment it was created.
+    """
+    orders = [{"instId": "A-USDT-SWAP", "clOrdId": "c1", "sz": "1"},
+              {"instId": "B-USDT-SWAP", "clOrdId": "c2", "sz": "2"},
+              {"instId": "C-USDT-SWAP", "clOrdId": "c3", "sz": "3"}]
+    cli = _okx_with_envelope(monkeypatch, {
+        "code": "2", "msg": "Bulk operation partially successful",
+        "data": [
+            {"clOrdId": "c1", "ordId": "11", "sCode": "0", "sMsg": ""},
+            {"clOrdId": "c2", "ordId": "", "sCode": "51001",
+             "sMsg": "Instrument ID does not exist"},
+            {"clOrdId": "c3", "ordId": "13", "sCode": "0", "sMsg": ""},
+        ]})
+    rows = cli.place_batch(orders)
+    assert [r["_ok"] for r in rows] == [True, False, True]
+    assert rows[1]["_error"] and "51001" in rows[1]["_error"]
+    assert rows[0]["_instId"] == "A-USDT-SWAP" and rows[0]["_clOrdId"] == "c1"
+    assert rows[0]["ordId"] == "11"
+
+
+def test_the_engine_records_mixed_outcomes_from_one_partial_batch(tmp_live, monkeypatch):
+    """End to end through `_send_okx`: 1 accepted, 1 rejected, with its own reason."""
+    eng, target, plan = _budgeted_plan(monkeypatch)
+    # `_send_okx` mints its own clOrdIds; pin them so the envelope can echo them.
+    monkeypatch.setattr(engine_mod, "make_clordid",
+                        lambda prefix, inst, seq: f"c{seq}")
+    envelope = {"code": "2", "msg": "Bulk operation partially successful",
+                "data": [{"clOrdId": "c0", "ordId": "o0", "sCode": "0", "sMsg": ""},
+                         {"clOrdId": "c1", "ordId": "", "sCode": "51001",
+                          "sMsg": "Instrument ID does not exist"}]}
+    cli = _okx_with_envelope(monkeypatch, envelope)
+    monkeypatch.setattr(eng, "_private", lambda: cli)
+    monkeypatch.setattr(eng, "_apply_leverage", lambda p: [])
+
+    res = eng._send_okx(plan, "demo_20260928_150854_862ed8")
+    assert [r["ok"] for r in res] == [True, False]
+    assert res[0]["error"] is None and res[0]["ordId"] == "o0"
+    assert "51001" in res[1]["error"]
+    assert res[1]["error"] != res[0]["error"]
+    assert eng.store.orders()["c1"]["state"] == "rejected"
+    assert eng.store.orders()["c0"]["state"] == "pending"
+
+
+def test_an_envelope_error_without_rows_still_raises(monkeypatch):
+    """The fix must not turn a real failure into a silent success.
+
+    Auth and parameter failures carry no per-row verdicts, so there is nothing
+    to hand back and they must keep raising.  So must the transient codes the
+    retry loop in `request()` depends on.
+    """
+    cases = [
+        ("50111", []),                       # bad key
+        ("51000", []),                       # bad parameter
+        ("50013", None),                     # system busy -> retried upstream
+        ("50011", [{"sCode": "0"}]),         # rate limit: rows exist, code is not per-row
+        ("51001", [{"instId": "X"}]),        # a row, but no sCode -> not a verdict list
+    ]
+    for code, data in cases:
+        cli = _okx_with_envelope(monkeypatch, {"code": code, "msg": "boom", "data": data})
+        with pytest.raises(OKXError) as ei:
+            cli.place_batch([{"instId": "A-USDT-SWAP", "clOrdId": "c1", "sz": "1"}])
+        assert ei.value.code == code
+
+
+def test_a_row_verdict_is_bound_by_clordid_not_by_position(monkeypatch):
+    """Rows are matched to requests by the echoed `clOrdId`.
+
+    Trusting array position would attribute a rejection to a neighbouring
+    instrument -- a wrong answer that looks exactly like a right one.
+    """
+    orders = [{"instId": "A-USDT-SWAP", "clOrdId": "c1", "sz": "1"},
+              {"instId": "B-USDT-SWAP", "clOrdId": "c2", "sz": "2"}]
+    cli = _okx_with_envelope(monkeypatch, {
+        "code": "2", "msg": "partial",
+        "data": [
+            {"clOrdId": "c2", "sCode": "51001", "sMsg": "no such instrument"},
+            {"clOrdId": "c1", "sCode": "0", "sMsg": ""},
+        ]})
+    by_cid = {r["_clOrdId"]: r for r in cli.place_batch(orders)}
+    assert by_cid["c1"]["_instId"] == "A-USDT-SWAP" and by_cid["c1"]["_ok"] is True
+    assert by_cid["c2"]["_instId"] == "B-USDT-SWAP" and by_cid["c2"]["_ok"] is False
+
+
+def test_clordid_prefix_distinguishes_runs_within_the_same_month():
+    """The prefix used to be mode + year + month.
+
+    `demo_20260928_150854_862ed8`.replace("_", "")[:10] == "demo202609", so every
+    rebalance that month minted byte-identical client order ids for the same
+    (instrument, index).  Two runs can no longer be told apart when reconciling,
+    and `order_by_clordid` answers about the wrong one.
+    """
+    # Imported here, not at module scope: the helper does not exist before the
+    # fix, and a module-level import would turn every test in this file into a
+    # collection error instead of failing this one.
+    from crypto_ls_research.execution.engine import _clordid_prefix
+    a, b = "demo_20260928_150854_862ed8", "demo_20260928_150902_1f4c77"
+    assert _clordid_prefix(a) != _clordid_prefix(b)
+    assert _clordid_prefix(a) == _clordid_prefix(a)        # deterministic
+    assert _clordid_prefix("demo_20261001_000000_862ed8") != _clordid_prefix(a)
+    assert make_clordid(_clordid_prefix(a), "ARB-USDT-SWAP", 0) != \
+           make_clordid(_clordid_prefix(b), "ARB-USDT-SWAP", 0)
+    cid = make_clordid(_clordid_prefix(a), "USELESS-USDT-SWAP", 18)
+    assert len(cid) <= 32 and cid.isalnum()               # still legal on OKX
+
+
+# ---------------------------------------------------------------------------
+# the venue's instrument universe is not the spec cache's
+# ---------------------------------------------------------------------------
+def _venue_limits():
+    return LiveLimits(max_gross_notional=1e9, max_gross_frac=99.0,
+                      max_turnover_frac=99.0, min_nav_usd=0.0,
+                      require_rebalance_due=False)
+
+
+def test_check_plan_warns_about_legs_this_venue_does_not_list():
+    """7 of the 8 rejected orders in one demo run were instruments demo lacks.
+
+    The contract-spec cache is built from public *live* data, so the planner
+    sizes legs the demo exchange has never heard of.  Asking once up front turns
+    a batch of unexplained rejections into a plan-time warning.
+    """
+    p = build_plan({"A-USDT-SWAP": 0.10, "B-USDT-SWAP": -0.10}, 1000.0,
+                   current_sz={}, prices={"A-USDT-SWAP": 10.0, "B-USDT-SWAP": 10.0},
+                   specs=_specs("A-USDT-SWAP", "B-USDT-SWAP"))
+    assert p.n_orders == 2
+    vs = check_plan(p, _venue_limits(), mode="demo", nav=1000.0,
+                    venue_insts={"A-USDT-SWAP"})
+    got = [v for v in vs if v.key == "venue_missing"]
+    assert len(got) == 1
+    assert got[0].sev == "warn", "模拟盘缺腿是可预期的，不该拦下整个调仓"
+    assert "B-USDT-SWAP" in got[0].body and "A-USDT-SWAP" not in got[0].body
+    assert not blocking(vs)
+
+
+def test_check_plan_is_silent_when_the_venue_list_is_unknown():
+    """No credentials, or the endpoint is down -> skip, never guess."""
+    p = build_plan({"A-USDT-SWAP": 0.10}, 1000.0, current_sz={},
+                   prices={"A-USDT-SWAP": 10.0}, specs=_specs("A-USDT-SWAP"))
+    assert not [v for v in check_plan(p, _venue_limits(), mode="demo", nav=1000.0,
+                                      venue_insts=None) if v.key == "venue_missing"]
+    # An empty-but-known list is a different statement from "unknown".
+    assert [v for v in check_plan(p, _venue_limits(), mode="demo", nav=1000.0,
+                                  venue_insts=set()) if v.key == "venue_missing"]
+
+
+def test_venue_instruments_is_best_effort_and_cached(tmp_live, monkeypatch):
+    """A failing endpoint must never block a rebalance."""
+    eng = LiveEngine(mode="demo", limits=_venue_limits())
+    calls = []
+
+    class Boom:
+        def request(self, *a, **kw):
+            calls.append(a)
+            raise RuntimeError("network down")
+
+    monkeypatch.setattr(eng, "_private", lambda: Boom())
+    assert eng.venue_instruments() is None
+    assert eng.venue_instruments() is None
+    assert len(calls) == 1, "失败也要缓存，别把公共接口打爆"
+
+    class Fine:
+        def request(self, *a, **kw):
+            calls.append(a)
+            return [{"instId": "A-USDT-SWAP", "state": "live"},
+                    {"instId": "DEAD-USDT-SWAP", "state": "suspend"}]
+
+    monkeypatch.setattr(eng, "_private", lambda: Fine())
+    eng._venue = (0.0, None)
+    assert eng.venue_instruments() == {"A-USDT-SWAP"}, "非 live 状态的合约不算可交易"
+
+
+# ---------------------------------------------------------------------------
+# realised exposure: the book that happened, not the book that was wanted
+# ---------------------------------------------------------------------------
+def test_realised_gross_counts_only_the_legs_that_went_out(tmp_live, monkeypatch):
+    """A rejected leg leaves its old position standing; it cannot be booked at target.
+
+    One demo rebalance recorded 10,842 USDT of "realised" gross from 19 orders
+    of which 11 filled -- the intended book, presented as the actual one -- and
+    that figure then flowed into `add_equity(...)` and the desk's exposure cell.
+    """
+    eng, target, plan = _budgeted_plan(monkeypatch)
+    acct = {"nav": 1000.0, "cur_sz": {}, "positions": []}
+    assert plan.realised_gross > 0
+
+    all_ok = [{"instId": o.inst_id, "ok": True} for o in plan.orders]
+    g_all, n_all = LiveEngine._realised_book(plan, all_ok, acct)
+    assert g_all == pytest.approx(plan.realised_gross)
+    assert n_all == pytest.approx(plan.realised_net)
+
+    # One leg from flat is rejected -> that leg stays flat, so it is not booked.
+    half = [{"instId": o.inst_id, "ok": (i == 0)} for i, o in enumerate(plan.orders)]
+    g_half, _ = LiveEngine._realised_book(plan, half, acct)
+    assert 0.0 < g_half < g_all
+
+    # Nothing went out -> nothing changed: the pre-trade book, which was flat.
+    none_ok = [{"instId": o.inst_id, "ok": False} for o in plan.orders]
+    assert LiveEngine._realised_book(plan, none_ok, acct) == (0.0, 0.0)
+
+
+def test_a_rejected_close_keeps_the_position_it_failed_to_shut(tmp_live, monkeypatch):
+    """The other direction: a *close* that was rejected still holds risk."""
+    px = {"A-USDT-SWAP": 10.0}
+    eng = LiveEngine(mode="paper", limits=_venue_limits())
+    monkeypatch.setattr(eng, "specs", lambda: {i: _spec() for i in px})
+    monkeypatch.setattr(eng, "prices", lambda insts=None, force=False: dict(px))
+    # start long 1000 contracts (100 USDT), target flat
+    acct_in = {"mode": "paper", "nav": 1000.0, "cur_sz": {"A-USDT-SWAP": 1000.0},
+               "marks": dict(px), "pos_mode": "net_mode",
+               "positions": [{"instId": "A-USDT-SWAP", "pos": 1000.0,
+                              "notional": 100.0}]}
+    plan, acct, _ = eng.build(_minimal_target({}), acct=acct_in, use_budget=False)
+    assert plan.n_orders == 1 and plan.orders[0].tgt_sz == 0.0
+    rejected = [{"instId": "A-USDT-SWAP", "ok": False}]
+    assert LiveEngine._realised_book(plan, rejected, acct)[0] == pytest.approx(100.0)
+    accepted = [{"instId": "A-USDT-SWAP", "ok": True}]
+    assert LiveEngine._realised_book(plan, accepted, acct)[0] == pytest.approx(0.0)

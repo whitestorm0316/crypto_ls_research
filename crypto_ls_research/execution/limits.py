@@ -24,7 +24,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Set
+from typing import Dict, Iterable, List, Optional, Sequence, Set
 
 from .credentials import kill_switch_on, kill_switch_path
 from .planner import Plan
@@ -84,7 +84,8 @@ def live_confirm_phrase(now: Optional[float] = None) -> str:
 def check_plan(plan: Plan, limits: LiveLimits, *, mode: str, nav: float,
                rebalance_due: bool = True, force: bool = False,
                actions: Sequence[str] = ("rebalance",),
-               leverage: Optional[float] = None) -> List[Violation]:
+               leverage: Optional[float] = None,
+               venue_insts: Optional[Iterable[str]] = None) -> List[Violation]:
     """Return every problem with this plan.  An empty list means "cleared".
 
     `force=True` downgrades `require_rebalance_due` only -- it never relaxes a
@@ -95,6 +96,15 @@ def check_plan(plan: Plan, limits: LiveLimits, *, mode: str, nav: float,
     the account leverage while the book stays the same size does not raise the
     return, it only removes margin -- i.e. it buys extra liquidation risk at
     zero expected gain.  So it is checked against a ceiling and narrated.
+
+    `venue_insts` is the set of instruments the venue we are about to trade will
+    actually accept, or `None` when that is unknown (no credentials, endpoint
+    down).  Demo and live do not share a pool -- live lists ~492 USDT swaps,
+    demo ~185 -- while the contract-spec cache is built from live data, so the
+    planner can size legs the demo exchange has never heard of.  They are
+    rejected one by one with `51001`, which is worth saying *before* the send.
+    A warning, not a block: on demo these names are unplaceable by definition,
+    and refusing to rebalance at all would be worse than trading the rest.
     """
     v: List[Violation] = []
     closing_only = all(a in ("flatten", "close") for a in actions)
@@ -182,6 +192,22 @@ def check_plan(plan: Plan, limits: LiveLimits, *, mode: str, nav: float,
                     f"{o.inst_id} 单笔占 30 日 ADV 的 {part:.2%}，超过上限 "
                     f"{limits.max_adv_participation:.2%}",
                     "冲击成本会显著偏离模型；把本金调小或跳过该名字。"))
+
+    if venue_insts is not None:
+        known = set(venue_insts)
+        missing = sorted({o.inst_id for o in plan.orders if o.inst_id not in known})
+        if missing:
+            v.append(Violation(
+                "warn", "venue_missing",
+                f"{len(missing)} 个目标腿在当前场所不存在，会被逐笔拒绝",
+                "模拟盘与实盘的合约池不是同一个：实盘约 492 个 USDT 永续，"
+                "模拟盘只有约 185 个。合约规格缓存来自实盘公开数据，"
+                "所以计划里会出现模拟盘根本没有的腿——它们会以 "
+                "<span class='mono'>51001 合约不存在或已下线</span> 被拒，"
+                "资金留在原有仓位上，本次调仓的其余腿不受影响。"
+                "实盘不受此限。涉及："
+                + "、".join(f"<span class='mono'>{m}</span>" for m in missing[:6])
+                + ("…" if len(missing) > 6 else "") + "。"))
 
     if nav > 0:
         gross = plan.realised_gross

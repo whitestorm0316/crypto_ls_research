@@ -1,0 +1,35 @@
+{
+  "_说明": "调仓通知。复制成 config/notify.json 后填真实值；config/ 下的 notify.json 已被 gitignore。",
+  "_provider_说明": "feishu=飞书自定义机器人（推荐）/ wecom=企业微信群机器人 / serverchan=Server酱 / pushplus=PushPlus / webhook=任意接收 JSON 的地址（到不了手机，仅当你另有中转服务）/ none=关闭",
+
+  "enabled": false,
+  "provider": "feishu",
+
+  "_feishu_url_说明": "飞书群 → 右上角设置 → 群机器人 → 添加机器人 → 自定义机器人 → 复制 Webhook 地址，形如 https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx",
+  "url": "",
+
+  "_feishu_secret_说明": "可选。机器人安全设置若开了「签名校验」，把密钥填这里。留空则不带签名（此时别在飞书侧开签名校验，否则会被拒）。",
+  "secret": "",
+
+  "_feishu_keyword_说明": "可选。安全设置若用「自定义关键词」，把那个词填这里——会自动拼在标题最前面。不填而飞书侧设了关键词的话，消息会被拒（code 19024）。",
+  "keyword": "",
+
+  "_wecom_url_说明": "改用企业微信时：企业微信 → 群聊 → 右上角 → 群机器人 → 添加 → 复制 Webhook 地址",
+  "_serverchan_说明": "改用 Server酱时：url 填 https://<uid>.push.ft07.com/send/<SendKey>.send（推到你的个人微信）",
+  "_pushplus_说明": "改用 PushPlus 时：provider 填 pushplus，token 填你的 token（推到你的个人微信）",
+  "token": "",
+
+  "_notify_on_说明": "只有这些结果会推送。traded=调仓完成 / blocked=风控拦截 / error=出错。not_due（非调仓日）刻意不推——它每天都会发生，推了就没人看了。",
+  "notify_on": ["traded", "blocked", "error"],
+
+  "_modes_说明": "只在这些模式推送。paper 是纸面账，不是真钱，默认不推。",
+  "modes": ["demo", "live"],
+
+  "_dedup_sec_说明": "同一条重复的失败（如每小时都出错）在这个窗口内只推一次；traded 永不抑制",
+  "dedup_sec": 21600,
+
+  "_timeout_说明": "单次 HTTP 超时（秒）。通知失败绝不影响调仓，所以这个值可以给得很短。",
+  "timeout": 10,
+  "_max_bytes_说明": "单条消息字节上限。飞书请求体上限 20KB，企业微信 markdown 上限 4KB，3800 对两家都安全。",
+  "max_bytes": 3800
+}

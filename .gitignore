@@ -6,6 +6,10 @@ config/okx_creds.json
 config/*creds*.json
 config/*secret*.json
 !config/okx_creds.example.json
+# config/notify.json 里是 webhook 地址 —— 这些服务的凭据就在 query string 里
+config/notify.json
+config/*notify*.json
+!config/notify.example.json
 *.env
 .env
 .env.*

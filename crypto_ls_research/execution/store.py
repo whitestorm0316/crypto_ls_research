@@ -20,6 +20,7 @@ import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional
 
 ROOT = os.path.abspath(
@@ -29,6 +30,101 @@ LIVE_DIR = os.path.join(ROOT, "artifacts", "live")
 _LOCK = threading.RLock()
 
 MODES = ("paper", "demo", "live")
+
+#: A lock file untouched for longer than this is treated as abandoned.  A real
+#: rebalance takes tens of seconds; 15 minutes is far above that and still short
+#: enough that a crashed holder cannot wedge the desk for a day.
+REBALANCE_LOCK_TTL = 900.0
+
+
+class RebalanceBusy(RuntimeError):
+    """Another process is already rebalancing this mode."""
+
+
+def _pid_alive(pid: Any) -> bool:
+    """`os.kill(pid, 0)` with the three outcomes separated.
+
+    `ProcessLookupError` = gone.  `PermissionError` (EPERM) = **it exists**, we
+    just may not signal it -- which is the normal case for anything not owned by
+    us.  Treating EPERM as "dead" would silently steal the lock from a console
+    running as another user, so the distinction is load-bearing.
+    """
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+    return True
+
+
+def _lock_abandoned(path: str, ttl: float) -> bool:
+    """Unreadable file, dead holder, or an ancient stamp -> debris, not a lock."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            info = json.load(f)
+    except (OSError, ValueError):
+        return True
+    try:
+        ts = float(info.get("ts") or 0.0)
+    except (TypeError, ValueError):
+        return True
+    if time.time() - ts > ttl:
+        return True
+    return not _pid_alive(info.get("pid"))
+
+
+@contextmanager
+def rebalance_lock(mode: str, ttl: float = REBALANCE_LOCK_TTL):
+    """One rebalance per mode at a time, **across processes**.
+
+    `_LOCK` above is a `threading.Lock`: process-local.  The console and the
+    unattended auto-trader (`execution.auto_trader`) are separate processes
+    sharing `artifacts/live/<mode>/`, and the one thing they must never do at the
+    same time is rebalance -- two concurrent `execute()` calls each read the same
+    starting book and each send the *full* order list, so every position is
+    placed twice.  `AmbiguousError` guards against a *lost response*; nothing
+    guarded against a *second actor*.
+
+    The file records the holder's pid, so a crash cannot wedge the desk: an
+    unreadable file, a dead pid, or a stamp older than `ttl` is taken over.
+    """
+    d = os.path.join(LIVE_DIR, mode)
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, "rebalance.lock")
+    for _ in range(50):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            if _lock_abandoned(path, ttl):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+                continue
+            raise RebalanceBusy(
+                f"{mode} 模式正在调仓中（另一个进程持有 {path}）。同一账户不能并发调仓："
+                "两边会各自按同一个起始持仓发一次完整订单，仓位翻倍。"
+                "等它跑完；若确认没有进程在跑，删除该锁文件即可。")
+        else:
+            try:
+                os.write(fd, json.dumps(
+                    {"pid": os.getpid(), "ts": time.time(), "mode": mode},
+                    ensure_ascii=False).encode("utf-8"))
+            finally:
+                os.close(fd)
+            break
+    else:
+        raise RebalanceBusy(f"{mode} 模式的调仓锁反复被抢占（{path}）")
+    try:
+        yield path
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 #: The files a reset rotates out.  Listed explicitly (not `os.listdir`) so a
 #: reset can only ever touch the desk's own ledger -- never a stray file a user
@@ -81,6 +177,32 @@ def _read_jsonl(path: str, limit: Optional[int] = None, newest_first: bool = Tru
     if newest_first:
         rows.reverse()
     return rows[:limit] if limit else rows
+
+
+def _count_lines(path: str) -> int:
+    """Non-empty line count of an append-only log, **without parsing it**.
+
+    `summary()` used to call `len(self.fills())` and `len(self.runs())`, and both
+    of those `json.loads` every line of a file that only ever grows -- to take a
+    length.  Measured at ~100ms per call on the demo ledger, inside
+    `/api/live/status`, which the trading desk reloads after every single action.
+    The cost grows with history, for a number that is only ever displayed.
+
+    This is not byte-for-byte identical to counting *parsed* rows: a truncated
+    or corrupt line is skipped by `_read_jsonl` and counted here.  That
+    divergence is deliberate and bounded at one record per damaged line -- a
+    damaged ledger is worth noticing either way, and the alternative is paying
+    for the whole history on every status poll.
+    """
+    n = 0
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    n += 1
+    except OSError:
+        return 0
+    return n
 
 
 class Store:
@@ -175,12 +297,20 @@ class Store:
     def turnover_state(self) -> tuple:
         """(day, used_today).  The budget resets on the UTC date, exactly as the
         backtest resets it on a new calendar day."""
-        s = self.read_state()
+        return self._turnover_from(self.read_state())
+
+    def _turnover_from(self, s: dict) -> tuple:
+        """`turnover_state()` for a state dict that has already been read.
+
+        `summary()` needs this too, and the two must not be allowed to drift:
+        they used to, and the desk displayed yesterday's "已用" while the planner
+        sized against an empty budget.  The stored day is reported separately as
+        `turnover_stale` rather than leaking the stale number.
+        """
         day = str(s.get("turnover_day") or "")
-        used = float(s.get("turnover_used_today") or 0.0)
         if day != self.today_utc():
             return self.today_utc(), 0.0
-        return day, used
+        return day, float(s.get("turnover_used_today") or 0.0)
 
     def bump_turnover(self, used: float, day: Optional[str] = None) -> dict:
         day = day or self.today_utc()
@@ -196,9 +326,38 @@ class Store:
             _atomic_json(self.path("state.json"), s)
             return s
 
+    # -- desk settings -----------------------------------------------------
+    #: Hard caps the user set on the 风控限额 table.  Settings, not ledger, so
+    #: deliberately **not** in `LEDGER_FILES`: the 「重置纸面账户」 button archives
+    #: the ledger, and silently forgetting the risk caps at that exact moment
+    #: would be the worst possible time to do it.
+    LIMITS_FILE = "limits.json"
+
+    def load_limits(self) -> Optional[dict]:
+        """The saved hard caps, or None if nothing was ever saved.
+
+        `None` and `{}` must stay distinguishable: "never configured" is what
+        lets `LiveEngine` fall back to its defaults, whereas an empty dict would
+        mean "the user cleared every cap".
+        """
+        with _LOCK:
+            d = _read_json(self.path(self.LIMITS_FILE), None)
+        return d if isinstance(d, dict) and d else None
+
+    def save_limits(self, d: dict) -> dict:
+        """Persist the caps.  Returns what was written, including the stamp."""
+        row = {**dict(d), "_saved": time.time(), "_mode": self.mode}
+        with _LOCK:
+            _atomic_json(self.path(self.LIMITS_FILE), row)
+        return row
+
+    def limits_path(self) -> str:
+        return self.path(self.LIMITS_FILE)
+
     # -- convenience -------------------------------------------------------
     def summary(self) -> dict:
         s = self.read_state()
+        day, used = self._turnover_from(s)
         return {
             "mode": self.mode,
             "dir": self.dir,
@@ -207,10 +366,14 @@ class Store:
             "last_rebalance": s.get("last_rebalance"),
             "updated": s.get("updated"),
             "n_orders": len(self.orders()),
-            "n_fills": len(self.fills()),
-            "n_runs": len(self.runs()),
-            "turnover_day": s.get("turnover_day"),
-            "turnover_used_today": s.get("turnover_used_today"),
+            "n_fills": _count_lines(self.path("fills.jsonl")),
+            "n_runs": _count_lines(self.path("runs.jsonl")),
+            "turnover_day": day,
+            "turnover_used_today": used,
+            #: The stored day is older than today -> `turnover_used_today` was
+            #: reset to 0 above, and the stale figure is disclosed here instead.
+            "turnover_stale": bool(
+                str(s.get("turnover_day") or "") not in ("", day)),
         }
 
 

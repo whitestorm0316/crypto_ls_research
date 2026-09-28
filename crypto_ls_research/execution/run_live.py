@@ -69,7 +69,12 @@ def main(argv: Optional[list] = None) -> int:
             _print({"kill_switch": a.kill == "on"})
         return 0
 
-    limits = LiveLimits.from_dict(json.loads(a.limits) if a.limits else None)
+    # `None` when `--limits` is absent, NOT `LiveLimits.from_dict(None)`: the
+    # latter returns an all-default object, which silently overrode the caps the
+    # user saved in the console with the factory values -- the same "the saved
+    # setting does not apply" defect the console had.  `None` lets
+    # `LiveEngine.__init__` read `limits.json` for the mode.
+    limits = LiveLimits.from_dict(json.loads(a.limits)) if a.limits else None
     eng = LiveEngine(
         mode=a.mode, limits=limits, ord_type=a.ord_type,
         signal_kwargs={"bar": a.bar, "rebalance_days": a.rebalance_days,

@@ -124,7 +124,12 @@ def engine(mode: str, limits: Optional[dict] = None,
     with _LOCK:
         eng = _ENGINES.get(mode)
         if eng is None:
-            eng = LiveEngine(mode=mode, limits=LiveLimits.from_dict(limits))
+            # `None` -- not `LiveLimits.from_dict(None)` -- so a freshly built
+            # engine reads the caps saved on disk.  Passing the defaults here
+            # would make `LiveEngine`'s "saved beats factory" fallback dead code,
+            # and a restart would quietly revert the risk limits (it did).
+            eng = LiveEngine(mode=mode,
+                             limits=LiveLimits.from_dict(limits) if limits else None)
             _ENGINES[mode] = eng
         elif limits:
             eng.limits = LiveLimits.from_dict(limits)
@@ -167,6 +172,10 @@ def route_get(path: str, q: dict) -> Optional[Tuple[dict, int]]:
                 "kill_switch": kill_switch_on(), "kill_path": kill_switch_path(),
                 "creds": creds_status(),
                 "limits_default": LiveLimits().to_dict(),
+                # Per mode, because the absolute caps are account-specific: a
+                # $1k paper book and a $54k demo account cannot share a
+                # `max_gross_notional`.  `null` = never saved for that mode.
+                "limits_saved": {m: Store(m).load_limits() for m in MODES},
                 "default_signal": DEFAULT_SIGNAL}, 200
 
     if path == "/api/live/status":
@@ -357,10 +366,20 @@ def route_post(path: str, body: dict) -> Optional[Tuple[dict, int]]:
 
     if path == "/api/live/limits":
         mode = body.get("mode", "paper")
+        if mode not in MODES:
+            return {"error": "bad mode"}, 400
         lim = LiveLimits.from_dict(body.get("limits"))
         eng = engine(mode)
         eng.limits = lim
-        return {"ok": True, "limits": lim.to_dict()}, 200
+        # The caps have to outlive this process.  They used to be assigned to the
+        # in-memory engine and nowhere else, so the button reported "已生效" and
+        # a restart brought back `LiveLimits()` defaults -- reported as
+        # "风控限额保存了重启不生效".  Write first, then report the path so the
+        # user can verify it themselves.
+        saved = eng.store.save_limits(lim.to_dict())
+        return {"ok": True, "limits": lim.to_dict(),
+                "saved_to": eng.store.limits_path(),
+                "saved_at": saved["_saved"]}, 200
 
     if path == "/api/live/reset":
         mode = body.get("mode", "paper")

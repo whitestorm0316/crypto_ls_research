@@ -105,6 +105,23 @@ def tag_dir(tag):
     return os.path.join(ARTIFACTS, tag)
 
 
+# How many pass/fail gates a *complete* full-stage run produces.  The recorded
+# v3 run reported 16/16; that is the yardstick for "do we have all the evidence
+# on disk right now", so a partial re-run is reported as partial instead of
+# quietly looking like a pass.
+_ACCEPT_EXPECTED = 16
+_ACCEPT_CACHE: dict = {}
+
+
+def _tag_stamp(tag):
+    """Newest mtime under a tag's tables/ — cheap cache key for artifact reads."""
+    d = os.path.join(tag_dir(tag), "tables")
+    try:
+        return max(os.path.getmtime(os.path.join(d, f)) for f in os.listdir(d))
+    except Exception:
+        return 0.0
+
+
 def collect_metrics(run) -> dict:
     """Everything the result panel needs, or None if the stage never produced it."""
     tag = run["tag"]
@@ -426,11 +443,17 @@ class Handler(BaseHTTPRequestHandler):
                     name.rsplit(".", 1)[-1], "application/octet-stream")
                 return self._file(os.path.join(STATIC, name), ctype)
             if p == "/api/spec":
+                base = self._baseline()
+                hl = self._headline(base)
                 return self._json({
-                    "spec": SPEC, "presets": PRESETS, "bundles": STAGE_BUNDLES,
+                    "spec": SPEC, "presets": self._presets(hl),
+                    "bundles": STAGE_BUNDLES,
                     "optimal_tag": OPTIMAL_TAG,
-                    "optimal_headline": OPTIMAL_HEADLINE,
-                    "baseline": self._baseline(),
+                    # Live numbers win over the recorded ones; the recorded dict is
+                    # kept only as the fallback for fields with no artifact.
+                    "optimal_headline": hl,
+                    "baseline": base,
+                    "acceptance": self._acceptance(),
                     "tags": self._tags(),
                     "lib_defaults": lib_defaults(),
                     "python": PY,
@@ -528,6 +551,14 @@ class Handler(BaseHTTPRequestHandler):
 
     # -- API pieces --------------------------------------------------------
     def _baseline(self):
+        """The live headline for the optimal tag, read from its artifacts.
+
+        Everything the UI shows about "the current optimum" must come from here.
+        The console used to *also* ship a hardcoded `OPTIMAL_HEADLINE`
+        (Sharpe 1.937) that no client read, while the banner hardcoded the same
+        number in JS -- so after the data was rebuilt the page claimed 1.937 in
+        the header and 1.758 in the yearly table.  One number, one source.
+        """
         head = read_json(os.path.join(ARTIFACTS, OPTIMAL_TAG, "tables",
                                       "01_headline_metrics.json"))
         if head is None:
@@ -536,8 +567,103 @@ class Handler(BaseHTTPRequestHandler):
             "tag": OPTIMAL_TAG,
             "sharpe": head.get("Sharpe"), "cagr": head.get("CAGR"),
             "mdd": head.get("Max Drawdown"),
+            "dd_days": head.get("Max DD Duration (days)"),
+            "cost_drag": head.get("Cost Drag (annual)"),
+            "funding": head.get("Funding P&L (total, frac)"),
+            "ann_turnover": head.get("Annual Turnover"),
+            "vol": head.get("Annualized Volatility"),
+            "gross_avg": head.get("Gross Exposure (avg)"),
+            "start": head.get("start"), "end": head.get("end"),
             "yearly": read_year_structure(OPTIMAL_TAG),
         })
+
+    def _acceptance(self):
+        """Evaluate the acceptance criteria from the artifacts, not from a string.
+
+        `OPTIMAL_HEADLINE.acceptance` says "16/16 通过".  That was true for the
+        original full-stage run; this machine only re-ran the `base` stage, so
+        most of the criteria have no artifact to read and cannot be evaluated at
+        all.  Reporting a remembered "16/16" next to a freshly computed baseline
+        is exactly the kind of self-contradiction this console must not have, so
+        the count is computed here and the missing evidence is named.
+        """
+        key = (OPTIMAL_TAG, _tag_stamp(OPTIMAL_TAG))
+        hit = _ACCEPT_CACHE.get(key)
+        if hit is not None:
+            return hit
+        try:
+            from crypto_ls_research.run.optimize_report import acceptance_checks
+            rows = acceptance_checks(OPTIMAL_TAG)
+        except Exception:
+            rows = []
+        gates = [r for r in rows if r.get("pass") is not None]
+        out = sanitize({
+            "rows": [{"criterion": r.get("criterion"), "value": r.get("value"),
+                      "pass": r.get("pass")} for r in rows],
+            "n_pass": sum(1 for r in gates if r.get("pass")),
+            "n_gate": len(gates),
+            "n_total": len(rows),
+            "complete": bool(gates) and len(gates) == _ACCEPT_EXPECTED,
+            "expected": _ACCEPT_EXPECTED,
+        })
+        _ACCEPT_CACHE.clear()
+        _ACCEPT_CACHE[key] = out
+        return out
+
+    def _headline(self, base):
+        """The recorded v3 headline with every live-measurable field overridden.
+
+        `OPTIMAL_HEADLINE` in spec.py is the *historical record* of the accepted
+        run (needed for fields with no artifact, and as a fallback when the tag
+        has not been re-run).  Anything we can measure from `baseline` must come
+        from `baseline`, otherwise the API publishes two different Sharpe ratios
+        for the same configuration.
+        """
+        out = dict(OPTIMAL_HEADLINE)
+        if base:
+            for k in ("sharpe", "cagr", "mdd", "dd_days", "cost_drag",
+                      "funding", "ann_turnover"):
+                if base.get(k) is not None:
+                    out[k] = base[k]
+            out["tag"] = base.get("tag")
+        out["live"] = bool(base)
+        acc = self._acceptance()
+        if acc and acc.get("n_gate"):
+            out["acceptance"] = f"{acc['n_pass']}/{acc['n_gate']} 通过"
+            if not acc.get("complete"):
+                out["acceptance"] += f"（证据不全：完整需 {acc['expected']} 项）"
+        out["acceptance_live"] = acc
+        return sanitize(out)
+
+    def _presets(self, headline):
+        """PRESETS with the v3 entry's description filled from the live headline.
+
+        The picker used to restate "Sharpe 1.937 / CAGR 25.09% / MDD −12.72%" while
+        the header banner computed 1.758 from the artifacts -- the same page, two
+        answers.  Copy before mutating: PRESETS is module state that `check_traps`
+        and the run builder also read.
+        """
+        out = []
+        for p in PRESETS:
+            q = dict(p)
+            q["cli"] = dict(p.get("cli") or {})
+            q["overrides"] = dict(p.get("overrides") or {})
+            if q.get("id") == "v3_optimal" and headline:
+                bits = []
+                if headline.get("sharpe") is not None:
+                    bits.append(f"Sharpe {headline['sharpe']:.3f}")
+                if headline.get("cagr") is not None:
+                    bits.append(f"CAGR {headline['cagr'] * 100:.2f}%")
+                if headline.get("mdd") is not None:
+                    bits.append(f"MDD {headline['mdd'] * 100:.2f}%")
+                if headline.get("acceptance"):
+                    bits.append(f"验收 {headline['acceptance']}")
+                if bits:
+                    q["desc"] = "、".join(bits) + "。" + q["desc"]
+                    if not headline.get("live"):
+                        q["desc"] += "（未找到产物，以上为记录值）"
+            out.append(q)
+        return out
 
     def _tags(self):
         if not os.path.isdir(ARTIFACTS):

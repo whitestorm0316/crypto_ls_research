@@ -26,6 +26,16 @@ OPTIMAL_OVERRIDES = {
     "portfolio.max_weight_per_instrument": 0.20,
     "execution.max_daily_turnover": 0.20,
 }
+
+# The headline recorded when v3 was accepted.  It is a **historical record**, not
+# the current truth: the console must report what the artifacts on disk say, so
+# `server.py::_headline` overrides every field it can measure from
+# `artifacts/v3/tables/01_headline_metrics.json` and keeps this dict only as the
+# fallback for fields with no artifact (and for when the tag has not been re-run).
+#
+# This distinction is not pedantry.  After the market data was rebuilt the same
+# configuration measured Sharpe 1.758 instead of 1.937, so shipping this dict as
+# "the" headline made the page claim both numbers at once.
 OPTIMAL_HEADLINE = {
     "sharpe": 1.937327,
     "cagr": 0.250868,
@@ -36,6 +46,11 @@ OPTIMAL_HEADLINE = {
     "ann_turnover": 23.887,
     "acceptance": "16/16 通过",
 }
+
+# Suffix for every Sharpe comparison below that was measured on the v3 acceptance
+# dataset.  Those before/after pairs are experiment *records* and belong together;
+# they must not be read as current numbers (see OPTIMAL_HEADLINE above).
+RECORDED_NOTE = "（历史记录值，非当前产物）"
 
 FACTOR_NAMES = ["momentum", "flow", "range_pos", "hitrate", "rev_short"]
 FACTOR_LABEL = {
@@ -269,7 +284,7 @@ SPEC: dict = {
                  "高频调仓必亏。"},
         {"key": "_cli.asset_class", "label": "池子范围", "type": "select",
          "options": ["crypto", "all"], "default": "crypto", "level": "core",
-         "help": "crypto = 剔除 OKX 上代币化股票/ETF 与商品（161 → 134）。"
+         "help": "crypto = 剔除 OKX 上代币化股票/ETF 与商品标的。"
                  "★ 增益 +0.285 但 100% 来自 2026，尚未跨期验证。"},
         {"key": "_cli.start", "label": "起始日期", "type": "text",
          "default": "2021-01-01", "level": "core"},
@@ -278,7 +293,7 @@ SPEC: dict = {
         {"key": "_cli.capital", "label": "初始资金（USD）", "type": "number",
          "default": 100000.0, "min": 10000.0, "max": 100_000_000.0,
          "step": 10000.0, "level": "adv",
-         "help": "容量曲线：$10M 时 Sharpe 1.937 → 1.696。"},
+         "help": "容量曲线：$10M 时 Sharpe 1.937 → 1.696。" + RECORDED_NOTE},
     ],
 }
 
@@ -306,8 +321,10 @@ STAGE_BUNDLES = [
 PRESETS = [
     {
         "id": "v3_optimal", "label": "v3 已验收最优", "badge": "默认",
-        "desc": "Sharpe 1.937 / CAGR 25.09% / MDD −12.72%，验收 16/16。"
-                "因子取 range_pos + hitrate。",
+        # 这里**不写指标数字**：它们由 server.py 在 /api/spec 里按产物现算后填进来
+        # （见 `_presets`）。写死过一次，数据重建后选择器和页头就对不上了。
+        "desc": "因子取 range_pos + hitrate、换手预算 20%、单名上限 20%、"
+                "1h 频率 3 天调仓、crypto 池。",
         "cli": dict(OPTIMAL_CLI), "overrides": dict(OPTIMAL_OVERRIDES),
     },
     {
@@ -340,7 +357,7 @@ PRESETS = [
     },
     {
         "id": "with_neutralize", "label": "开中性化（预期崩）",
-        "desc": "把否决清单里的一项真的跑一遍，自己看它怎么崩：1.937 → 1.596。",
+        "desc": f"把否决清单里的一项真的跑一遍，自己看它怎么崩：1.937 → 1.596 {RECORDED_NOTE}。",
         "cli": dict(OPTIMAL_CLI), "overrides": {
             "factors.subset": ["range_pos", "hitrate"],
             "factors.neutralize": True,
@@ -377,7 +394,8 @@ def check_traps(ov: dict, cli: dict) -> list:
                 "title": "因子中性化已被实测否决",
                 "body": "本实现下 v3 从 1.937 掉到 1.596；原四因子 1.567 → 0.217；"
                         "五因子 1.586 → 0.177。横截面只有约 16 个名字，回归掉噪声元"
-                        "吃掉的自由度远大于信息量。正解是剪冗余因子，不是正交化。",
+                        "吃掉的自由度远大于信息量。正解是剪冗余因子，不是正交化。"
+                        + RECORDED_NOTE,
             })
         if "rev_short" in subset:
             out.append({
@@ -410,7 +428,8 @@ def check_traps(ov: dict, cli: dict) -> list:
             "body": "K=5 比 K=10 高 +0.105 看着是增益，但 K=5 时 cap×n 正好 = 1.0、"
                     "100% 的调仓都退化成等权——量到的是等权红利 +0.1525，"
                     "不是宽度红利 +0.0580。让 sizing 真正生效后 K=5 掉到 1.889 "
-                    "（低于 v3 的 1.937），10 个 arm 全部过不了验收判据。",
+                    "（低于 v3 的 1.937），10 个 arm 全部过不了验收判据。"
+                    + RECORDED_NOTE,
         })
     slack = get("portfolio.cap_width_slack")
     if slack is not None and float(slack) > 0:
@@ -420,7 +439,8 @@ def check_traps(ov: dict, cli: dict) -> list:
             "body": "全样本看着该采纳（slack=1.00 时 1.937 → 1.966），"
                     "但逐年 Δ 里 2026 是 −0.976，15 个季度折只有 47% 为正，"
                     "锁定样本 CAGR 从 75.6% 掉到 44.4%。"
-                    "反推出的结论是：在 3–7 个名字的横截面里，等权本身就是风控。",
+                    "反推出的结论是：在 3–7 个名字的横截面里，等权本身就是风控。"
+                    + RECORDED_NOTE,
         })
     mas = get("portfolio.min_abs_score")
     if mas is not None and float(mas) > 0:
@@ -435,7 +455,8 @@ def check_traps(ov: dict, cli: dict) -> list:
     if ep == "next_close":
         out.append({"sev": "mid", "key": "execution.exec_price",
                     "title": "next_close 已被实测否决",
-                    "body": "与路线图预期反号：1.887 vs next_open 的 1.937。"})
+                    "body": "与路线图预期反号：1.887 vs next_open 的 1.937。"
+                            + RECORDED_NOTE})
     k_open = get("costs.funding_multiplier")
     if k_open == 0:
         out.append({"sev": "mid", "key": "costs.funding_multiplier",

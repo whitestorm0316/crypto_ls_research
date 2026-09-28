@@ -12,6 +12,10 @@
  *      表格里就是一格 NaN，画布却"看起来没报错"）。
  *   3. 四个子视图、三种模式、三种 job 状态都能渲染，不留死分支。
  *   4. 按钮 id 在当前这棵渲染树里真的存在（`$('#liveGo')` 取不到时绑定会静默跳过）。
+ *   5. 「省掉的无用工作」真的被省掉了，而且**只省该省的**：轮询互斥锁、日志定时器不
+ *      被反复推倒重建、内容没变就不重写 300 行的历史表、切模式不留旧账户快照。
+ *      这一类缺陷不抛错、控制台干净、截图也看不出来 —— 每条都必须配一条反向断言
+ *      （该工作时还在工作），否则把守卫写成无条件 return 也能过。
  *
  * 用法：先 `python webapp/server.py 8790`，再
  *   node scripts/smoke_live.js [baseUrl]
@@ -56,6 +60,9 @@ const PREVIEW = (() => {
    ======================================================================== */
 const overrides = new Map();             // id -> {kind:'html'|'text', v:string}
 let contentHtml = '';
+/* `#content` 被重建的次数。用来验证「轮询在没变化时不再重建」——比对 contentHtml
+ * 字符串在这里不够用：有些状态变化（如 S.active）并不改变 #content 的文本。 */
+let contentWrites = 0;
 
 /* 静态外壳（index.html 的 <body>）。app.js 顶层会 `$('#themeBtn').onclick = ...`
  * / `$('#runBtn').onclick = ...`，这两个 id 在静态 HTML 里，不在任何渲染串里；
@@ -128,9 +135,24 @@ class FakeEl {
     return s ? s.html : '';
   }
   set innerHTML(v) {
-    if (this.id === 'content') { contentHtml = String(v); overrides.clear(); resetInputsIn(v); return; }
+    if (this.id === 'content') {
+      contentHtml = String(v); overrides.clear(); resetInputsIn(v); classReg.clear();
+      /* 真实浏览器里 `#content.innerHTML = h` 会把子节点**全部销毁**，所以之后
+       * `getElementById('liveAcct')` 拿到的是一个**新元素**。FakeEl 是按 id 缓存的
+       * （els），不模拟这一步的话，挂在元素上的渲染备忘（app.js 里的
+       * `el.__lastHtml`）会跨重建活下来 —— 重建后 livePaintAll() 以为「内容没变」
+       * 而跳过重填，页面就停在骨架。测试必须比被测代码更忠于浏览器，
+       * 否则它会把一个真实存在的回归报成通过。 */
+      for (const e of els.values()) e.__lastHtml = undefined;
+      contentWrites++;
+      return;
+    }
     overrides.set(this.id, { kind: 'html', v: String(v) });
     resetInputsIn(v);
+    /* 只失效**这棵子树**里的类元素：`cp.innerHTML = …` 换的是 #liveConnPill 的
+     * 子节点，真实 DOM 里 #liveSeg 上的 classList 改动一点都不会丢。
+     * 全局清空会把 livePaintAll() 刚做完的子标签高亮抹掉（踩过一次）。 */
+    clearClassScope(this.id);
   }
   get textContent() {
     const o = overrides.get(this.id);
@@ -163,7 +185,12 @@ class FakeEl {
   setAttribute() {}
   getAttribute() { return null; }
   querySelector() { return null; }
-  querySelectorAll(sel) { return resolveAll(sel); }
+  querySelectorAll(sel) {
+    const s = String(sel).trim();
+    const c = /^\.([A-Za-z0-9_-]+)$/.exec(s);
+    if (c) return queryAllClass(c[1], this.id || '');
+    return resolveAll(sel);
+  }
   addEventListener() {}
   removeEventListener() {}
 }
@@ -193,6 +220,84 @@ function queryAllData(attr) {
       const e = new FakeEl('');
       e.dataset[attr.replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = m[1];
       e.dataset[attr] = m[1];
+      out.push(e);
+    }
+  }
+  return out;
+}
+
+/* ---- 类选择器（`.segbtn`）----
+ * 子标签高亮（`$$('.segbtn', seg)` + `classList.toggle('on', …)`）是本项目
+ * 「切换成交/运行记录切不过去」那个 bug 的实现位置。MiniDom 一开始只认 #id 和
+ * [data-x]，`.segbtn` 静默返回 []——于是高亮对不对测试根本看不见，永远不红。
+ *
+ * 这里补上按 class 扫描，并且把结果**按 key 持久化**：真实 DOM 里
+ * `classList.toggle()` 改的就是那个元素本身，后续 `querySelectorAll` 拿到的还是它。
+ * 若每次查询都新建对象，toggle 的效果立刻丢失，断言就只能读到模板初值。
+ * 生命周期对齐 innerHTML 赋值（见 FakeEl 的 setter）：重建即重置。
+ */
+const classReg = new Map();
+
+/** 某棵子树的 innerHTML 被换掉 → 只有那棵子树里的类元素失效。 */
+function clearClassScope(scopeId) {
+  if (!scopeId) { classReg.clear(); return; }
+  const pre = scopeId + '::';
+  for (const k of [...classReg.keys()]) if (k.startsWith(pre)) classReg.delete(k);
+}
+
+function classIdent(attrs, idx) {
+  const g = (a) => { const r = new RegExp(`${a}="([^"]*)"`, 'i').exec(attrs); return r ? r[1] : null; };
+  return 'lsub:' + (g('data-lsub') || g('data-cv') || g('id') || 'i' + idx);
+}
+
+function buildClassEls(cls, html, scope) {
+  const out = [];
+  const re = /<([A-Za-z][\w-]*)\b([^>]*?)\/?>/g;
+  let m, idx = 0;
+  while ((m = re.exec(String(html || '')))) {
+    const attrs = m[2] || '';
+    const cm = /class="([^"]*)"/i.exec(attrs);
+    const classes = cm ? cm[1].split(/\s+/).filter(Boolean) : [];
+    if (!classes.includes(cls)) continue;
+    const key = `${scope}::${cls}::${classIdent(attrs, idx++)}`;
+    let e = classReg.get(key);
+    if (!e) {
+      const idm = /id="([^"]*)"/i.exec(attrs);
+      e = new FakeEl(idm ? idm[1] : '');
+      e.tagName = m[1].toUpperCase();
+      e._set = new Set(classes);          // 初值来自模板给的 class 串
+      e._cls = cm ? cm[1] : '';
+      const dre = /data-([a-z-]+)="([^"]*)"/gi;
+      let d;
+      while ((d = dre.exec(attrs))) {
+        e.dataset[d[1].replace(/-([a-z])/g, (_, c) => c.toUpperCase())] = d[2];
+        e.dataset[d[1]] = d[2];
+      }
+      classReg.set(key, e);
+    }
+    out.push(e);
+  }
+  return out;
+}
+
+/** scopeId 给定时只扫该子树（`$$('.segbtn', $('#liveSeg'))` 的真实语义）。 */
+function queryAllClass(cls, scopeId) {
+  if (scopeId) {
+    const root = rootFor(scopeId);
+    if (root != null) {
+      const s = sliceByTag(root, scopeId);
+      if (s) return buildClassEls(cls, s.html, scopeId);
+    }
+  }
+  const roots = [...overrides.values()].filter((o) => o.kind === 'html').map((o) => o.v)
+    .concat([contentHtml, staticHtml]);
+  const out = [];
+  const seen = new Set();
+  for (const r of roots) {
+    for (const e of buildClassEls(cls, r, '')) {
+      const k = e.id + '|' + (e.dataset.lsub || e.dataset.cv || '');
+      if (seen.has(k)) continue;
+      seen.add(k);
       out.push(e);
     }
   }
@@ -355,7 +460,12 @@ src += `
   liveModeHtml, liveAcctHtml, liveSignalHtml, liveGatesHtml, livePlanHtml, liveJobHtml,
   liveHistHtml, liveLimitsHtml, liveBind, liveExport, tabBar, LIVE_LABEL,
   LIVE_LIMIT_FIELDS, liveLeverageHtml, liveTradeSettings, pollRuns, renderSide,
-  liveNetHtml };
+  liveNetHtml, startLog, stopLog };
+/* 用 typeof 守卫：SMOKE_APP 指向旧版 app.js 做变异测试时，那里还没有 runsSig，
+ * 直接写进字面量会让整份源码在加载阶段就 ReferenceError，测试一行都跑不到。 */
+if (typeof runsSig === 'function') globalThis.__T.runsSig = runsSig;
+if (typeof limitsDiff === 'function') globalThis.__T.limitsDiff = limitsDiff;
+if (typeof limitsStateHtml === 'function') globalThis.__T.limitsStateHtml = limitsStateHtml;
 `;
 vm.createContext(sandbox);
 vm.runInContext(src, sandbox, { filename: 'app.js' });
@@ -399,6 +509,7 @@ const LOADING = ['正在读取…', '正在读取账户…'];
   const S = T.S;
   S.spec = spec.spec; S.presets = spec.presets; S.bundles = spec.bundles;
   S.lib = spec.lib_defaults || {}; S.baseline = spec.baseline; S.optimalTag = spec.optimal_tag;
+  S.acceptance = spec.acceptance || null; S.headline = spec.optimal_headline || null;
   T.applyPreset('v3_optimal');
   S.runs = [];
 
@@ -423,6 +534,33 @@ const LOADING = ['正在读取…', '正在读取账户…'];
     'liveJob', 'liveHist']) {
     check(`骨架里有 #${id}`, sandbox.document.getElementById(id) != null);
   }
+
+  /* --- 1b. 页头横幅的指标必须来自基线产物，不能写死 ---
+   * 这个页面曾经同时宣称 Sharpe 1.937（横幅在 JS 里写死）和 1.758（KPI 卡与年度表
+   * 按产物实算）。数据一重建，同一个页头就自相矛盾。现在横幅一律读 /api/spec 的
+   * baseline 与 acceptance。 */
+  const b0 = S.baseline;
+  const a0 = S.acceptance;
+  const _i0 = contentHtml.indexOf('class="banners"');
+  const _i1 = contentHtml.indexOf('核心指标');
+  const ban = (_i0 >= 0 && _i1 > _i0) ? contentHtml.slice(_i0, _i1) : contentHtml;
+  check('横幅显示基线 Sharpe（来自产物）',
+    !!(b0 && b0.sharpe != null) && ban.includes(T.fmt.n(b0.sharpe)),
+    `baseline.sharpe=${b0 && b0.sharpe}`);
+  check('横幅不再残留写死的 1.937 / 25.09 / 12.72',
+    !ban.includes('1.937') && !ban.includes('25.09') && !ban.includes('12.72'),
+    ban.slice(0, 140).replace(/<[^>]*>/g, ' '));
+  check(`横幅验收条数与 /api/spec 一致（${a0 ? a0.n_pass + '/' + a0.n_gate : 'n/a'}）`,
+    !a0 || !a0.n_gate || ban.includes(`${a0.n_pass}/${a0.n_gate}`),
+    JSON.stringify(a0 && { n_pass: a0.n_pass, n_gate: a0.n_gate, complete: a0.complete }));
+  check('证据不全时不冒充「16/16 通过」',
+    !a0 || a0.complete || !ban.includes('16/16'));
+  /* 预设选择器的 v3 文案由 server.py 现算填入，也不能写死。 */
+  const pv3 = (S.presets || []).find((p) => p.id === 'v3_optimal');
+  check('v3_optimal 选择器文案用基线 Sharpe（不是写死的 1.937）',
+    !!pv3 && !!(b0 && b0.sharpe != null)
+    && pv3.desc.includes(T.fmt.n(b0.sharpe)) && !pv3.desc.includes('1.937'),
+    pv3 ? pv3.desc.slice(0, 80) : '(无该 preset)');
 
   /* --- 2. 重建即回占位（本项目最贵的那个坑） --- */
   // renderContent() 刚把 #liveRoot 整个重建过，所有 override 都被清空。这 7 个
@@ -553,19 +691,65 @@ const LOADING = ['正在读取…', '正在读取账户…'];
   check(`闸门渲染出 ${preview.violations.length} 条（warn ${nWarn} / block ${nBlock}）`,
     gh.includes('gate warn') || gh.includes('gate block') || gh.includes('全部通过'));
   check('「非调仓日」被渲染成警告', gh.includes('当前不是调仓日'));
-  check('「行情缓存过期」被渲染成警告', gh.includes('行情缓存') || gh.includes('行情数据已过期'));
+  /* 「行情缓存过期」不是每份 preview 都有——数据新鲜时这条闸门压根不该出现。
+   * 以前这里写死「必须出现」，于是数据一刷新测试就红，红得毫无信息量。
+   * 现在按实际 violations 条件化，两个方向都有牙齿：有则必须渲染成 warn，
+   * 没有则**不许凭空冒出来**（凭空出现同样是 bug）。 */
+  const staleV = (preview.violations || []).find(
+    (v) => /行情缓存|行情数据已过期|stale/i.test(String(v.key || '') + String(v.title || '')));
+  check(`行情过期闸门与实际 violations 一致（${staleV ? '有' : '无'}）`,
+    staleV ? gh.includes(staleV.title) : !/行情缓存|行情数据已过期/.test(gh),
+    staleV ? staleV.title : '数据新鲜 → 不应出现该闸门');
   check('paper 模式无 block 时不出现拦截样式', nBlock > 0 || !gh.includes('gate block'));
 
   const ph = region('livePlan');
   const p = preview.plan;
+  const tgt = preview.target || {};
   check(`下单表有 ${p.n_orders} 行`, (ph.match(/data-lord=/g) || []).length === p.n_orders,
     `${(ph.match(/data-lord=/g) || []).length} 行`);
-  check('账单显示原始目标毛敞口 1.202', ph.includes('1.202'), p.raw_target_gross / p.nav);
-  check('账单显示预算后 0.200', ph.includes('0.200'));
-  check('账单显示换手缩放 16.6%', ph.includes('16.6'));
+  /* 账单里的三个数字全部**从当前 preview 派生**，并且刻意用 UI 自己的 fmt
+   * 去算期望值——否则每换一份 preview（换手预算、池宽、本金一变）就要来改一次
+   * 测试，而改测试的人多半会顺手把断言改成恒真。 */
+  const wantRaw = T.fmt.n((p.raw_target_gross || 0) / (p.nav || 1), 3);
+  const wantBudget = T.fmt.n((p.target_gross || 0) / (p.nav || 1), 3);
+  const wantScale = T.fmt.pct(p.turnover_scale);
+  check(`账单原始目标毛敞口 = raw_target_gross/nav（${wantRaw}）`,
+    ph.includes(wantRaw), `raw=${p.raw_target_gross} nav=${p.nav}`);
+  check(`账单预算后毛敞口 = target_gross/nav（${wantBudget}）`,
+    ph.includes(wantBudget), `target_gross=${p.target_gross}`);
+  check(`账单换手缩放 = turnover_scale（${wantScale}）`,
+    ph.includes(wantScale), `turnover_scale=${p.turnover_scale}`);
+  /* 解释横幅里的倍数也是实算的（baseline 实际毛敞口均值 vs 本次原始目标）。 */
+  const gAvg = (spec.baseline || {}).gross_avg;
+  const mult = gAvg > 0 ? ((p.raw_target_gross / p.nav) / gAvg).toFixed(1) : null;
   check('有「只执行目标变动的 x%」解释横幅',
-    ph.includes('只执行目标变动的') && ph.includes('2.2 倍'));
-  check(`跳过腿 ${p.skips.length} 条被披露`, ph.includes(`被跳过的目标腿（${p.skips.length}）`));
+    ph.includes('只执行目标变动的') && ph.includes('不是 bug')
+    && (mult == null || ph.includes(`${mult} 倍`)),
+    mult == null ? '（基线缺 gross_avg，跳过倍数）' : `期望 ${mult} 倍`);
+  /* 空 skips 时这一小节本来就不该渲染（app.js 里是 `if (p.skips.length)`）。 */
+  const nSkips = (p.skips || []).length;
+  check(`跳过腿披露与实际一致（${nSkips} 条）`,
+    nSkips ? ph.includes(`被跳过的目标腿（${nSkips}）`) : !ph.includes('被跳过的目标腿'),
+    nSkips ? '' : '空列表不应渲染该小节');
+
+  /* 执行后必须显示「实际扣减了多少换手预算」，且与计划值分开。
+   * 以前无论订单是否被受理都按计划值扣满：一次全部被拒的下单也会把当日额度吃光，
+   * 下一次金额被缩到几美分，页面上却没有任何东西解释。 */
+  const realPlan = S.live.plan;
+  S.live.plan = Object.assign({}, preview, {
+    record: { turnover_frac: 0.19865, turnover_charged: 0.05012 },
+  });
+  T.livePaintAll();
+  const ph2 = region('livePlan');
+  check('显示实际扣减的换手预算，且与计划值分列',
+    ph2.includes('本次实际扣减当日换手预算')
+    && ph2.includes(T.fmt.pct(0.05012)) && ph2.includes(T.fmt.pct(0.19865))
+    && ph2.includes(T.fmt.pct(0.19865 - 0.05012)),
+    `扣 5.01% / 计划 19.87% / 未扣 14.85%`);
+  check('未被受理而未扣的部分被点名',
+    ph2.includes('因订单未被受理而未扣'));
+  S.live.plan = realPlan;
+  T.livePaintAll();
   check('覆盖率与权重误差被显示', ph.includes('信号覆盖率') && ph.includes('权重误差'));
   check('paper 模式的执行按钮文案正确',
     ph.includes('执行调仓（本地模拟成交）') && ph.includes('id="liveGo"'));
@@ -579,11 +763,16 @@ const LOADING = ['正在读取…', '正在读取账户…'];
   const sh = region('liveSignal');
   check('信号区显示信号日与下次调仓',
     sh.includes('信号日') && sh.includes('下次调仓'));
-  check('信号区显示池宽 19 / 多 9 / 空 10',
-    sh.includes('>19<') && sh.includes('多 9 / 空 10'));
+  /* 池宽与毛敞口同样从 preview.target 派生（以前写死 19/9/10 与 1.2018）。 */
+  const dg = (tgt.diagnostics || {});
+  check(`信号区显示池宽 ${dg.n_universe} / 多 ${dg.n_long} / 空 ${dg.n_short}`,
+    sh.includes(`>${dg.n_universe}<`) && sh.includes(`多 ${dg.n_long} / 空 ${dg.n_short}`),
+    `实际渲染：${(sh.match(/可选池宽[\s\S]{0,90}/) || [''])[0].replace(/<[^>]*>/g, ' ')}`);
   check('信号区显示缩放分解（regime/BTC 波动/回撤）',
     sh.includes('regime') && sh.includes('BTC 波动') && sh.includes('回撤'));
-  check('信号区目标毛敞口 1.2018', sh.includes('1.2018'));
+  const wantGross = T.fmt.n(tgt.gross, 4);
+  check(`信号区目标毛敞口 = target.gross（${wantGross}）`,
+    sh.includes(wantGross), `target.gross=${tgt.gross}`);
 
   /* --- 9. 四个子视图 --- */
   for (const sub of ['orders', 'fills', 'runs', 'limits']) {
@@ -618,6 +807,30 @@ const LOADING = ['正在读取…', '正在读取账户…'];
       check(`子视图 ${sub} 空表时给出「暂无记录」`, h.includes('暂无记录') || h.includes('<table'));
     }
   }
+
+  /* --- 9a. 子标签高亮必须跟着 S.live.sub 走 ---
+   * 用户报的是「切换成交和运行记录 tab 老是切换不过去」：表格换了，高亮还停在
+   * 上一个标签上，看起来就像没切过去。根因是 livePaintAll() 只重绘 #liveHist，
+   * 从不同步 #liveSeg 的 on 类——而 #liveSeg 只在 liveSkeleton() 里渲染一次。
+   * 断言的是**切换之后**的状态：只渲染一次的话，切到 fills 后 fills 不会有 on。 */
+  const SUB_TABS = ['orders', 'fills', 'runs', 'limits'];
+  const segOn = (seg, tab) => {
+    const b = seg.find((x) => x.dataset.lsub === tab);
+    return b ? b.hasClass('on') : null;
+  };
+  let seg = queryAllClass('segbtn', 'liveSeg');
+  check('交易台子标签被扫到 4 个', seg.length === 4, `${seg.length}`);
+  for (const want of ['orders', 'fills', 'runs', 'limits']) {
+    S.live.sub = want;
+    T.livePaintAll();
+    seg = queryAllClass('segbtn', 'liveSeg');
+    const others = SUB_TABS.filter((x) => x !== want);
+    check(`切到「${want}」后只有它高亮`,
+      segOn(seg, want) === true && others.every((x) => segOn(seg, x) === false),
+      SUB_TABS.map((x) => `${x}=${segOn(seg, x)}`).join(' '));
+  }
+  S.live.sub = 'orders';
+  T.livePaintAll();
 
   /* --- 9b. 网络延迟徽标（「卡顿」得能被归因，不能只靠猜） --- */
   check('没有请求样本时不显示延迟徽标', T.liveNetHtml({}) === '');
@@ -814,10 +1027,349 @@ const LOADING = ['正在读取…', '正在读取账户…'];
   check('无焦点重建后内容仍由第一道防线兜住', elById('lvKey').value === 'dont-touch-me',
     JSON.stringify(elById('lvKey').value));
 
+  /* --- 15c. 轮询不再无条件重建整页（用户报的「滑着滑着跳到运行记录」） ---
+   * pollRuns() 每 2.5s 跑一次，以前无条件 renderContent()：交易台里那张最多 300 行
+   * 的历史表被反复拆建，滚动位置每 2.5s 被重置一次——表现就是"页面自己跳走"；
+   * 同一机制还会在 mousedown 与 click 之间把按钮换掉，于是"子标签点了没反应"。
+   * 现在：run 列表签名不变、且没有任务在跑时，直接跳过重建。
+   *
+   * 断言用 #content 的**重建次数**而不是字符串比对：像 S.active 这种变化并不改变
+   * #content 的文本，只比字符串会漏判。三件事都要验：
+   *   ① 没变化 → 不重建（省掉无用重建）
+   *   ② 列表变了 → 必须重建（否则 UI 永远不刷新）
+   *   ③ 有任务在跑 → 必须重建（那时用户就是要看进度）
+   */
+  const realRuns = S.runs;
+  const origFetch = sandbox.fetch;
+  let runsPayload = { runs: [], active: false, queued: [] };
+  sandbox.fetch = (u, o) => {
+    const s = String(u);
+    if (s.includes('/api/runs') && !/\/api\/runs\//.test(s)) {
+      return Promise.resolve({ ok: true, json: async () => runsPayload });
+    }
+    return origFetch(u, o);
+  };
+
+  S.runsSig = undefined;
+  await T.pollRuns();                       /* 首次：建立签名并重建一次 */
+  const wSkip = contentWrites;
+  await T.pollRuns();                       /* 无变化：应跳过 */
+  check('run 列表无变化时 pollRuns 不重建 #content', contentWrites === wSkip,
+    `重建 ${contentWrites - wSkip} 次`);
+  check('无变化时签名保持不变（跳过判据本身是稳定的）',
+    typeof T.runsSig !== 'function' || S.runsSig === T.runsSig(), JSON.stringify(S.runsSig));
+
+  runsPayload = { runs: [{ id: 'zz-1', status: 'done', n_stage_errors: 0,
+    summary: { sharpe: 1.23, cagr: 0.11 } }], active: false, queued: [] };
+  await T.pollRuns();
+  check('run 列表变化后 pollRuns 立刻重建 #content', contentWrites === wSkip + 1,
+    `重建 ${contentWrites - wSkip} 次`);
+
+  const wActive = contentWrites;
+  runsPayload = { runs: runsPayload.runs, active: true, queued: [] };
+  await T.pollRuns();
+  check('有任务在跑时 pollRuns 持续重建（进度要看得见）', contentWrites === wActive + 1,
+    `重建 ${contentWrites - wActive} 次`);
+
+  sandbox.fetch = origFetch;
+  S.runs = realRuns;
+  S.runsSig = undefined;
+
   S.live.mode = 'paper';
   S.live.credsOpen = false;
   S.live.sub = 'orders';
   T.livePaintAll();
+
+  /* --- 15d. 「老是有延迟和 bug」的四个具体成因 ---
+   * 这四条都不会抛错、控制台干净、截图也看不出来，只能靠断言钉住：
+   *   ① pollRuns 每 2.5s 起一次，而它内部有 `await fetch` —— 某轮慢过 2.5s 就会叠起来，
+   *      多个 renderContent() 并发互相覆盖，表现为「抖一下、点了没反应」；
+   *   ② startLog 被 pollRuns 每 2.5s 调一次，实现却是「先 clearInterval 再 setInterval」，
+   *      于是 1.1s 的日志轮询被推倒重建，节奏被拉成 1.1s / 1.4s 交替；
+   *   ③ livePaintAll 有三十来个调用点，每次都把最多 300 行的历史表整张重建；
+   *   ④ 切模式时旧模式的账户快照留在 state 里 —— liveLoadStatus 要 ~1.4s，这期间
+   *      账户面板拿 paper 的 $1,000 去顶 demo 的位置。
+   * 每条都做成**成对断言**：省掉无用工作的那条，必须配一条「该工作时还在工作」，
+   * 否则把守卫改成无条件 return 也能过（本项目踩过的假绿就是这么来的）。
+   */
+
+  /* ① 互斥锁：慢轮询还在飞时，第二次 pollRuns 不许再发一次请求 */
+  {
+    const realFetch2 = sandbox.fetch;
+    const realDetail2 = S.detail;
+    let runsHits = 0;
+    let releaseRuns = null;
+    const gate = new Promise((r) => { releaseRuns = r; });
+    sandbox.fetch = (u, o) => {
+      const s = String(u);
+      if (s.includes('/api/runs') && !/\/api\/runs\//.test(s)) {
+        runsHits++;
+        return gate.then(() => ({ ok: true, json: async () => ({ runs: [], active: false, queued: [] }) }));
+      }
+      return realFetch2(u, o);
+    };
+    S.detail = null;                  /* 隔离：别把日志轮询扯进来 */
+    S.runsSig = undefined;
+    const p1 = T.pollRuns();          /* 同步跑到 `await fetch`，锁已上 */
+    const p2 = T.pollRuns();          /* 必须被锁挡掉 */
+    check('慢轮询在飞时第二次 pollRuns 不再发请求（互斥锁）', runsHits === 1,
+      `实际发了 ${runsHits} 次 /api/runs`);
+    releaseRuns();
+    await Promise.all([p1, p2]);
+    const hitsDone = runsHits;
+    await T.pollRuns();               /* 上一轮结束后：锁必须已经释放 */
+    check('互斥锁在轮询结束后释放（守卫不能变成永久停摆）', runsHits === hitsDone + 1,
+      `上一轮结束后发了 ${runsHits - hitsDone} 次`);
+    sandbox.fetch = realFetch2;
+    S.detail = realDetail2;
+    S.runsSig = undefined;
+  }
+
+  /* ② 日志轮询的节奏不能被 2.5s 的 runs 轮询反复推倒重建 */
+  {
+    S.detail = { id: 'smoke-log-a', status: 'running', _log: '' };
+    S.selected = 'smoke-log-a';
+    T.startLog(S.detail);
+    const timer1 = S.logTimer;
+    check('运行中的 run 会起日志轮询', !!timer1 && S.logRunId === 'smoke-log-a');
+    T.startLog(S.detail);
+    T.startLog(S.detail);
+    check('重复 startLog 同一个 run 不推倒重建定时器', S.logTimer === timer1,
+      '「日志一顿一顿」的成因就是这个');
+    T.startLog({ id: 'smoke-log-b', status: 'running' });
+    check('换了被观察的 run 才重建定时器',
+      S.logTimer !== timer1 && S.logRunId === 'smoke-log-b');
+    S.detail.status = 'done';
+    T.startLog(S.detail);
+    check('run 结束后日志轮询停掉', S.logTimer === null && S.logRunId === null);
+    T.stopLog();
+    S.detail = null;
+    S.selected = null;
+  }
+
+  /* ③ 内容没变就不重写 #liveHist（它最多 300 行 × 8 列） */
+  {
+    const realSet = overrides.set.bind(overrides);
+    let histWrites = 0;
+    overrides.set = (k, v) => { if (k === 'liveHist') histWrites++; return realSet(k, v); };
+
+    S.live.sub = 'fills';             /* 先制造一次真实的内容变化 */
+    T.livePaintAll();
+    check('子视图切换后 #liveHist 确实被重写（守卫不能变成不刷新）', histWrites >= 1,
+      `写 ${histWrites} 次`);
+
+    S.live.sub = 'orders';
+    T.livePaintAll();
+    const w0 = histWrites;
+    T.livePaintAll();                 /* 状态没变：不该再写一次 */
+    check('状态没变时 livePaintAll 不重写 #liveHist（省掉整表重建）',
+      histWrites === w0, `第二次多写了 ${histWrites - w0} 次`);
+
+    overrides.set = realSet;
+    S.live.sub = 'orders';
+    T.livePaintAll();
+  }
+
+  /* ④ 切模式必须立刻丢掉上一个模式的账户快照 */
+  {
+    const realFetch3 = sandbox.fetch;
+    const realQsa = sandbox.document.querySelectorAll;
+    let releaseStatus = null;
+    let statusHits = 0;
+    const gate = new Promise((r) => { releaseStatus = r; });
+    sandbox.fetch = (u, o) => {
+      const s = String(u);
+      if (s.includes('/api/live/status')) {
+        statusHits++;
+        return gate.then(() => ({ ok: true, json: async () => ({
+          account: { nav: 54000, positions: [], pos_mode: 'long_short_mode' },
+          store: { turnover_used_today: 0 },
+          creds: { configured: true },
+        }) }));
+      }
+      return realFetch3(u, o);
+    };
+
+    const realMode = S.live.mode;
+    const realStatus = S.live.status;
+    const realOrders2 = S.live.orders;
+    S.live.mode = 'paper';
+    S.live.status = { creds: { configured: false },
+      account: { nav: 1000, positions: [], pos_mode: 'net_mode' }, store: {} };
+    T.renderContent();
+
+    /* `liveBind()` 把 onclick 挂在 `$$('[data-lmode]')` 返回的那批元素上，而
+     * queryAllData() 每次调用都新建对象 —— 事后拿不到那些元素。这里包一层
+     * document.querySelectorAll 把它们截下来，驱动的仍是**真实的** onclick。 */
+    let modeBtns = null;
+    sandbox.document.querySelectorAll = (sel) => {
+      const r = realQsa(sel);
+      if (String(sel) === '[data-lmode]') modeBtns = r;
+      return r;
+    };
+    T.liveBind();
+    sandbox.document.querySelectorAll = realQsa;
+
+    const demoBtn = modeBtns && modeBtns.find((b) => b.dataset.lmode === 'demo');
+    check('抓到了 demo 模式卡的真实 onclick',
+      !!demoBtn && typeof demoBtn.onclick === 'function');
+    const pending = demoBtn.onclick();          /* 不 await：要在等待窗口里观察 */
+
+    check('切模式后旧模式的账户快照立刻被丢弃',
+      !(S.live.status && S.live.status.account),
+      JSON.stringify((S.live.status || {}).account));
+    check('切模式时凭据状态保留（与 mode 无关）',
+      !!(S.live.status && S.live.status.creds));
+    const midHtml = region('liveAcct');
+    check('切模式期间账户区显示「正在读取账户…」而不是旧模式的净值',
+      midHtml.includes('正在读取账户') && !midHtml.includes(T.fmt.dol(1000)),
+      midHtml.slice(0, 90).replace(/<[^>]*>/g, ' '));
+
+    releaseStatus();
+    await pending;
+    check('新模式的快照读回来后替换掉占位',
+      region('liveAcct').includes(T.fmt.dol(54000)),
+      region('liveAcct').slice(0, 90).replace(/<[^>]*>/g, ' '));
+    check('切模式只发一次状态请求', statusHits === 1, `${statusHits} 次`);
+
+    sandbox.fetch = realFetch3;
+    S.live.mode = realMode;
+    S.live.status = realStatus;
+    S.live.orders = realOrders2;
+    T.renderContent();
+  }
+
+  /* --- 15e. 「风控限额保存了重启不生效」+「今日换手预算对不上」 ---
+   * 两条都是用户报的，且都是**在一个进程内看不出来**的缺陷：
+   *   · 限额只写进内存里的 engine，重启后回到出厂默认 —— 与「按钮没反应」无法区分；
+   *   · 账户区把「策略节流预算」和「风控硬闸门」并排显示，两处都不说来源，且「已用」
+   *     取的是不重置的原始值 —— 一个标题下面两个数字。
+   * 所以断言要落在「页面上这几个数自洽」与「保存这件事有落点」上。 */
+  {
+    const realStatus4 = S.live.status;
+    const realLimits = S.live.limits;
+    const realSaved = S.live.savedLimits;
+    const realBaseline = S.baseline;
+    const realSub = S.live.sub;
+
+    /* ① 换手预算：预算 − 已用 = 剩余 必须在页面上成立，且「已用」是按 UTC 日重置后的值 */
+    const BUDGET = 0.2, USED = 0.06;
+    S.live.statusLoading = false;
+    S.live.status = {
+      turnover_budget: BUDGET, turnover_used_today: USED,
+      account: { nav: 1000, positions: [], pos_mode: 'net_mode' },
+      store: { turnover_used_today: USED, turnover_stale: false },
+      prices_source: 'cache',
+    };
+    T.renderContent();
+    const acct = region('liveAcct');
+    check('账户区把换手写成「策略节流」，不再与风控闸门同名',
+      acct.includes('换手预算（策略节流）'), acct.slice(0, 80));
+    /* 期望值从 UI 自己的格式化函数派生，不写死字符串：换一份数据也不用改测试 */
+    const wantUsed = T.fmt.pct(USED, 1);
+    const wantRemain = T.fmt.pct(BUDGET - USED, 1);
+    check(`「已用」按 UTC 日重置后的值渲染（${wantUsed}）`,
+      acct.includes(wantUsed), wantUsed);
+    check(`「剩余」= 预算 − 已用（${wantRemain}）`, acct.includes(wantRemain), wantRemain);
+    check('预算本身仍按百分数显示（与「已用/剩余」同一量纲）',
+      acct.includes(T.fmt.pct(BUDGET, 0)));
+
+    /* 日切之后必须**明说**旧值被丢掉，而不是悄悄显示 0 */
+    S.live.status.store.turnover_stale = true;
+    T.renderContent();
+    check('UTC 日切换时明说「上一日用量已归零」（不静默显示 0）',
+      region('liveAcct').includes('上一日用量已归零'));
+
+    /* ② 限额保存状态：三种状态各自说清楚，且「已保存」必须报出落盘路径 */
+    S.live.limits = {
+      max_gross_notional: 5000, max_order_notional: 1000, max_orders: 60,
+      max_turnover_frac: 1, max_adv_participation: 0.05, min_nav_usd: 50,
+      max_nav_usd: null, max_leverage: 5, max_gross_frac: 1,
+      require_rebalance_due: true,
+    };
+    S.live.savedLimits = null;
+    S.live.status = Object.assign({}, S.live.status, {
+      limits_saved: null, limits_path: 'artifacts/live/paper/limits.json' });
+
+    check('从未保存过 → 明说「出厂默认值」且「重启后会回到这里」',
+      T.limitsStateHtml().includes('从未保存过')
+      && T.limitsStateHtml().includes('出厂默认值'));
+
+    const SAVED = Object.assign({}, S.live.limits, { _saved: 1700000000 });
+    S.live.savedLimits = SAVED;
+    const okBanner = T.limitsStateHtml();
+    check('已保存 → 报出落盘路径（用户能自己去核对）',
+      okBanner.includes('artifacts/live/paper/limits.json') && okBanner.includes('已保存'),
+      okBanner.slice(0, 70));
+    check('已保存 → 提示「重启控制台后仍然生效」',
+      okBanner.includes('重启控制台后仍然生效'));
+
+    /* 改一个字段但没点保存：必须**点名**是哪个字段还没落盘 */
+    S.live.limits = Object.assign({}, S.live.limits, { max_leverage: 3 });
+    const dirty = T.limitsStateHtml();
+    check('有未保存改动 → 点名未落盘的字段',
+      dirty.includes('未保存') && dirty.includes('max_leverage'), dirty.slice(0, 90));
+    check('未保存的字段恰好只点名那一个（不误报其它字段）',
+      dirty.includes('max_leverage') && !dirty.includes('max_orders'), dirty.slice(0, 120));
+
+    /* ③ 杠杆横幅的毛敞口/换手必须来自实算 —— 以前写死「0.47× / 20%」，
+     *    和页头横幅那次是同一个缺陷（数据一重建就自相矛盾）。 */
+    S.live.limits = Object.assign({}, S.live.limits, { max_leverage: 5 });
+    S.baseline = { gross_avg: 0.83 };
+    S.live.status = Object.assign({}, S.live.status, { turnover_budget: 0.2 });
+    const lev1 = T.liveLeverageHtml({ max_leverage: 5, max_gross_frac: 2 });
+    check(`杠杆横幅的毛敞口取自 baseline 实算（${T.fmt.n(0.83, 2)}×）`,
+      lev1.includes(T.fmt.n(0.83, 2) + '×'), lev1.slice(0, 60));
+    check('杠杆横幅不再出现写死的 0.47×', !lev1.includes('0.47'));
+    S.baseline = { gross_avg: 1.37 };
+    S.live.status.turnover_budget = 0.35;
+    const lev2 = T.liveLeverageHtml({ max_leverage: 5, max_gross_frac: 2 });
+    check('毛敞口随 baseline 变（证明是实算，不是常量）', lev2.includes('1.37×'));
+    check('换手随当前预算变（证明是实算，不是常量）',
+      lev2.includes(T.fmt.pct(0.35, 0)) && !lev2.includes(T.fmt.pct(0.2, 0)));
+
+    /* ④ 点「保存限额」必须把**勾选框的真实状态**送出去。
+     *    `liveSaveLimits(requireDue)` 的第一个参数被 onclick 的 MouseEvent 顶掉了
+     *    （恒真），于是取消勾选后保存会把 true 又存回去 —— 勾选框静默失效。 */
+    const realFetch5 = sandbox.fetch;
+    let sentBody = null;
+    sandbox.fetch = (u, o) => {
+      const s = String(u);
+      if (s.includes('/api/live/limits')) {
+        sentBody = JSON.parse((o && o.body) || '{}');
+        return Promise.resolve({ ok: true, json: async () => ({
+          ok: true, limits: sentBody.limits,
+          saved_to: '/tmp/limits.json', saved_at: 1700000001 }) });
+      }
+      if (s.includes('/api/live/status')) {
+        return Promise.resolve({ ok: true, json: async () => (S.live.status || {}) });
+      }
+      return realFetch5(u, o);
+    };
+    S.live.sub = 'limits';
+    S.live.status = Object.assign({}, S.live.status, { limits: S.live.limits });
+    T.renderContent();
+    T.liveBind();
+    const cb = sandbox.document.getElementById('lvRequireDue');
+    if (cb) cb.checked = false;              /* 用户取消了勾选 */
+    const saveBtn = sandbox.document.getElementById('liveLimitsSave');
+    check('限额子视图里存在「保存限额」按钮', saveBtn != null);
+    await saveBtn.onclick({ type: 'click' }); /* 传一个真事件，复现参数被顶掉的情形 */
+    const sentDue = sentBody && sentBody.limits
+      && sentBody.limits.require_rebalance_due;
+    check('点保存送出的是勾选框的真实状态（false），不是 MouseEvent 的恒真',
+      sentDue === false, JSON.stringify(sentDue));
+    check('保存后提示里带上落盘路径（用户知道去哪儿核对）',
+      String(S.live.note || '').includes('/tmp/limits.json'), String(S.live.note));
+    sandbox.fetch = realFetch5;
+
+    S.live.sub = realSub;
+    S.live.status = realStatus4;
+    S.live.limits = realLimits;
+    S.live.savedLimits = realSaved;
+    S.baseline = realBaseline;
+    T.renderContent();
+  }
 
   /* --- 16. 空状态下不留悬空 id --- */
   S.live.plan = null;

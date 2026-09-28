@@ -24,10 +24,12 @@ Order of operations on every execution (the order matters)
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -45,7 +47,7 @@ from .okx_private import (MAX_LEVERAGE_BATCH, MAX_ORDER_BATCH, AmbiguousError,
 from .planner import Order, Plan, build_plan, prices_from_cache
 from .signal import LiveTarget, compute_live_target
 from .specs import InstSpec, load_specs
-from .store import Store, new_run_id
+from .store import RebalanceBusy, Store, new_run_id, rebalance_lock  # noqa: F401
 
 #: The v3 verified configuration.  Kept here (not in webapp/spec.py) so the
 #: execution layer does not depend on the UI.
@@ -208,6 +210,26 @@ def daily_vol_map(insts: Sequence[str], bar: str = "1h", window: int = 60) -> Di
 
 
 # ---------------------------------------------------------------------------
+def _clordid_prefix(run_id: str) -> str:
+    """A per-**run** clOrdId prefix, derived from the whole run id.
+
+    This used to be `run_id.replace("_", "")[:10]`.  For
+    `demo_20260928_150854_862ed8` that is `demo202609` -- the mode plus the
+    *year and month*.  The date, the time and the random suffix, i.e.
+    everything that makes one run different from the next, were truncated away,
+    so every rebalance in the same month minted byte-identical client order ids
+    for the same (instrument, index).  The ledger then cannot say which run an
+    order belongs to, and `order_by_clordid` reconciles against the wrong one.
+
+    A digest of the full run id keeps the readable mode prefix, stays inside the
+    id's 20-char readable budget, and is unique per run by construction rather
+    than by hoping the surviving fragment was the distinctive one.
+    """
+    mode = (run_id.split("_") or [""])[0][:4] or "run"
+    return mode + hashlib.sha1(run_id.encode("utf-8")).hexdigest()[:8]
+
+
+# ---------------------------------------------------------------------------
 class LiveEngine:
     """One engine per mode.  Holds no long-lived connection; REST only."""
 
@@ -220,7 +242,13 @@ class LiveEngine:
             raise ValueError(f"unknown mode {mode!r}")
         self.mode = mode
         self.store = Store(mode)
-        self.limits = limits or LiveLimits()
+        # The saved caps beat the factory defaults.  They used to live only in
+        # the caller's memory (`live_api._ENGINES`), so restarting the console
+        # silently reverted every risk limit to `LiveLimits()` -- indistinguishable
+        # from "the save button does nothing", which is exactly how it was
+        # reported.  `limits=` still wins when a caller passes them explicitly.
+        self.limits = limits if limits is not None else LiveLimits.from_dict(
+            self.store.load_limits())
         self.signal_kwargs = {**DEFAULT_SIGNAL, **(signal_kwargs or {})}
         self.costs = costs or CostConfig()
         self.ord_type = ord_type
@@ -233,8 +261,44 @@ class LiveEngine:
         self._specs: Dict[str, InstSpec] = {}
         self._signals = {"msg": "未开始", "ts": None, "ok": None}
         self._cli: Optional[tuple] = None      # (credential key, OKXPrivate)
+        #: `(ts, set_or_None)` for the venue's tradable instrument list.
+        self._venue: tuple = (0.0, None)
         #: Set by whoever runs the job; slow/retry notices are streamed here.
         self._net_notice: Optional[Any] = None
+
+    #: The tradable-instrument list is stable; the endpoint's failure mode is
+    #: not, so a failure is cached far more briefly than a success.
+    _VENUE_TTL = 600.0
+    _VENUE_ERR_TTL = 60.0
+
+    def venue_instruments(self) -> Optional[set]:
+        """Instrument ids the *current venue* will accept, or `None` if unknown.
+
+        The demo and live universes are not the same pool: live carries ~492
+        USDT swaps, demo about 185.  The contract-spec cache is built from
+        public *live* data, so the planner will happily size legs the demo
+        exchange has never heard of.  They come back as `51001 合约不存在或已下线`
+        only *after* the orders are sent, inside a batch whose envelope code
+        says nothing about which rows failed -- so the failure arrives without
+        a usable reason.  One request up front moves it into the plan.
+
+        Best effort by design: this is a public endpoint, and a network hiccup
+        must never block a rebalance.  On failure this returns `None` and the
+        gate is skipped rather than guessed.
+        """
+        now = time.time()
+        ts, val = self._venue
+        if (now - ts) < (self._VENUE_TTL if val is not None else self._VENUE_ERR_TTL):
+            return val
+        try:
+            rows = self._private().request("GET", "/api/v5/public/instruments",
+                                           {"instType": "SWAP"})
+            val = {str(r.get("instId")) for r in rows
+                   if str(r.get("state") or "live") == "live"} or None
+        except Exception:                                          # noqa: BLE001
+            val = None
+        self._venue = (now, val)
+        return val
 
     # ================= connectivity =================
     def _private(self) -> OKXPrivate:
@@ -327,7 +391,22 @@ class LiveEngine:
         cli = self._private()
         cfg = cli.account_config()
         pos_mode = cfg.get("posMode") or "net_mode"
-        rows = cli.positions("SWAP")
+        # `positions()` and `equity_usdt()` are two **independent** signed round
+        # trips -- measured ~0.31s and ~0.30s on this link.  Run in series they
+        # cost the sum, and the desk reloads this after *every* action (save
+        # limits, kill switch, reconcile, reset), so the sum is exactly the lag
+        # the user feels.  Neither needs the other's answer.
+        #
+        # Concurrency here is not a hack: `OKXPrivate` already keeps a
+        # per-thread urllib opener (`self._local`), a locked RTT deque and a
+        # locked rate limiter -- it was built to be called from more than one
+        # thread.  Measured 616ms -> ~320ms.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            fut_pos = pool.submit(cli.positions, "SWAP")
+            fut_nav = pool.submit(cli.equity_usdt)
+            rows = fut_pos.result()
+            nav = fut_nav.result()
+        sp = self.specs()                    # cached in-process; needed for notional
         cur_sz: Dict[str, float] = {}
         marks: Dict[str, float] = {}
         detail: List[dict] = []
@@ -346,17 +425,28 @@ class LiveEngine:
             elif str(r.get("posSide")) == "long":
                 sz = abs(sz)
             cur_sz[inst] = cur_sz.get(inst, 0.0) + sz
+            mp = 0.0
             try:
                 mp = float(r.get("markPx") or 0.0)
                 if mp > 0:
                     marks[inst] = mp
             except (TypeError, ValueError):
                 pass
+            # The console renders position notional as |sz| * ctVal * markPx and
+            # deliberately refuses to guess it client-side (dropping ctVal is a
+            # 100x error on BTC).  It used to receive no `notional` at all here,
+            # so *every* position was reported as "contract spec missing,
+            # probably delisted" -- wrong for live instruments.  Send it, and
+            # send None only when the spec genuinely is unknown.
+            spec = sp.get(inst)
+            notional = (abs(sz) * spec.ct_val * mp
+                        if (spec is not None and mp > 0) else None)
             detail.append({"instId": inst, "pos": sz, "posSide": r.get("posSide"),
                            "avgPx": _f(r.get("avgPx")), "markPx": _f(r.get("markPx")),
                            "upl": _f(r.get("upl")), "lever": r.get("lever"),
-                           "mgnMode": r.get("mgnMode"), "liqPx": _f(r.get("liqPx"))})
-        nav = cli.equity_usdt()
+                           "mgnMode": r.get("mgnMode"), "liqPx": _f(r.get("liqPx")),
+                           "notional": notional})
+        nav = fut_nav.result()
         return {"mode": self.mode, "nav": nav, "cur_sz": cur_sz, "marks": marks,
                 "positions": detail, "pos_mode": pos_mode,
                 "acctLv": cfg.get("acctLv"), "uid": cfg.get("uid"),
@@ -468,7 +558,8 @@ class LiveEngine:
           f"覆盖率 {plan.coverage:.1%}")
         violations = check_plan(plan, self.limits, mode=self.mode, nav=acct["nav"],
                                 rebalance_due=target.rebalance_due,
-                                leverage=self.set_leverage)
+                                leverage=self.set_leverage,
+                                venue_insts=self.venue_instruments())
         stale = self.data_staleness()
         if stale.get("stale"):
             violations.append(Violation(
@@ -494,6 +585,24 @@ class LiveEngine:
     def execute(self, *, confirm: Optional[str] = None, force: bool = False,
                 dry_run: bool = True, only: Optional[Sequence[str]] = None,
                 force_signal: bool = False, progress=None) -> dict:
+        """`_execute_inner`, wrapped in the cross-process rebalance lock.
+
+        The console and the unattended auto-trader are **separate processes**
+        over the same `artifacts/live/<mode>/`.  Two concurrent executes each
+        read the same starting book and each send the full order list, so every
+        position is placed twice -- and `AmbiguousError` is no help, because
+        nothing was lost, it was duplicated.  Fails fast, before the signal is
+        even computed.
+        """
+        with rebalance_lock(self.mode):
+            return self._execute_inner(confirm=confirm, force=force,
+                                       dry_run=dry_run, only=only,
+                                       force_signal=force_signal,
+                                       progress=progress)
+
+    def _execute_inner(self, *, confirm: Optional[str] = None, force: bool = False,
+                       dry_run: bool = True, only: Optional[Sequence[str]] = None,
+                       force_signal: bool = False, progress=None) -> dict:
         p = progress or (lambda m: None)
         # Slow or retried exchange calls are streamed to whoever is watching the
         # run, because a silent wait and a hang look identical from the UI.
@@ -510,7 +619,8 @@ class LiveEngine:
         p(f"④ 计划 {plan.n_orders} 笔订单 · 名义额 {plan.order_notional:,.0f} USDT")
         violations = check_plan(plan, self.limits, mode=self.mode, nav=nav,
                                 rebalance_due=target.rebalance_due, force=force,
-                                leverage=self.set_leverage)
+                                leverage=self.set_leverage,
+                                venue_insts=self.venue_instruments())
         blocked = blocking(violations)
         p("⑤ 风控闸门拦截，未发送任何订单" if blocked else "⑤ 风控闸门通过 ✓")
         record: dict = {
@@ -593,8 +703,23 @@ class LiveEngine:
         record["errors"] = [f"{r.get('instId')}: {r.get('error')}"
                             for r in results if not r.get("ok")]
         record["elapsed"] = round(time.time() - t0, 2)
+        # `plan.realised_gross` is the book the plan *wanted*.  Once the results
+        # are in, the honest number is the one the account will actually hold --
+        # a rejected leg leaves its current position standing.  Recording the
+        # intended figure here claimed 10,842 USDT of exposure from 19 orders of
+        # which 11 filled, and that claim then flowed into `add_equity(...)`.
+        gross, net = self._realised_book(plan, results, acct)
+        record["gross_realised"] = gross
+        record["realised_net"] = net
+        # Charged here rather than in `_after_execute` because `add_run` serialises
+        # the record immediately -- a field added afterwards would never reach the
+        # ledger, and "how much budget did this run eat" is exactly the thing that
+        # must be auditable.
+        record["turnover_charged"] = self._charged_turnover(plan, results, nav)
         self.store.add_run(record)
-        p(f"⑦ 成交/受理 {record['n_ok']}/{len(results)} 笔")
+        p(f"⑦ 成交/受理 {record['n_ok']}/{len(results)} 笔"
+          + (f" · 换手预算已用 {record['turnover_charged']:.2%}"
+             if plan.turnover_budget is not None else ""))
         self._after_execute(target, acct, plan, record)
         return self._result(record, plan, target, acct, violations, px, stage="sent")
 
@@ -629,7 +754,7 @@ class LiveEngine:
             if abs(new_sz) <= 1e-12:
                 s["positions"].pop(o.inst_id, None)
             s["cash"] = float(s.get("cash", 0.0)) + pnl - cost
-            cid = make_clordid(run_id.replace("_", "")[:10], o.inst_id, len(results))
+            cid = make_clordid(_clordid_prefix(run_id), o.inst_id, len(results))
             fill = {"tradeId": cid + "P", "clOrdId": cid, "instId": o.inst_id,
                     "side": o.side, "px": px, "sz": o.sz, "fee": -cost,
                     "notional": notional, "ct_val": ct,
@@ -749,7 +874,7 @@ class LiveEngine:
         orders = list(plan.orders)
         bodies: Dict[str, dict] = {}
         for i, o in enumerate(orders):
-            cid = make_clordid(run_id.replace("_", "")[:10], o.inst_id, i)
+            cid = make_clordid(_clordid_prefix(run_id), o.inst_id, i)
             bodies[cid] = o.to_body(self.td_mode, cid)
 
         cids = list(bodies)
@@ -801,6 +926,79 @@ class LiveEngine:
         return results
 
     # ================= post-trade =================
+    @staticmethod
+    def _realised_book(plan: Plan, results: List[dict],
+                       acct: dict) -> Tuple[float, float]:
+        """`(gross, net)` exposure the account will actually hold after this send.
+
+        `plan.realised_gross` / `plan.realised_net` describe the book the plan
+        *intends*: every leg at its target.  They are the right thing for the
+        pre-trade risk gates (which ask "is this plan acceptable?") and the wrong
+        thing for the record (which asks "what happened?").
+
+        A rejected leg does not move, so its **current** position is what
+        remains.  Orders that were never sent at all are treated the same way.
+        Per-contract notional comes from the order's own delta where there is an
+        order, and from the account's reported notional otherwise; anything
+        still unpriceable is skipped rather than silently counted as zero.
+        """
+        tgt = plan_target_positions(plan)
+        accepted = {r.get("instId") for r in (results or []) if r.get("ok")}
+        cur = acct.get("cur_sz") or {}
+
+        per_ct: Dict[str, float] = {}
+        for o in plan.orders:
+            if o.sz and o.delta_notional:
+                per_ct[o.inst_id] = abs(float(o.delta_notional)) / abs(float(o.sz))
+            elif o.tgt_sz and o.target_notional:
+                per_ct[o.inst_id] = abs(float(o.target_notional)) / abs(float(o.tgt_sz))
+        for p in (acct.get("positions") or []):
+            n, sz = p.get("notional"), p.get("pos")
+            if n and sz:
+                per_ct.setdefault(str(p.get("instId")),
+                                  abs(float(n)) / abs(float(sz)))
+
+        gross = net = 0.0
+        for inst in set(tgt) | set(cur):
+            if inst in accepted:
+                sz = float((tgt.get(inst) or {}).get("sz") or 0.0)
+            else:
+                sz = float(cur.get(inst) or 0.0)
+            pc = per_ct.get(inst)
+            if not sz or not pc:
+                continue
+            gross += abs(sz) * pc
+            net += sz * pc
+        return gross, net
+
+    @staticmethod
+    def _charged_turnover(plan: Plan, results: List[dict], nav: float) -> float:
+        """Turnover actually consumed by a send, as a fraction of NAV.
+
+        Only orders the exchange accepted count.  This used to be
+        `plan.turnover_frac`, bumped unconditionally -- so a rebalance whose every
+        order was *rejected* still burned the whole day's budget.  One failed demo
+        run left `turnover_used_today = 0.19994` of 0.20, and the next plan came
+        out scaled by ~5e-5: orders of a few cents, with nothing in the UI to
+        explain why.  A rejected order moved nothing and must not be charged.
+
+        An *ambiguous* batch is the opposite case: the response was lost, so the
+        orders may well have gone through.  Charging nothing there would let the
+        same budget be spent twice before reconciliation, so it is charged in
+        full -- for a risk limit, "assume it happened" is the safe side.
+
+        `paper` always fills, so its charge equals the planned fraction; that
+        keeps live and paper comparable.
+        """
+        if plan.turnover_budget is None:
+            return 0.0
+        done = sum(float(r.get("notional") or 0.0)
+                   for r in (results or []) if r.get("ok"))
+        used = (done / nav) if nav and nav > 0 else 0.0
+        if any(r.get("ambiguous") for r in (results or [])):
+            used = max(used, float(plan.turnover_frac or 0.0))
+        return used
+
     def _after_execute(self, target: LiveTarget, acct: dict, plan: Plan,
                        record: dict) -> None:
         """Record what happened.  Note what is *not* written here: `positions`.
@@ -823,10 +1021,17 @@ class LiveEngine:
             "target_positions": plan_target_positions(plan),
         }
         self.store.patch_state(**state)
-        # Consume the day's turnover budget, exactly like the backtest does.
+        # Consume the day's turnover budget, exactly like the backtest does --
+        # but only for what actually went out (see `_charged_turnover`).
         if plan.turnover_budget is not None:
-            self.store.bump_turnover(plan.turnover_frac)
-        self.store.add_equity(acct["nav"], plan.realised_gross, plan.realised_net)
+            charged = record.get("turnover_charged")
+            self.store.bump_turnover(
+                float(plan.turnover_frac) if charged is None else float(charged))
+        self.store.add_equity(acct["nav"],
+                              plan.realised_gross if record.get("gross_realised") is None
+                              else float(record["gross_realised"]),
+                              plan.realised_net if record.get("realised_net") is None
+                              else float(record["realised_net"]))
         if self.mode != "paper":
             try:
                 self.reconcile(quiet=True)
@@ -901,7 +1106,18 @@ class LiveEngine:
 
     def flatten(self, *, confirm: Optional[str] = None, dry_run: bool = True,
                 progress=None) -> dict:
-        """Close everything.  Allowed even off-schedule; still fully guarded."""
+        """Close everything.  Allowed even off-schedule; still fully guarded.
+
+        Takes the same cross-process lock as `execute`: "flatten" and "rebalance"
+        racing each other is the worst version of the double-order problem, since
+        the flatten closes a book the rebalance is simultaneously rebuilding.
+        """
+        with rebalance_lock(self.mode):
+            return self._flatten_inner(confirm=confirm, dry_run=dry_run,
+                                       progress=progress)
+
+    def _flatten_inner(self, *, confirm: Optional[str] = None,
+                       dry_run: bool = True, progress=None) -> dict:
         p = progress or (lambda m: None)
         self._net_notice = p
         run_id = new_run_id(self.mode)
@@ -958,13 +1174,22 @@ class LiveEngine:
 
     # ================= status =================
     def status(self) -> dict:
+        # `summary()` already carries the day-checked turnover figure.  Deriving
+        # the top-level `turnover_used_today` from that same dict (rather than
+        # re-reading the state file) is not just one file read saved: the two
+        # fields are now the same value by construction, and they *were* able to
+        # disagree -- the account panel read `store.turnover_used_today` (raw,
+        # never reset) while the planner sized against the reset one.
+        store_sum = self.store.summary()
         out: dict = {"mode": self.mode, "limits": self.limits.to_dict(),
+                     "limits_saved": self.store.load_limits(),
+                     "limits_path": self.store.limits_path(),
                      "ord_type": self.ord_type, "td_mode": self.td_mode,
                      "signal": dict(self._signals),
-                     "store": self.store.summary(),
+                     "store": store_sum,
                      "prices_source": self.prices_source,
                      "turnover_budget": self.turnover_budget,
-                     "turnover_used_today": self.store.turnover_state()[1],
+                     "turnover_used_today": store_sum["turnover_used_today"],
                      "kill_switch": kill_switch_on(),
                      "confirm_phrase": live_confirm_phrase() if self.mode == "live" else None}
         st = self.store.read_state()
