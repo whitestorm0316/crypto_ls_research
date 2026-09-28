@@ -29,6 +29,7 @@ from crypto_ls_research.execution.credentials import (
 from crypto_ls_research.execution.engine import DEFAULT_SIGNAL, LiveEngine
 from crypto_ls_research.execution.limits import LiveLimits
 from crypto_ls_research.execution.store import Store, archives, reset_mode
+from crypto_ls_research.execution import auto_ctl
 
 MODES = ("paper", "demo", "live")
 MODE_LABEL = {"paper": "本地纸面", "demo": "OKX 模拟盘", "live": "OKX 实盘"}
@@ -234,6 +235,13 @@ def route_get(path: str, q: dict) -> Optional[Tuple[dict, int]]:
     if path == "/api/live/creds":
         return creds_status(), 200
 
+    if path == "/api/live/auto":
+        mode = one("mode", "paper")
+        return {"mode": mode, "state": auto_ctl.read_state(mode),
+                "ctl": auto_ctl.read_ctl(),
+                "running": auto_ctl.is_running(mode),
+                "grid": auto_ctl.grid_for(mode)}, 200
+
     return None
 
 
@@ -330,6 +338,11 @@ def route_post(path: str, body: dict) -> Optional[Tuple[dict, int]]:
 
         return _submit("refresh", "paper", run, label=f"刷新 {bar} 行情"), 200
 
+    if path == "/api/live/auto/start":
+        return _auto_start(body)
+    if path == "/api/live/auto/stop":
+        return _auto_stop(body)
+
     if path == "/api/live/creds":
         mode = body.get("mode")
         if mode not in ("demo", "live"):
@@ -397,3 +410,52 @@ def route_post(path: str, body: dict) -> Optional[Tuple[dict, int]]:
         return {"ok": True, "mode": mode, "nav": nav, "archived": archived}, 200
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Unattended auto-trader (see `execution/auto_ctl.py`)
+# ---------------------------------------------------------------------------
+def _auto_start(body: dict) -> Tuple[dict, int]:
+    mode = body.get("mode", "paper")
+    if mode not in MODES:
+        return {"ok": False, "error": f"bad mode {mode!r}"}, 400
+    grid = auto_ctl.grid_for(mode)
+    # Default the grid to whatever is already in force, so "restart the daemon"
+    # cannot silently move a 1d schedule back to 3d just because the field was
+    # omitted from the request.
+    rd = body.get("rebalance_days")
+    if rd is None:
+        rd = grid.get("rebalance_days")
+    if rd is None:
+        rd = DEFAULT_SIGNAL["rebalance_days"]
+    try:
+        rd = float(rd)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "调仓间隔必须是数字（天）"}, 400
+    try:
+        interval = float(body.get("interval_min") or 30.0)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "检查间隔必须是数字（分钟）"}, 400
+
+    res = auto_ctl.start(mode, rebalance_days=rd, interval_min=interval,
+                         bar=body.get("bar") or DEFAULT_SIGNAL["bar"],
+                         dry_run=bool(body.get("dry_run", False)),
+                         allow_live=bool(body.get("allow_live", False)))
+    if not res.get("ok"):
+        return res, 200
+    waited = auto_ctl.wait_for_heartbeat(mode, timeout=25.0)
+    # Report the heartbeat, not the request.  `confirmed` is the field the page
+    # keys off, so the two cannot be confused.
+    res["confirmed"] = bool(waited.get("ok"))
+    res["state"] = waited.get("state") or auto_ctl.read_state(mode)
+    res["grid"] = auto_ctl.grid_for(mode)
+    if not waited.get("ok"):
+        res["warning"] = waited.get("error")
+    return res, 200
+
+
+def _auto_stop(body: dict) -> Tuple[dict, int]:
+    mode = body.get("mode", "paper")
+    if mode not in MODES:
+        return {"ok": False, "error": f"bad mode {mode!r}"}, 400
+    return auto_ctl.stop(mode), 200

@@ -294,14 +294,51 @@ def test_an_abandoned_lock_is_taken_over(tmp_live):
 
 def test_a_live_pid_that_is_not_ours_is_still_respected(tmp_live):
     """The pid check must be about *aliveness*, not about equality with ours:
-    the console is a different pid and its lock must hold."""
+    the console is a different pid and its lock must hold.
+
+    The pid used must be one that is **actually alive on this platform**.  This
+    test used to hardcode `1`, on the reasoning that pid 1 is `init`/`launchd`
+    and therefore always alive.  That is a POSIX fact, not a portable one:
+    Windows has no pid 1 at all (`OpenProcess` -> `ERROR_INVALID_PARAMETER`),
+    so on Windows the lock was correctly judged abandoned and the assertion
+    failed for the right reason.  Picking a live pid at runtime keeps the test
+    about the *aliveness* rule instead of about the number 1.
+    """
+    live_pid = _a_live_pid_that_is_not_ours()
+    assert store_mod._pid_alive(live_pid), (
+        f"前提不成立：pid {live_pid} 在本平台并非存活进程，"
+        "这个测试就无法验证「别人的活锁必须被尊重」")
+
     path = os.path.join(str(tmp_live), "demo", "rebalance.lock")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        json.dump({"pid": 1, "ts": time.time()}, f)     # launchd: definitely alive
+        json.dump({"pid": live_pid, "ts": time.time()}, f)
     with pytest.raises(store_mod.RebalanceBusy):
         with store_mod.rebalance_lock("demo"):
             pass                                                # pragma: no cover
+
+
+def _a_live_pid_that_is_not_ours() -> int:
+    """A pid that is alive right now and is **not** `os.getpid()`.
+
+    The parent process is the natural candidate, but a test runner may be the
+    top of its own tree, so fall back to scanning for any live pid.  `4` is
+    Windows' `System` process and `1` is POSIX `init`; both are checked with the
+    same `_pid_alive` the lock uses, so the fallback cannot silently return a
+    dead pid.
+    """
+    import subprocess
+    candidates = []
+    ppid = os.getppid()
+    if ppid and ppid != os.getpid():
+        candidates.append(ppid)
+    candidates += [1, 4]                       # POSIX init / Windows System
+    for pid in range(4, 400):                  # any live process will do
+        candidates.append(pid)
+    for pid in candidates:
+        if pid != os.getpid() and store_mod._pid_alive(pid):
+            return pid
+    pytest.skip("本平台找不到一个存活的、非本进程的 pid，跳过")
 
 
 def test_the_lock_is_released_when_the_body_raises(tmp_live):

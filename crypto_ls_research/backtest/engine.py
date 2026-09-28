@@ -121,12 +121,21 @@ def run_backtest(panels: Panels, cfg: BacktestConfig,
                  randomize_score: bool = False,
                  disable_risk_overlays: bool = False,
                  disable_costs: bool = False,
-                 extra_gross: Optional[np.ndarray] = None) -> BacktestResult:
+                 extra_gross: Optional[np.ndarray] = None,
+                 dec_offset_bars: int = 0) -> BacktestResult:
     """Run one backtest.  Pure function of (panels, cfg, flags).
 
     `factor_subset=None` falls back to `cfg.factors.subset`, so a factor-set
     change made through a config override reaches *every* backtest in a sweep
     instead of only the ones that explicitly pass the kwarg.
+
+    `dec_offset_bars` shifts the whole rebalance grid later by that many bars
+    (`dec_idx = arange(warmup + k, T-1, R)`), moving BOTH the signal bar and
+    the execution bar.  The default 0 reproduces the anchored-at-UTC-02:00
+    grid bit-for-bit, which is what every archived result used.  It exists so
+    a grid-phase question ("place orders at 23:30 Beijing instead") can be
+    answered with a measurement instead of an opinion --- see
+    `scripts/exp_grid_phase.py`.
     """
     if factor_subset is None:
         factor_subset = cfg.factors.subset
@@ -165,7 +174,7 @@ def run_backtest(panels: Panels, cfg: BacktestConfig,
         int(round(cfg.factors.range_days * bpd)) + 2,
         int(round(cfg.risk.vol_est_window_days * bpd)) + 2,
     )
-    dec_idx = np.arange(warmup, T - 1, R, dtype=int)
+    dec_idx = np.arange(warmup + int(dec_offset_bars), T - 1, R, dtype=int)
     D = dec_idx.size
     if D < 3:
         raise ValueError(f"not enough bars: T={T} warmup={warmup} R={R} -> D={D}")

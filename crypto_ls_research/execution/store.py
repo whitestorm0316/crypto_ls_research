@@ -48,9 +48,28 @@ def _pid_alive(pid: Any) -> bool:
     just may not signal it -- which is the normal case for anything not owned by
     us.  Treating EPERM as "dead" would silently steal the lock from a console
     running as another user, so the distinction is load-bearing.
+
+    **On Windows `os.kill` is not POSIX.**  It maps to `TerminateProcess` for
+    real pids, and `os.kill(pid, 0)` raises `OSError`/`WinError 87` rather than
+    succeeding.  So a pid that is plainly alive (init/`1`, or any pid we do not
+    own) probes as dead, and a lock held by another user is treated as debris
+    and *stolen* -- the exact failure the docstring above says must not happen.
+
+    Rather than let the aliveness check lie, `OpenProcess` is used when it is
+    available: it answers "does this process exist" without requiring the right
+    to signal it.  `ERROR_ACCESS_DENIED` means "it exists, not ours" -- the
+    Windows spelling of EPERM.
     """
     try:
-        os.kill(int(pid), 0)
+        pid_i = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid_i <= 0:
+        return False
+    if os.name == "nt":                                         # pragma: no cover
+        return _pid_alive_win(pid_i)
+    try:
+        os.kill(pid_i, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
@@ -58,6 +77,31 @@ def _pid_alive(pid: Any) -> bool:
     except (OSError, ValueError, TypeError):
         return False
     return True
+
+
+def _pid_alive_win(pid: int) -> bool:                           # pragma: no cover
+    """Windows: `OpenProcess` -> handle means it exists.  See `_pid_alive`."""
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    ERROR_INVALID_PARAMETER = 87
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        err = ctypes.get_last_error()
+        # ACCESS_DENIED (~5) = the process exists but is not ours: alive.
+        # INVALID_PARAMETER (87) = no such pid: gone.
+        return err != ERROR_INVALID_PARAMETER
+    try:
+        code = wintypes.DWORD()
+        if kernel32.GetExitCodeProcess(h, ctypes.byref(code)):
+            return code.value == STILL_ACTIVE
+        return True                 # opened but unqueryable: assume alive
+    finally:
+        kernel32.CloseHandle(h)
 
 
 def _lock_abandoned(path: str, ttl: float) -> bool:

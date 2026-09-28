@@ -109,6 +109,12 @@ async function boot() {
       ensureTrades();
     } else if (wantLive) {
       ensureLive();
+      /* 自动任务的心跳按 30 秒量级更新（守护进程每 30 分钟检查一次，但心跳
+       * 只在每次决策后重写）。10 秒的轮询足以让「启动/停止」立刻反映出来，
+       * 又比 `pollRuns` 的 2.5s 轻得多。只在交易台停留时轮询。 */
+      setInterval(() => {
+        if (S.tab === 'live') liveLoadAuto();
+      }, 10000);
     } else {
       // 打开页面就把最近一次成功的运行显示出来，而不是留一片空卡片
       const wantTag = qs.get('tag');
@@ -1441,6 +1447,16 @@ function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTi
    3) 页面上的数字必须和服务端逐位一致：所有金额都由后端算好、前端只负责显示。
    ========================================================================= */
 const LIVE_LABEL = { paper: '本地纸面', demo: 'OKX 模拟盘', live: 'OKX 实盘' };
+/* 自动任务的心跳里 `action` / `reason` 是代码常量（`skip` / `not_due` …）。
+ * 直接把常量铺在页面上，用户看到的是「skip / not_due」，而真正需要回答的问题是
+ * 「为什么今晚没下单」。所以这里给的是原因，不是标识符。 */
+const LIVE_ACTION_LABEL = { traded: '已调仓', skip: '跳过', blocked: '被闸门拦下',
+                            noop: '无需下单', dry_run: '预演（未发单）', error: '出错' };
+const LIVE_SKIP_LABEL = {
+  kill_switch: '熔断开关已拉下', data_stale: '行情陈旧（刷新后仍旧）',
+  not_due: '未到调仓日', busy: '另一进程正在调仓', risk_gate: '风控闸门拦截',
+  confirm_failed: '确认短语不符', no_orders: '目标与持仓一致，无单可发',
+  dry_run: '预演模式', executed: '已执行' };
 const LIVE_LIMIT_FIELDS = [
   ['max_gross_notional', '总名义额上限 (USD)', '绝对上限，不随本金缩放——唯一能挡住「连错账户」的闸门'],
   ['max_order_notional', '单笔上限 (USD)', '任何一笔订单超过即整批拒绝'],
@@ -1475,6 +1491,10 @@ function liveSkeleton() {
   <div class="panel" style="margin-top:14px"><div class="head"><h3>风控闸门</h3>
     <span class="spacer"></span><span class="muted" style="font-size:11.5px">任何一条「拦截」都会让整批订单不发出</span></div>
     <div class="body" id="liveGates"><div class="empty">尚未生成计划</div></div></div>
+
+  <div class="panel" style="margin-top:14px"><div class="head"><h3>自动任务</h3>
+    <span class="spacer"></span><span class="muted" style="font-size:11.5px">独立进程运行，关掉本页面也继续；只按调仓日下单</span></div>
+    <div class="body" id="liveAuto"><div class="empty">正在读取…</div></div></div>
 
   <div class="panel" style="margin-top:14px"><div class="head"><h3>下单计划</h3>
     <span class="spacer"></span><span class="muted" style="font-size:11.5px" id="livePlanMeta"></span></div>
@@ -1557,6 +1577,10 @@ async function liveLoadStatus() {
   } finally {
     L.statusLoading = false;
   }
+  /* 自动任务状态与账户状态是两条独立的读路径：账户走签名请求（慢、可能没配 key），
+   * 自动任务是本地文件（快、永远可读）。放在 `finally` 之后，所以即使账户读失败，
+   * 「自动任务是否在跑」照样能显示 —— 而这恰恰是密钥没配的时候最需要知道的事。 */
+  await liveLoadAuto();
 }
 
 /* ---- 渲染 ---- */
@@ -1645,6 +1669,7 @@ function livePaintAll() {
     put('liveAcct', liveAcctHtml());
     put('liveSignal', liveSignalHtml());
     put('liveGates', liveGatesHtml());
+    put('liveAuto', liveAutoHtml());
     put('livePlan', livePlanHtml());
     put('liveJob', liveJobHtml());
     put('liveHist', liveHistHtml());
@@ -2031,6 +2056,110 @@ function liveJobHtml() {
   return h;
 }
 
+/* ---- 自动任务面板 ----
+ * 一条规矩：**只显示守护进程自己写出来的数字**。
+ * 页面上刚点的「1 天」只是请求，`/api/live/auto` 返回的 `grid.source` 会说明
+ * 它是来自心跳（确认生效）还是仅来自请求（还没确认）。把请求当现状显示，
+ * 和一个真的生效了的界面长得一模一样 —— 直到那一夜什么都没发生。
+ */
+const AUTO_GRID_CHOICES = [
+  [1, '每天（1d）', '换手预算几乎一直吃满：实测 Sharpe 1.855、MDD −16.8%，比 3 天差一档'],
+  [2, '每 2 天（2d）', '实测 Sharpe 1.754、MDD −15.5%，三个网格里最差'],
+  [3, '每 3 天（3d，已验收最优）', 'Sharpe 1.935 / MDD −12.7%，对外交付口径用这个'],
+];
+
+function liveAutoHtml() {
+  const L = S.live;
+  const A = L.auto;
+  if (A == null) return `<div class="empty">正在读取…</div>`;
+  const st = A.state || {};
+  const grid = A.grid || {};
+  const running = !!A.running;
+  const rd = grid.rebalance_days;
+  const src = grid.source;
+  const confirmed = src === 'heartbeat';
+
+  let h = '';
+  /* 三个互斥的结论，且**只出其中一个**。
+   * 曾经的写法是先无条件打「正在运行」，再在下面补一条「网格未确认」——两条同时
+   * 存在时，读的人只会记住第一句。而「进程活着但我不知道它按什么网格在跑」和
+   * 「确认在按 1d 跑」是两件事，后果也不同：前者可能一夜不下单。
+   * 顺序即优先级：未确认 > 在跑 > 已死 > 未启动。 */
+  if (running && !confirmed) {
+    h += `<div class="banner danger"><div class="ico">!</div><div><b>进程在跑，但网格未确认</b>
+      <p>pid ${esc(st.pid)} 已启动，可它还没有写出心跳，所以**无法确认**当前调仓间隔。
+      读到的是 ${rd != null ? fmt.n(rd, 2) + ' 天' : '空'}（来源：${esc(src)}）。
+      在确认之前，别假设它按你要的网格在跑。</p></div></div>`;
+  } else if (running) {
+    h += `<div class="banner ok"><div class="ico">●</div><div><b>正在运行（独立进程 pid ${esc(st.pid)}）</b>
+      <p>启动于 ${esc(st.started_str || '—')} · 每 ${fmt.n(st.interval_min, 0)} 分钟检查一次 ·
+      调仓网格 <b>${rd != null ? fmt.n(rd, 2) : '?'} 天</b>（已确认）</p></div></div>`;
+  } else if (A.ctl && A.ctl.pid) {
+    h += `<div class="banner warn"><div class="ico">!</div><div><b>控制文件还在，但进程已不在</b>
+      <p>上次请求：pid ${esc(A.ctl.pid)}，调仓网格 ${A.ctl.rebalance_days != null ? fmt.n(A.ctl.rebalance_days, 2) + ' 天' : '—'}。
+      这一轮没有跑起来，请重新启动。</p></div></div>`;
+  } else {
+    h += `<div class="banner warn"><div class="ico">!</div><div><b>未运行</b>
+      <p>自动任务关掉本页面也会继续。它只在「到调仓日」时下单，其余时间只记录跳过原因。</p></div></div>`;
+  }
+
+  const skips = st.skips || {};
+  const skipTxt = Object.keys(skips).length
+    ? Object.entries(skips).map(([k, v]) => `${LIVE_SKIP_LABEL[k] || k} ×${v}`).join('、')
+    : '—';
+  const last = st.last || {};
+  /* `.kv` 的子元素必须是 `.cell > .k + .v`：写 `<span>/<b>` 会直接内联排下来，
+   * 变成「检查次数1」这样标签和数值粘在一起（实测截图里就是这样）。
+   * 样式类是有契约的，凭直觉写标签就会静默丢掉整套布局。 */
+  const cell = (k, v, s) => `<div class="cell"><div class="k">${k}</div>`
+    + `<div class="v" style="font-size:13px">${v}</div>`
+    + (s ? `<div class="s">${s}</div>` : '') + `</div>`;
+  h += `<div class="kv" style="margin-top:10px">
+    ${cell('检查次数', fmt.n(st.checks, 0), '守护进程每轮都会记一次')}
+    ${cell('实际调仓', fmt.n(st.trades, 0), '只在到调仓日时才下单')}
+    ${cell('跳过构成', esc(skipTxt), '跳过也要有原因，否则看不出没跑')}
+    ${cell('熔断开关', st.kill_switch ? '已拉下' : '正常',
+           st.kill_switch ? '不会下任何单' : '未拦截')}
+    ${cell('通知', (st.notify || {}).ready ? esc((st.notify || {}).provider) : '未启用',
+           (st.notify || {}).ready ? '' : '配 config/notify.json 后自动生效')}
+    ${cell('下一次决策',
+           `<span class="mono">${esc((last.next_decision_ts || '—').slice(0, 16).replace('T', ' '))}</span>`,
+           last.rebalance_due ? '<b style="color:var(--danger)">已到调仓日</b>' : '未到')}
+  </div>`;
+
+  if (last.reason) {
+    h += `<div class="muted" style="font-size:11.5px;margin-top:8px">
+      最近一次决策：<b>${esc(LIVE_ACTION_LABEL[last.action] || last.action || '—')}</b>
+      / ${esc(LIVE_SKIP_LABEL[last.reason] || last.reason)}
+      · 信号日 ${esc((last.decision_ts || '—').slice(0, 16).replace('T', ' '))}
+      · 目标毛敞口 ${last.target_gross != null ? fmt.n(last.target_gross, 3) : '—'}</div>`;
+  }
+
+  const opts = AUTO_GRID_CHOICES.map(([d, label, tip]) =>
+    `<option value="${d}" ${rd === d ? 'selected' : ''}>${label} — ${tip}</option>`).join('');
+  const dis = L.busy ? 'disabled' : '';
+  h += `<div class="row" style="margin-top:12px;gap:8px;align-items:flex-end;flex-wrap:wrap">
+    <label style="min-width:330px"><span class="muted" style="font-size:11.5px">调仓间隔</span><br>
+      <select class="liveinput" id="autoGrid" style="min-width:320px" ${dis}>${opts}</select></label>
+    <label style="min-width:120px"><span class="muted" style="font-size:11.5px">检查间隔（分钟）</span><br>
+      <input class="liveinput" id="autoInterval" value="${fmt.n(st.interval_min || 30, 0)}" ${dis}></label>
+    <label style="display:flex;align-items:center;gap:5px;font-size:12px">
+      <input type="checkbox" id="autoDry" ${st.dry_run ? 'checked' : ''} ${dis}> 只算不下单</label>
+    <span class="spacer"></span>
+    <button class="btn sm" id="autoStart" ${dis}>${running ? '重启自动任务' : '启动自动任务'}</button>
+    <button class="btn sm ghost" id="autoStop" ${(!running || L.busy) ? 'disabled' : ''}>停止</button>
+  </div>`;
+
+  if (running && rd === 1) {
+    h += `<div class="banner warn" style="margin-top:10px"><div class="ico">!</div><div>
+      <b>1 天调仓不是已验收配置</b><p>实测（本机、同一面板）：Sharpe 1.855 vs 3 天的 1.935，
+      最大回撤 −16.8% vs −12.7%，回撤更深 4.1pp，年化波动 16.3% vs 11.9%。
+      换手预算 20%/天 会被顶满，调仓总次数约为 3 天档的三倍。
+      对外口径请仍用 3 天（Sharpe 1.60 / 2021–2025 分窗）。</p></div></div>`;
+  }
+  return h;
+}
+
 function liveHistHtml() {
   const L = S.live;
   if (L.sub === 'limits') return liveLimitsHtml();
@@ -2245,6 +2374,10 @@ function liveBind() {
   if (cf) cf.oninput = () => { L.confirm = cf.value; };
   const rc = $('#liveReconcile');
   if (rc) rc.onclick = liveReconcile;
+  const ast = $('#autoStart');
+  if (ast) ast.onclick = liveAutoStart;
+  const asp = $('#autoStop');
+  if (asp) asp.onclick = liveAutoStop;
   const fd = $('#liveFlatDry');
   if (fd) fd.onclick = () => liveFlatten(true);
   const fl = $('#liveFlat');
@@ -2311,6 +2444,89 @@ async function liveLoadHist() {
   } catch (e) {
     L[kind] = [];
     L.statusErr = String(e && e.message || e);
+  }
+}
+
+/* 自动任务状态。与 `liveLoadHist` 分开：历史表按子标签拉，
+ * 自动任务面板是常驻的，且它的轮询频率必须独立于子标签切换。 */
+async function liveLoadAuto() {
+  const L = S.live;
+  try {
+    const d = await liveApi(`/api/live/auto?mode=${encodeURIComponent(L.mode)}`);
+    if (!d || !d.grid) throw new Error('返回结构不对');
+    L.auto = d;
+  } catch (e) {
+    L.auto = null;
+    L.autoErr = String(e && e.message || e);
+  }
+  livePaintAll();
+}
+
+async function liveAutoStart() {
+  const L = S.live;
+  const g = $('#autoGrid');
+  const iv = $('#autoInterval');
+  const dr = $('#autoDry');
+  if (L.busy) return;
+  L.busy = true;
+  L.note = '正在启动自动任务…';
+  livePaintAll();
+  try {
+    const d = await liveApi('/api/live/auto/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        mode: L.mode,
+        rebalance_days: g ? Number(g.value) : undefined,
+        interval_min: iv && iv.value !== '' ? Number(iv.value) : undefined,
+        dry_run: dr ? !!dr.checked : undefined,
+      }),
+    });
+    if (!d.ok) throw new Error(d.error || '启动失败');
+    /* `confirmed` = 心跳已读到。没确认成功就不说成功 —— 进程被拉起来了但
+     * 一秒后自己退掉，和「启动成功」在页面上长得一样，而后果是当天不下单。 */
+    if (d.confirmed) {
+      L.note = `自动任务已启动（pid ${(d.state || {}).pid}），调仓网格 ${fmt.n((d.grid || {}).rebalance_days, 2)} 天`;
+    } else {
+      /* 未确认心跳时，最常见的原因不是"参数错"，而是**父进程在沙箱进程树里**：
+       * 参数中台自己是从工具调用的 shell 起出来的，它 spawn 的守护进程会在
+       * 启动期（增量刷新那几十秒）被整个进程树回收，日志断在半句、无 traceback。
+       * 这条路径永远不可能成功，所以必须直接把用户推向双击脚本，而不是
+       * 让他反复点按钮猜哪里错了。 */
+      L.note = `已拉起进程，但未确认心跳：${d.warning || '未知原因'}`;
+      L.note += '\n提示：若参数中台本身是从沙箱环境启动的，网页无法派生常驻进程'
+        + '（子进程会被回收）。请改用双击 START_AUTO_TRADER_DEMO.bat（Windows）'
+        + '/ .command（macOS）启动，或由系统定时器派生。';
+    }
+    await liveLoadAuto();
+  } catch (e) {
+    L.note = String(e && e.message || e);
+  } finally {
+    L.busy = false;
+    livePaintAll();
+  }
+}
+
+async function liveAutoStop() {
+  const L = S.live;
+  if (L.busy) return;
+  L.busy = true;
+  L.note = '正在停止自动任务…';
+  livePaintAll();
+  try {
+    const d = await liveApi('/api/live/auto/stop', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: L.mode }),
+    });
+    /* `still_running` 是失败中最重要的那一种：信号发了、进程还在。
+     * 此时绝不能显示「已停止」，否则用户会以为改参数是安全的。 */
+    L.note = d.ok ? (d.note || '已停止')
+      : (d.still_running ? `进程 ${d.pid} 仍在运行：${d.error}` : (d.error || '停止失败'));
+    await liveLoadAuto();
+  } catch (e) {
+    L.note = String(e && e.message || e);
+  } finally {
+    L.busy = false;
+    livePaintAll();
   }
 }
 

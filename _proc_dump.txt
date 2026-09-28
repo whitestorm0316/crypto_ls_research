@@ -1,0 +1,26 @@
+﻿
+
+ProcessId       : 21712
+ParentProcessId : 9876
+CommandLine     : C:\Users\50651\.workbuddy\binaries\python\envs\default\Script
+                  s\python.exe webapp/server.py 8790
+
+ProcessId       : 6472
+ParentProcessId : 21712
+CommandLine     : C:\Users\50651\.workbuddy\binaries\python\envs\default\Script
+                  s\python.exe webapp/server.py 8790
+
+ProcessId       : 21344
+ParentProcessId : 6472
+CommandLine     : C:\Users\50651\.workbuddy\binaries\python\envs\default\Script
+                  s\python.exe -m crypto_ls_research.execution.auto_trader --mo
+                  de paper --interval 30.0 --rebalance-days 1.0 --bar 1h
+
+ProcessId       : 7308
+ParentProcessId : 21344
+CommandLine     : C:\Users\50651\.workbuddy\binaries\python\envs\default\Script
+                  s\python.exe -m crypto_ls_research.execution.auto_trader --mo
+                  de paper --interval 30.0 --rebalance-days 1.0 --bar 1h
+
+
+

@@ -557,7 +557,19 @@ def test_write_config_merges_instead_of_clobbering(tmp_path):
         "enabled": True, "url": "new", "dedup_sec": 60}
 
 
+@pytest.mark.skipif(os.name == "nt",
+                    reason="POSIX 权限位在 Windows 上不可表达（chmod 无法产生 0600，"
+                           "且 stat 一律读回 0666）；此处真正要守的是 POSIX 侧的行为")
 def test_write_config_is_private_because_the_url_carries_a_key(tmp_path):
+    """The webhook URL carries a key, so the config must not be world-readable.
+
+    Skipped on Windows rather than asserted: NTFS has no POSIX mode, `os.chmod`
+    there only toggles the read-only bit, and `stat.S_IMODE` reads back `0o666`
+    regardless -- so an assertion here would fail on every Windows checkout
+    while telling us nothing about whether the file is actually protected.
+    The production path already tolerates this (`chmod` is wrapped in
+    `except OSError`), which is the behaviour that matters.
+    """
     p = tmp_path / "notify.json"
     notify_mod.write_config({"url": "https://example.com/hook?key=SEC"}, path=str(p))
     assert stat.S_IMODE(p.stat().st_mode) == 0o600

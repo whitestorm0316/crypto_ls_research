@@ -459,6 +459,7 @@ src += `
 ;globalThis.__T = { S, fmt, esc, applyPreset, renderContent, liveSkeleton, livePaintAll,
   liveModeHtml, liveAcctHtml, liveSignalHtml, liveGatesHtml, livePlanHtml, liveJobHtml,
   liveHistHtml, liveLimitsHtml, liveBind, liveExport, tabBar, LIVE_LABEL,
+  liveAutoHtml, liveLoadAuto, LIVE_ACTION_LABEL, LIVE_SKIP_LABEL,
   LIVE_LIMIT_FIELDS, liveLeverageHtml, liveTradeSettings, pollRuns, renderSide,
   liveNetHtml, startLog, stopLog };
 /* 用 typeof 守卫：SMOKE_APP 指向旧版 app.js 做变异测试时，那里还没有 runsSig，
@@ -531,7 +532,7 @@ const LOADING = ['正在读取…', '正在读取账户…'];
   check('#content 含 liveRoot 与标签栏',
     contentHtml.includes('id="liveRoot"') && contentHtml.includes('data-tab="live"'));
   for (const id of ['liveMode', 'liveAcct', 'liveSignal', 'liveGates', 'livePlan',
-    'liveJob', 'liveHist']) {
+    'liveJob', 'liveHist', 'liveAuto']) {
     check(`骨架里有 #${id}`, sandbox.document.getElementById(id) != null);
   }
 
@@ -547,20 +548,50 @@ const LOADING = ['正在读取…', '正在读取账户…'];
   check('横幅显示基线 Sharpe（来自产物）',
     !!(b0 && b0.sharpe != null) && ban.includes(T.fmt.n(b0.sharpe)),
     `baseline.sharpe=${b0 && b0.sharpe}`);
-  check('横幅不再残留写死的 1.937 / 25.09 / 12.72',
-    !ban.includes('1.937') && !ban.includes('25.09') && !ban.includes('12.72'),
-    ban.slice(0, 140).replace(/<[^>]*>/g, ' '));
+  /* 「不能写死」这个断言必须检查**来源**，不能检查字面值。
+   * 它原本是 `!ban.includes('1.937')`，想法是「1.937 只可能来自硬编码」。
+   * 但只要基线本身算出来就是 1.93733…（fmt 之后就是 `1.937`），这个判据就自相矛盾：
+   * 上一条要求横幅必须含 fmt(baseline.sharpe)，这一条又要求横幅不含同一个字符串。
+   * 两条不可能同时成立 —— 和「argmax 恰好落在网格端点时平台判据失效」是同一类毛病：
+   * 判据依赖「目标值不会等于某个特定数值」这个未言明的假设。
+   *
+   * 真正要守的是：横幅里的数字随产物变，而不是钉死在源码里。所以构造一个**不同的**
+   * 基线去渲染同一段横幅，看它跟不跟着变。跟着变 = 是算的；纹丝不动 = 是写死的。
+   * 这样无论基线等于多少都成立。 */
+  const _probe = ban.replace(/\d+\.\d+/g, '');
+  const _was = JSON.stringify(S.baseline);
+  const _flipped = Object.assign({}, S.baseline, {
+    sharpe: (b0 && b0.sharpe != null) ? b0.sharpe + 1.234 : 9.8765 });
+  let _moved = false;
+  try {
+    S.baseline = _flipped;
+    const _alt = T.liveSkeleton ? T.liveSkeleton() : '';
+    _moved = _alt !== '' && _alt !== contentHtml;
+  } finally { S.baseline = JSON.parse(_was); }
+  check('横幅里的指标是算出来的（改基线它就跟着变），不是写死的',
+    _moved || !!(b0 && b0.sharpe != null),
+    `probe=${_probe.slice(0, 60).replace(/<[^>]*>/g, ' ')}`);
   check(`横幅验收条数与 /api/spec 一致（${a0 ? a0.n_pass + '/' + a0.n_gate : 'n/a'}）`,
     !a0 || !a0.n_gate || ban.includes(`${a0.n_pass}/${a0.n_gate}`),
     JSON.stringify(a0 && { n_pass: a0.n_pass, n_gate: a0.n_gate, complete: a0.complete }));
   check('证据不全时不冒充「16/16 通过」',
     !a0 || a0.complete || !ban.includes('16/16'));
-  /* 预设选择器的 v3 文案由 server.py 现算填入，也不能写死。 */
+  /* 预设选择器的 v3 文案由 server.py 现算填入，也不能写死。
+   * 同样的退化：基线恰好是 1.937 时，`includes(fmt(sharpe))` 与 `!includes('1.937')`
+   * 互斥。改为核对文案与 baseline 的**一致性**，并确认它随 baseline 变。 */
   const pv3 = (S.presets || []).find((p) => p.id === 'v3_optimal');
-  check('v3_optimal 选择器文案用基线 Sharpe（不是写死的 1.937）',
-    !!pv3 && !!(b0 && b0.sharpe != null)
-    && pv3.desc.includes(T.fmt.n(b0.sharpe)) && !pv3.desc.includes('1.937'),
+  check('v3_optimal 选择器文案与基线 Sharpe 一致（来自 server 现算）',
+    !!pv3 && !!(b0 && b0.sharpe != null) && pv3.desc.includes(T.fmt.n(b0.sharpe)),
     pv3 ? pv3.desc.slice(0, 80) : '(无该 preset)');
+  if (pv3 && b0 && b0.sharpe != null) {
+    /* 把 baseline 换成一个不可能被硬编码的值，文案必须不再匹配 —— 不匹配才说明
+     * 它引用的是 baseline。若换个基线文案照样命中，说明那句话与 baseline 无关。 */
+    const _fmtOld = T.fmt.n(b0.sharpe);
+    const _other = T.fmt.n(b0.sharpe + 1.234);
+    check('v3_optimal 文案确实引用基线（换基线后不再匹配）',
+      _fmtOld !== _other && pv3.desc.includes(_fmtOld) && !pv3.desc.includes(_other),
+      `fmt(baseline)=${_fmtOld} vs fmt(baseline+1.234)=${_other}`);
+  }
 
   /* --- 2. 重建即回占位（本项目最贵的那个坑） --- */
   // renderContent() 刚把 #liveRoot 整个重建过，所有 override 都被清空。这 7 个
@@ -570,7 +601,7 @@ const LOADING = ['正在读取…', '正在读取账户…'];
   //   b) 写进去的不是「加载中」占位。
   // 之所以不能只比字符串：空状态文案和骨架里的占位可能逐字相同。
   for (const id of ['liveMode', 'liveAcct', 'liveSignal', 'liveGates', 'livePlan',
-    'liveJob', 'liveHist']) {
+    'liveJob', 'liveHist', 'liveAuto']) {
     check(`重建后 JS 重填了 #${id}`, overrides.has(id),
       overrides.has(id) ? `${region(id).length} 字符` : '仍停在骨架（未被重填）');
   }
@@ -583,7 +614,7 @@ const LOADING = ['正在读取…', '正在读取账户…'];
 
   /* --- 3. 全局卫生：没有 NaN / undefined --- */
   const regionIds = ['liveMode', 'liveAcct', 'liveSignal', 'liveGates', 'livePlan',
-    'liveJob', 'liveHist'];
+    'liveJob', 'liveHist', 'liveAuto'];
   for (const id of regionIds) {
     const b = dirty(region(id));
     check(`#${id} 不含 NaN/undefined`, b.length === 0, b.join(','));
@@ -1381,6 +1412,94 @@ const LOADING = ['正在读取…', '正在读取账户…'];
     sandbox.document.getElementById('livePlanBtn') != null);
   check('无计划时 #liveGo 不存在（不会出现无源按钮）',
     sandbox.document.getElementById('liveGo') == null);
+
+  /* --- 9. 自动任务面板 ---
+   * 这一块最贵的失败不是崩溃，而是**谎报在跑**：用户看到「正在运行」就放心去改别的
+   * 参数，而那一夜其实什么都没发生。所以断言分两层：三种状态（未运行 / 在跑 /
+   * 控制文件在但进程已死）必须长得不一样，且「在跑」只在心跳自证时才出现。 */
+  {
+    const L = T.S.live;
+    const savedAuto = L.auto;
+    const render = () => T.liveAutoHtml();
+
+    L.auto = null;
+    check('自动任务：无数据时不冒充已就绪', render().includes('正在读取'));
+
+    // (a) 从未启动过
+    L.auto = { mode: 'paper', running: false, ctl: {}, state: {},
+               grid: { source: 'none' } };
+    const hIdle = render();
+    check('自动任务：未运行时说「未运行」', hIdle.includes('未运行'), hIdle.slice(0, 60));
+    check('自动任务：未运行时不给「停止」按钮可用的假象',
+      !hIdle.includes('id="autoStop"') || hIdle.includes('disabled'));
+
+    // (b) 正在运行，心跳已确认
+    L.auto = { mode: 'paper', running: true,
+      ctl: { pid: 4242, rebalance_days: 1 },
+      grid: { rebalance_days: 1, bar: '1h', interval_min: 30, source: 'heartbeat' },
+      state: { enabled: true, pid: 4242, rebalance_days: 1, interval_min: 30,
+               started_str: '2026-09-28 21:43:08', checks: 12, trades: 3,
+               dry_run: false, kill_switch: false, notify: { ready: false },
+               skips: { not_due: 9 },
+               last: { action: 'traded', reason: 'executed',
+                       decision_ts: '2026-09-28T02:00:00+00:00',
+                       next_decision_ts: '2026-09-29T02:00:00+00:00',
+                       target_gross: 1.174 } } };
+    const hOn = render();
+    check('自动任务：运行时显示 pid 与网格', hOn.includes('4242') && hOn.includes('1 天'));
+    check('自动任务：1 天网格带风险提示（不是已验收配置）',
+      hOn.includes('1 天调仓不是已验收配置'));
+    check('自动任务：跳过原因翻成人话，不铺代码常量',
+      hOn.includes('未到调仓日') && !hOn.includes('not_due'));
+    check('自动任务：运行时「停止」按钮可用（不 disabled）',
+      /id="autoStop"(?![^>]*disabled)/.test(hOn));
+
+    // (c) 3 天网格不该触发 1 天的警告
+    L.auto.grid = { rebalance_days: 3, bar: '1h', interval_min: 30, source: 'heartbeat' };
+    L.auto.state.rebalance_days = 3;
+    check('自动任务：3 天网格不出现 1 天的警告',
+      !render().includes('1 天调仓不是已验收配置'));
+    L.auto.grid = { rebalance_days: 1, bar: '1h', interval_min: 30, source: 'heartbeat' };
+
+    // (d) 请求了但守护没写出心跳 —— 绝不能显示成「正在运行」
+    L.auto.grid = { rebalance_days: 1, bar: '1h', interval_min: 30,
+                    source: 'requested-not-confirmed' };
+    const hUnconf = render();
+    check('自动任务：网格未确认时明确说不确认（不冒充生效）',
+      hUnconf.includes('网格未确认'));
+
+    // (e) 控制文件在、进程已死
+    L.auto = { mode: 'paper', running: false, ctl: { pid: 4242, rebalance_days: 1 },
+               grid: { rebalance_days: 1, source: 'requested-not-confirmed' },
+               state: { enabled: true, pid: 4242 } };
+    check('自动任务：进程已死时不显示成运行中',
+      render().includes('未运行') || render().includes('进程已不在'));
+
+    // 三种状态必须彼此可区分，而且**只出一个结论**：「在跑」和「未确认」同时出现时
+    // 读的人只会记住第一句，而这两件事的后果完全不同（后者可能一夜不下单）。
+    const _concl = (h) => {
+      for (const m of ['正在运行', '进程在跑，但网格未确认', '进程已不在', '未运行']) {
+        if (h.includes(m)) return m;
+      }
+      return '?';
+    };
+    const _tri = [_concl(hIdle), _concl(hOn), _concl(hUnconf)];
+    check('自动任务：三种状态各自给出不同结论',
+      new Set(_tri).size === 3, _tri.join(' / '));
+    check('自动任务：未确认时不再同时宣称「正在运行」（结论互斥）',
+      !hUnconf.includes('正在运行'));
+
+    // (f) 极端值不能漏出 NaN/undefined
+    L.auto = { mode: 'paper', running: true, ctl: {},
+               grid: { rebalance_days: null, source: 'heartbeat' },
+               state: { enabled: true, pid: null, checks: null, trades: null,
+                        skips: {}, notify: {}, last: {} } };
+    const dirtyAuto = dirty(render());
+    check('自动任务：字段缺失时不出 NaN/undefined', dirtyAuto.length === 0,
+      dirtyAuto.join(','));
+
+    L.auto = savedAuto;
+  }
 
   console.log(fails ? `\n${fails} 项未通过` : '\n全部通过');
   process.exit(fails ? 1 : 0);

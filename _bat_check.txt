@@ -1,0 +1,18 @@
+﻿{
+ "mode": "demo",
+ "running": false,
+ "heartbeat_pid": 19516,
+ "heartbeat_enabled": true,
+ "ctl_pid": null,
+ "ctl_pid_kind": null,
+ "grid": {
+  "rebalance_days": 1.0,
+  "bar": "1h",
+  "interval_min": 30.0,
+  "source": "heartbeat"
+ },
+ "rebalance_days": 1.0,
+ "checks": 1,
+ "trades": 0
+}
+

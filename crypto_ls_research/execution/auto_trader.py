@@ -20,10 +20,38 @@ Guards, in the order they are applied
 2. **market data stale**   -> refresh incrementally, re-check; still stale ->
                               skip.  A signal computed off a stale cache is a
                               *wrong* signal, not a late one.
-3. **not a rebalance day** -> skip.  (see above)
+3. **not a rebalance day** -> skip, UNLESS an exec window is configured and we
+                              are inside it (see `--exec-window`).
 4. **any `block`**         -> skip.  `force` is never passed, so no cap is ever
                               relaxed to make a trade happen.
 5. otherwise               -> execute.
+
+Exec windows (`--exec-window HH:MM`)
+------------------------------------
+The backtest grid is anchored at **UTC 02:00 = Beijing 10:00** and that anchor
+is not a parameter: `dec_idx = np.arange(warmup, T - 1, R)` with `warmup = 722`
+on a panel that starts 2021-01-01 00:00 UTC.  Every one of the 2,064 rebalance
+points in the delivered v3 sits on hour 02 minute 00.
+
+An operator who wants orders placed at, say, 23:30 Beijing cannot move that
+anchor, so the choice is:
+
+  * **pretend to move it** -- place the order 13.5h late and keep quoting the
+    backtest Sharpe, which is now a number for a strategy nobody is running; or
+  * **say what is happening** -- keep the signal exactly as verified, let the
+    due-ness gate be overridden deliberately inside a declared window, and
+    record the override so the deviation is visible in the audit log.
+
+This implements the second.  A window is a local-time `HH:MM` plus a tolerance
+(default 5 min); the first tick inside it forces one rebalance.  Forcing is
+rate-limited to **once per `rebalance_days`** so a 30-minute tick cannot spend
+the whole 20%/day turnover budget on noise -- the same failure the due-ness gate
+exists to prevent.
+
+A forced run is **not** silently equivalent: it trades on a signal that is
+`(window - anchor)` hours old.  Every forced decision writes
+`"forced_by": "exec_window"` and the measured signal age into `auto.jsonl`, so
+the deviation can be audited later instead of being discovered in the P&L.
 
 Every decision, **including every skip**, is appended to `auto.jsonl` and
 mirrored into `auto.json`, because "it has been running for a week" and "it died
@@ -70,6 +98,67 @@ def bar_hours(bar: str) -> float:
     return 1.0
 
 
+def parse_hhmm(s: str) -> int:
+    """`"23:30"` -> 1410 (minutes since local midnight).
+
+    Raises rather than guessing.  A typo'd window that silently became
+    "00:00" would move every future order by nine hours and look like a
+    strategy change, which is exactly the class of bug this file exists to
+    make impossible.
+    """
+    t = str(s or "").strip()
+    parts = t.split(":")
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        raise ValueError(f"时刻必须形如 'HH:MM'（24 小时制），收到 {s!r}")
+    hh, mm = int(parts[0]), int(parts[1])
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        raise ValueError(f"时刻超出范围，收到 {s!r}")
+    return hh * 60 + mm
+
+
+def in_exec_window(window_min: Optional[int], now: Optional[float] = None,
+                   tol_min: float = 5.0) -> bool:
+    """Is local wall-clock time inside `[window, window + tol)`?
+
+    Local time, deliberately: the operator says "11:30 at night" and means the
+    clock on the wall next to them.  Converting that to UTC is the caller's
+    job via `--exec-window-utc`, because a daemon that silently reinterpreted
+    the number would place orders 8 hours off for an Asia/Shanghai operator
+    and nobody would notice until the fills looked wrong.
+    """
+    if window_min is None:
+        return False
+    t = time.localtime(time.time() if now is None else now)
+    cur = t.tm_hour * 60 + t.tm_min
+    lo = int(window_min)
+    hi = lo + max(0.0, float(tol_min))
+    # Windows are short (<24h) by construction, so no midnight wrap handling:
+    # a window of "23:58 + 5min" legitimately spans two days and is supported
+    # by the modulo; anything longer is a misconfiguration, not a schedule.
+    if hi <= 1440:
+        return lo <= cur < hi
+    return cur >= lo or cur < (hi - 1440)
+
+
+def utc_offset_label(now: Optional[float] = None) -> str:
+    """A stable ASCII UTC-offset label for the *current* local zone.
+
+    NOT `time.strftime("%Z")`: on a Chinese Windows that returns `中国标准时间`,
+    which then travels through argv, JSON state files and log lines and can
+    crash a GBK console (`UnicodeEncodeError`) or mojibake the audit log.  The
+    offset is what actually matters for reading a schedule anyway -- "UTC+08:00"
+    is unambiguous and ASCII on every platform.
+
+    `%z` also gives the offset but is locale-independent only on POSIX; the
+    manual computation below is the same code path everywhere.
+    """
+    t = time.localtime(time.time() if now is None else now)
+    off = -time.timezone if not t.tm_isdst else -time.altzone
+    sign = "+" if off >= 0 else "-"
+    off = abs(int(off))
+    return f"UTC{sign}{off // 3600:02d}:{(off % 3600) // 60:02d}"
+
+
 class AutoTrader:
     """One rebalance loop for one mode.  No thread pool, no queue, no retries.
 
@@ -89,9 +178,13 @@ class AutoTrader:
 
     def __init__(self, mode: str = "demo", interval_min: float = 60.0, *,
                  bar: Optional[str] = None,
+                 rebalance_days: Optional[float] = None,
                  refresh_after_hours: float = 2.0,
                  dry_run: bool = False,
                  allow_live: bool = False,
+                 exec_window: Optional[str] = None,
+                 exec_window_tol_min: float = 5.0,
+                 exec_window_utc: bool = False,
                  limits: Optional[LiveLimits] = None,
                  signal_kwargs: Optional[dict] = None,
                  engine: Optional[LiveEngine] = None,
@@ -107,9 +200,28 @@ class AutoTrader:
         self.interval_min = max(MIN_INTERVAL_MIN, float(interval_min))
         self.interval_sec = self.interval_min * 60.0
         self.bar = bar or DEFAULT_SIGNAL["bar"]
+        # `None` means "whatever `DEFAULT_SIGNAL` says" (3d).  Passing a number
+        # overrides only this one field, so a caller can move the rebalance grid
+        # to 1d without having to restate the whole verified configuration and
+        # risk dropping a factor or a cap by omission.
+        self.rebalance_days = (float(rebalance_days)
+                               if rebalance_days is not None
+                               else float(DEFAULT_SIGNAL["rebalance_days"]))
+        if not (self.rebalance_days > 0):
+            raise ValueError(f"rebalance_days 必须为正，收到 {rebalance_days!r}")
         self.refresh_after_hours = float(refresh_after_hours)
         self.dry_run = bool(dry_run)
         self.allow_live = bool(allow_live)
+        # Exec window: `None` = never override the due-ness gate (the archived
+        # behaviour, and what every test before this feature assumed).
+        self.exec_window_min = parse_hhmm(exec_window) if exec_window else None
+        self.exec_window_tol_min = float(exec_window_tol_min)
+        self.exec_window_utc = bool(exec_window_utc)
+        # Rate limit for forced runs.  Without it a 30-minute tick inside a
+        # 5-minute window would fire once, but a mis-set tolerance (say 60 min)
+        # would fire twice and spend 40% of gross in one night.
+        self._last_forced_ts: float = 0.0
+        self._forced_count: int = 0
         self.store = Store(mode)
         self._log_fn = log
         # `limits=None` (not `LiveLimits.from_dict(None)`) so the engine reads the
@@ -120,7 +232,7 @@ class AutoTrader:
             mode=mode, limits=limits,
             signal_kwargs=signal_kwargs or {
                 "bar": self.bar,
-                "rebalance_days": DEFAULT_SIGNAL["rebalance_days"],
+                "rebalance_days": self.rebalance_days,
                 "asset_class": DEFAULT_SIGNAL["asset_class"],
                 "overrides": DEFAULT_SIGNAL["overrides"],
             })
@@ -191,6 +303,52 @@ class AutoTrader:
             self._log(f"写审计日志失败（不影响交易）：{e}")
         self._write_state()
 
+    # -- exec window -------------------------------------------------------
+    def _window_label(self) -> Optional[str]:
+        """Human-readable window, always stating the timezone it is in.
+
+        A bare "23:30" in a log is ambiguous the moment the machine's TZ
+        differs from the operator's, and this project has already been bitten
+        once by a UTC/local mix-up in the funding-fee join.
+        """
+        if self.exec_window_min is None:
+            return None
+        hh, mm = divmod(int(self.exec_window_min), 60)
+        tz = "UTC" if self.exec_window_utc else utc_offset_label()
+        return f"{hh:02d}:{mm:02d} {tz} (+{self.exec_window_tol_min:g}min)"
+
+    def _exec_window_open(self) -> bool:
+        """True if we may override the due-ness gate right now.
+
+        Three conditions, all required:
+          1. a window is configured;
+          2. local (or UTC, if `--exec-window-utc`) time is inside it;
+          3. the rate limit has elapsed -- at most one forced run per
+             `rebalance_days`, which is the same period the grid uses.  Without
+             (3) a tolerance typo turns the 20%/day turnover budget into a
+             per-tick budget and the book churns to death on fees.
+        """
+        if self.exec_window_min is None:
+            return False
+        now = time.time()
+        if self.exec_window_utc:
+            t = time.gmtime(now)
+            cur = t.tm_hour * 60 + t.tm_min
+            lo = int(self.exec_window_min)
+            hi = lo + max(0.0, self.exec_window_tol_min)
+            inside = (lo <= cur < hi) if hi <= 1440 else (cur >= lo or cur < hi - 1440)
+        else:
+            inside = in_exec_window(self.exec_window_min, now,
+                                    self.exec_window_tol_min)
+        if not inside:
+            return False
+        min_gap_sec = self.rebalance_days * 24.0 * 3600.0
+        if self._last_forced_ts and (now - self._last_forced_ts) < min_gap_sec:
+            self._log(f"     执行窗口已触发过（{self._forced_count} 次，"
+                      f"{min_gap_sec/3600:.0f}h 内不再强制），本次跳过。")
+            return False
+        return True
+
     def _write_state(self, enabled: Optional[bool] = None) -> None:
         st = {
             "mode": self.mode,
@@ -198,6 +356,7 @@ class AutoTrader:
             "pid": os.getpid(),
             "interval_min": self.interval_min,
             "bar": self.bar,
+            "rebalance_days": self.rebalance_days,
             "dry_run": self.dry_run,
             "allow_live": self.allow_live,
             "started": self.started,
@@ -211,6 +370,15 @@ class AutoTrader:
             "state_path": self.state_path(),
             "log_path": self.log_path(),
             "kill_switch": kill_switch_on(),
+            # The exec window must be in the heartbeat, not only in the argv:
+            # "why did it trade on a Tuesday" has to be answerable from
+            # `auto.json` alone, and a restart without the flag must be
+            # distinguishable from one with it.
+            "exec_window": self._window_label(),
+            "exec_window_min": self.exec_window_min,
+            "exec_window_utc": self.exec_window_utc,
+            "forced_runs": self._forced_count,
+            "last_forced_ts": self._last_forced_ts or None,
             # So "did I configure notifications, and are they actually wired?" is
             # answerable from the heartbeat instead of from memory.
             "notify": self._notifier_now().describe(),
@@ -282,13 +450,36 @@ class AutoTrader:
 
         # THE gate the server does not hold.  Without it this loop rebalances
         # every tick; `check_plan` only warns.
+        forced = False
         if self.engine.limits.require_rebalance_due and not target.rebalance_due:
-            self._log(f"未到调仓日（信号日 {target.decision_ts[:16]}，"
-                      f"下次 {target.next_decision_ts[:16]}），不下单")
-            return self._finish(out, "skip", "not_due", t0)
+            if self._exec_window_open():
+                forced = True
+                age_h = float(target.bars_since_decision) * bar_hours(self.bar)
+                out["forced_by"] = "exec_window"
+                out["exec_window"] = self._window_label()
+                out["signal_age_hours"] = age_h
+                self._forced_count += 1
+                self._last_forced_ts = time.time()
+                # Loud on purpose.  A forced run is a real deviation from the
+                # verified grid and must be visible in the notification, the
+                # audit log and the console -- not buried in a debug field.
+                self._log(
+                    f"⚠ 执行窗口 {self._window_label()} 触发强制调仓："
+                    f"信号日 {target.decision_ts[:16]}，信号已旧 {age_h:.1f} 小时。"
+                    f"本次下单偏离回测网格（锚点 UTC02:00/北京10:00），"
+                    f"策略绩效不再是 v3 口径。")
+            else:
+                self._log(f"未到调仓日（信号日 {target.decision_ts[:16]}，"
+                          f"下次 {target.next_decision_ts[:16]}），不下单")
+                if self.exec_window_min is not None:
+                    self._log(f"     执行窗口：{self._window_label()}（当前不在窗口内）")
+                return self._finish(out, "skip", "not_due", t0)
 
-        self._log(f"到调仓日（信号日 {target.decision_ts[:16]}），"
-                  f"目标毛敞口 {target.gross:.3f}，提交执行…")
+        if forced:
+            self._write_state(True)
+        else:
+            self._log(f"到调仓日（信号日 {target.decision_ts[:16]}），"
+                      f"目标毛敞口 {target.gross:.3f}，提交执行…")
         # `force=False` always: the only thing `force` does is silence the
         # off-schedule warning, and we have already decided we are on-schedule.
         try:
@@ -382,6 +573,12 @@ class AutoTrader:
         self._write_state(True)
         self._log(f"自动交易启动：mode={self.mode} 每 {self.interval_min:g} 分钟检查一次"
                   f"{'（dry-run，只算不下单）' if self.dry_run else ''}")
+        # Print the grid that actually gates trading.  It is the one number that
+        # decides whether tonight's tick is a rebalance or a no-op, so a
+        # heartbeat that does not state it cannot answer "why did nothing
+        # happen" without reading the source.
+        self._log(f"调仓网格：{self.bar} bar、每 {self.rebalance_days:g} 天一次"
+                  f"（资产分类 {DEFAULT_SIGNAL['asset_class']}）")
         if self.mode == "live":
             self._log("⚠ 实盘模式：订单将以真实资金成交。熔断开关可随时在控制台拉下。")
         self._log(f"心跳 {self.state_path()} · 审计 {self.log_path()}")
@@ -423,10 +620,26 @@ def main(argv: Optional[list] = None) -> int:
     ap.add_argument("--interval", type=float, default=60.0,
                     help="检查间隔（分钟），下限 %.0f" % MIN_INTERVAL_MIN)
     ap.add_argument("--bar", default=DEFAULT_SIGNAL["bar"])
+    ap.add_argument("--rebalance-days", type=float,
+                    default=DEFAULT_SIGNAL["rebalance_days"],
+                    help="调仓网格（天）。默认 %.2g = v3 已验收配置；"
+                         "改成 1 表示每天调仓（实测 Sharpe −0.08、MDD 深 4.1pp，"
+                         "但换手预算会一直吃满，详见 artifacts/FINDINGS.md）"
+                         % DEFAULT_SIGNAL["rebalance_days"])
     ap.add_argument("--refresh-after-hours", type=float, default=2.0,
                     help="最新已收盘 bar 落后超过这么多小时就先做增量刷新；0 = 从不刷新")
     ap.add_argument("--once", action="store_true",
                     help="只跑一次决策就退出（用于验证/外部定时器）")
+    ap.add_argument("--exec-window", default=None, metavar="HH:MM",
+                    help="执行窗口（本地时间）。到点后即使不在调仓网格上也会"
+                         "强制调仓一次。**这会偏离回测网格**：信号日仍是 "
+                         "UTC02:00/北京10:00 那个 bar，下单却晚了几小时。"
+                         "不传 = 不强制（默认，与回测口径一致）。")
+    ap.add_argument("--exec-window-tol", type=float, default=5.0, metavar="MIN",
+                    help="执行窗口宽度（分钟，默认 5）。窗口内第一个 tick 触发。")
+    ap.add_argument("--exec-window-utc", action="store_true",
+                    help="把 --exec-window 解释成 UTC 而不是本地时间。"
+                         "默认本地时间，因为『晚上11点半』指的是墙上的钟。")
     ap.add_argument("--dry-run", action="store_true",
                     help="只算不下单（写的是 dry_run 运行记录）")
     ap.add_argument("--allow-live", action="store_true",
@@ -435,8 +648,12 @@ def main(argv: Optional[list] = None) -> int:
 
     try:
         bot = AutoTrader(mode=a.mode, interval_min=a.interval,
-                         bar=a.bar, refresh_after_hours=a.refresh_after_hours,
-                         dry_run=a.dry_run, allow_live=a.allow_live)
+                         bar=a.bar, rebalance_days=a.rebalance_days,
+                         refresh_after_hours=a.refresh_after_hours,
+                         dry_run=a.dry_run, allow_live=a.allow_live,
+                         exec_window=a.exec_window,
+                         exec_window_tol_min=a.exec_window_tol,
+                         exec_window_utc=a.exec_window_utc)
     except PermissionError as e:
         print(f"拒绝启动：{e}", file=sys.stderr)
         return 3
