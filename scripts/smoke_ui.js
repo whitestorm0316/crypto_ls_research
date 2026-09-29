@@ -91,7 +91,8 @@ let src = fs.readFileSync(APP, 'utf8');
 if (!/\nboot\(\);\s*$/.test(src)) throw new Error('app.js 末尾的 boot() 调用没找到，stub 需要更新');
 src = src.replace(/\nboot\(\);\s*$/, '\n');
 src += `
-;globalThis.__T = { S, drawChart, curveValues, tickLabel, chartCandidates, initChartOff, PALETTE };
+;globalThis.__T = { S, drawChart, curveValues, tickLabel, chartCandidates, initChartOff, PALETTE,
+                    liveSkeleton, liveBarHtml, tradesHtml };
 `;
 vm.createContext(sandbox);
 vm.runInContext(src, sandbox, { filename: 'app.js' });
@@ -164,6 +165,60 @@ function check(name, ok, extra) {
   check('MDD 出现在图例里', lg.includes((eq.mdd * 100).toFixed(1) + '%'),
     `${(eq.mdd * 100).toFixed(1)}%`);
   check('候选数不超过上限', T.chartCandidates().length <= 6, `${T.chartCandidates().length} 个`);
+
+  /* --- 5. HTML 结构配平（2026-09-30 交易台泄漏事故的回归测试） ---
+   * liveBarHtml 曾多输出一个 </div>：浏览器解析时把 #liveRoot 提前关闭，
+   * 之后所有交易台面板变成 #content 的直接子元素、逃出 .liveOnly 的
+   * display:none，在回测结果/交易记录页全部可见。截图只能看到视口内的
+   * 内容、DOM grep 又只查了「出现顺序」，两层验证都没兜住。
+   * 这里用栈式配平直接断言：任何 builder 的输出都不许出现负深度。 */
+  function divBalance(html) {
+    const re = /<(\/?)div\b[^>]*>/gi;
+    let depth = 0, minDepth = 0;
+    let m;
+    while ((m = re.exec(html))) {
+      depth += m[1] === '/' ? -1 : 1;
+      if (depth < minDepth) minDepth = depth;
+    }
+    return { depth, minDepth };
+  }
+  const bar = T.liveBarHtml();
+  const balBar = divBalance(bar);
+  check('liveBarHtml div 配平（不得有孤立 </div>）',
+    balBar.depth === 0 && balBar.minDepth >= 0,
+    `end=${balBar.depth} min=${balBar.minDepth}`);
+
+  const wrapped = '<div class="liveOnly" id="liveRoot">' + T.liveSkeleton() + '</div>';
+  const balSkel = divBalance(wrapped);
+  check('liveSkeleton（含 liveRoot 包裹）div 配平',
+    balSkel.depth === 0 && balSkel.minDepth >= 0,
+    `end=${balSkel.depth} min=${balSkel.minDepth}`);
+
+  /* 面板必须出现在 liveRoot 的闭合之前：在包裹串里逐个面板名求 div 深度，
+   * 只要深度 < 1 就说明解析到它时 liveRoot 已经被提前关掉了。
+   * 名字匹配用 `>名字` 且后面跟空白或标签（summary 里是「模式与交易场所 <small>」，
+   * h3 里是「>信号<」，两种写法都要覆盖）。 */
+  const LIVE_PANELS = ['账户与连接', '信号', '下单计划', '风控闸门', '模式与交易场所',
+    '自动任务', '执行日志'];
+  {
+    const depths = LIVE_PANELS.map((name) => {
+      const m = wrapped.match(new RegExp('>' + name + '(?=[\\s<])'));
+      if (!m) return { name, depth: -99, found: false };
+      const at = m.index;
+      let depth = 0, mm;
+      const re = /<(\/?)div\b[^>]*>/gi;
+      while ((mm = re.exec(wrapped)) && mm.index < at) depth += mm[1] === '/' ? -1 : 1;
+      return { name, depth, found: true };
+    });
+    const outside = depths.filter((d) => !d.found || d.depth < 1);
+    check('交易台全部面板都在 .liveOnly 容器内',
+      outside.length === 0,
+      outside.map((d) => `${d.name}@depth${d.depth}${d.found ? '' : '(未找到)'}`).join(', '));
+  }
+
+  const balTrades = divBalance('<div class="tradesOnly">' + T.tradesHtml() + '</div>');
+  check('tradesHtml div 配平', balTrades.depth === 0 && balTrades.minDepth >= 0,
+    `end=${balTrades.depth} min=${balTrades.minDepth}`);
 
   console.log(fails ? `\n${fails} 项未通过` : '\n全部通过');
   process.exit(fails ? 1 : 0);

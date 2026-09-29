@@ -435,15 +435,26 @@ FUNDING_DIR=funding python -m ...                   # 强制使用纯 OKX（仅 
 
 ## 11. Phase 14–15 — Paper / Live Trading
 
-**当前状态：未实现（有意为之）。** 本仓库交付的是研究结论，而不是生产系统；
-在横截面 Alpha 未能通过成本与证伪检验之前上线实盘是错误顺序。
-代码层面已为它留好接口：
+**当前状态：执行层已实现（`crypto_ls_research/execution/`），三模式 paper/demo/live。**
 
-- `BacktestResult.weight_matrix` 就是每日目标仓位快照（可执行尺寸）
-- `risk/engine.py` 的函数都是无状态纯函数，可直接复用到实时风控
-- `execution` 的成交语义（信号→下单→成交差一根 bar）与真实下单流程一致
-- 上线前必须补齐：私有 API 签名与限频、订单状态机与部分成交、断线重连、
-  持仓对账、资金费实收核对、kill switch
+执行链：`signal.py`（跑 `run_backtest` 取最后调仓目标，**不重算信号**）→
+`planner.py`（量化张数）→ `limits.py`（五道风控闸门）→ `engine.py` →
+`store.py`。已实现的能力：
+
+- **OKX 私有 API**（`okx_private.py`）：v5 签名、批量下单（`/trade/batch-orders`）、
+  下单不盲重试（抛 `AmbiguousError` 要求对账）、确定性 `clOrdId`。
+- **订单状态机与部分成交**：`reconcile()` 拉 `order_by_clordid` 更新状态 +
+  `fills` 按 `tradeId` 去重。
+- **跨进程 `rebalance_lock`**（PID + TTL）：防「双 actor 各发一次完整订单 → 仓位翻倍」。
+- **目标书幂等**：`build_plan(current_sz → target_weights)` 算差量。
+- **换手预算对齐回测**：`turnover_budget` 不设会跑到 2.2× 已验证敞口。
+- **凭证管理**（`credentials.py`）：demo/live 分槽、env > file、脱敏、原子写、
+  kill switch（文件实现 fail closed）。
+- **`BacktestResult.weight_matrix`** 就是每日目标仓位快照（可执行尺寸）；
+  `risk/engine.py` 的函数都是无状态纯函数，可直接复用到实时风控。
+
+上线前仍须补齐的**非代码**项：成交假设的真实校准（薄池半价差 3bps 是分档常数
+不是实测报价）、实盘资金费进本地归因、影子盘（只记不下）先跑 4–8 周。
 
 ---
 

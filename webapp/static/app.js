@@ -180,6 +180,7 @@ async function boot() {
     await pollRuns();
     setInterval(pollRuns, 2500);
     window.addEventListener('resize', debounce(() => drawChart(), 180));
+    initHotkeys();
     if (wantTrades) {
       ensureTrades();
     } else if (wantLive) {
@@ -491,6 +492,11 @@ window.addEventListener('unhandledrejection', (e) => fatal('unhandled promise: '
 /* ============================== 主面板 ============================== */
 function renderContent() {
   const el = $('#content');
+  // 先把 tab 的显隐 class 打上，再生成内容。这样即使下方生成 HTML 的代码
+  // 中途抛异常（某个 run 的 summary 字段异常等），#content 的 trades/live
+  // class 也已经是正确状态，不会出现「切到交易记录却还残留交易台面板」。
+  el.classList.toggle('trades', S.tab === 'trades');
+  el.classList.toggle('live', S.tab === 'live');
   let h = `<div class="banners">`;
 
   const diffs = diffFromOptimal();
@@ -565,27 +571,35 @@ function renderContent() {
     <div class="panel"><div class="head"><h3>逐年 Sharpe</h3><span class="spacer"></span>
       <span class="muted" style="font-size:11.5px">与 ${esc(optTagLabel())} 基线对照</span></div>
       <div class="body" style="padding:4px 10px 10px">${yearTable(d)}</div></div></div>`;
-  h += `</div>`;                       /* /resultOnly */
 
-  h += `<div class="tradesOnly">${tradesHtml()}</div>`;
+  /* --- 增强分析：回撤区间 / 月度热力图 / 敞口序列 --- */
+  h += `<div class="panel" style="margin-top:14px"><div class="head"><h3>增强分析</h3>
+      <span class="spacer"></span><span class="muted" style="font-size:11.5px" id="detailNote">数据来自产物 baseline.pkl，与报告同源</span></div>
+      <div class="body" id="detailBody"><div class="empty">运行一次回测后显示回撤区间、月度收益与敞口序列。</div></div></div>`;
 
-  h += `<div class="liveOnly" id="liveRoot">${liveSkeleton()}</div>`;
-
-  /* --- 运行记录 --- */
-  h += `<h2 class="sec">运行记录 <small>${S.runs.length} 条 · 串行执行，不会抢核</small></h2>`;
+  /* --- 运行记录：只在「回测结果」页显示。以前它在三个 tab 之外、到处都跟着，
+   * 交易台/交易记录页下方挂着一份，看起来像页面串了。 --- */
+  h += `<h2 class="sec">运行记录 <small>${S.runs.length} 条 · 串行执行，不会抢核 · 勾选「对比」可叠加曲线</small></h2>`;
   h += `<div class="runs">`;
   if (!S.runs.length) h += `<div class="empty">还没有运行过。点右上角「运行回测」，快速档约 50 秒。</div>`;
   for (const run of S.runs) {
     const su = run.summary || {};
+    const done = run.status === 'done' || run.status === 'partial';
+    const on = done && !S.chartOff[run.tag];
+    const delable = run.status !== 'queued' && run.status !== 'running';
     h += `<div class="runrow ${S.selected === run.id ? 'sel' : ''}" data-run="${esc(run.id)}">
+      <div class="cmp" title="叠加到回测曲线">
+        <input type="checkbox" data-cmp="${esc(run.id)}" ${done && on ? 'checked' : ''} ${done ? '' : 'disabled'}></div>
       <div class="lbl"><b>${esc(run.label || run.id)}</b>
         <small>${esc(run.tag)} · ${fmtCN(run.created, 'sec')}${run.elapsed ? ' · ' + run.elapsed + 's' : ''}${run.n_stage_errors ? ` · <span style="color:var(--danger)">${run.n_stage_errors} 个 stage 报错</span>` : ''}</small></div>
       <div class="m">${su.sharpe != null ? 'Sharpe ' + fmt.n(su.sharpe) : ''}</div>
       <div class="m">${su.cagr != null ? 'CAGR ' + fmt.pct(su.cagr) : ''}</div>
       <div class="state ${esc(run.status)}"><span class="dot2"></span>${esc(statusText(run.status))}</div>
+      ${delable ? `<button class="btn sm ghost delrun" data-delrun="${esc(run.id)}" title="删除这条运行记录${run.tag === S.optimalTag ? '（该 tag 是验收基线，仅移除列表，保留盘上产物）' : ''}">删除</button>` : ''}
     </div>`;
   }
   h += `</div>`;
+  h += `<div id="cmpTable"></div>`;
 
   /* --- 日志 --- */
   if (d) {
@@ -602,19 +616,37 @@ function renderContent() {
       <div class="body"><div class="chips"><span class="chip" style="white-space:pre-wrap;word-break:break-all">${esc(cmdText(d))}</span></div></div></div>`;
   }
 
+  h += `</div>`;                       /* /resultOnly */
+
+  h += `<div class="tradesOnly">${tradesHtml()}</div>`;
+
+  h += `<div class="liveOnly" id="liveRoot">${liveSkeleton()}</div>`;
+
   // `pollRuns()` 每 2.5s 走到这里重建整块 #content。包进 preserveUi()，否则用户
   // 正在敲的任何输入框都会被丢回模板给的旧值——API Key 那种没有 value 回填的框
   // 就是直接变空。浏览器控制台一个报错都没有。
   preserveUi(() => {
   el.innerHTML = h;
-  // `#content` carries `.content` for its own scroll/padding; never overwrite
-  // `className` outright or the layout silently collapses.
-  el.classList.toggle('trades', S.tab === 'trades');
-  el.classList.toggle('live', S.tab === 'live');
 
   const bo = $('#backOpt');
   if (bo) bo.onclick = () => { applyPreset('v3_optimal'); renderSide(); renderContent(); refreshWarnings(); };
-  $$('[data-run]').forEach((row) => row.onclick = () => selectRun(row.dataset.run));
+  $$('[data-run]').forEach((row) => row.onclick = (e) => {
+    // 勾选框在行内，点它不该触发「选中运行」；删除按钮同理
+    if (e.target && (e.target.tagName === 'INPUT' || e.target.closest('.delrun'))) return;
+    selectRun(row.dataset.run);
+  });
+  $$('[data-delrun]').forEach((btn) => btn.onclick = async () => {
+    await deleteRun(btn.dataset.delrun);
+  });
+  $$('[data-cmp]').forEach((cb) => cb.onchange = () => {
+    const run = S.runs.find((r) => r.id === cb.dataset.cmp);
+    if (!run) return;
+    if (cb.checked) delete S.chartOff[run.tag];
+    else S.chartOff[run.tag] = true;
+    paintCmpTable();
+    drawChart();
+  });
+  paintCmpTable();
   $$('[data-tab]').forEach((t) => t.onclick = () => {
     if (S.tab === t.dataset.tab) return;
     S.tab = t.dataset.tab;
@@ -627,8 +659,22 @@ function renderContent() {
 
   const note = $('#chartNote');
   if (note && r) note.textContent = `蓝 = 本配置，灰 = ${optTagLabel()} 基线`;
-  if (S.tab === 'result') drawChart();
+  if (S.tab === 'result') { drawChart(); loadDetail(); }
   if (d) { const lg = $('#log'); if (lg) lg.innerHTML = logHtml(d._log || ''); startLog(d); }
+  const cc = $('#copyCmd');
+  if (cc) cc.onclick = async () => {
+    // 这个按钮此前从来没绑过事件（点了没反应）。clipboard API 在非 https 的
+    // 127.0.0.1 上可用，但老浏览器没有，退回 execCommand 方案。
+    const txt = d ? cmdText(d) : '';
+    try { await navigator.clipboard.writeText(txt); cc.textContent = '已复制'; }
+    catch {
+      const ta = document.createElement('textarea');
+      ta.value = txt; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); cc.textContent = '已复制'; } catch { cc.textContent = '复制失败'; }
+      document.body.removeChild(ta);
+    }
+    setTimeout(() => { cc.textContent = '复制'; }, 1500);
+  };
   if (S.tab === 'trades') {
     // `el.innerHTML = h` 刚刚把 #trBody 重建成了「正在读取…」占位，所以这里必须
     // 让它恢复内容。以前这里只调 bindTrBody()，于是 pollRuns() 每 2.5s 调一次
@@ -1147,6 +1193,30 @@ const PALETTE = ['#2f6feb', '#d1495b', '#2a9d8f', '#e9a23b', '#8e6fd8', '#4b8b3b
   '#c2571a', '#0f7c8a'];
 const CHART_MAX_SERIES = 6;
 
+/* 指标对比表：勾选了 ≥2 条历史运行（叠加到曲线）时，并排显示 Sharpe/CAGR/MDD，
+ * 一眼看出「改一个参数」到底动了哪个指标。 */
+function paintCmpTable() {
+  const el = $('#cmpTable');
+  if (!el) return;
+  const rows = S.runs.filter((r) => (r.status === 'done' || r.status === 'partial')
+    && r.summary && !S.chartOff[r.tag]);
+  if (rows.length < 2) { el.innerHTML = ''; return; }
+  let h = `<div class="panel" style="margin-top:14px"><div class="head"><h3>指标对比
+    <small>已叠加 ${rows.length} 条曲线</small></h3></div>
+    <div class="body"><div class="tblwrap"><table class="cmp"><thead><tr>
+      <th>运行</th><th>tag</th><th>Sharpe</th><th>CAGR</th><th>最大回撤</th></tr></thead><tbody>`;
+  for (const r of rows) {
+    const s = r.summary || {};
+    h += `<tr><td class="tk">${esc(r.label || r.id)}</td>
+      <td class="mono">${esc(r.tag)}</td>
+      <td class="num">${s.sharpe != null ? fmt.n(s.sharpe) : '—'}</td>
+      <td class="num">${s.cagr != null ? fmt.pct(s.cagr) : '—'}</td>
+      <td class="num">${s.mdd != null ? fmt.pct(s.mdd) : '—'}</td></tr>`;
+  }
+  h += `</tbody></table></div></div></div>`;
+  el.innerHTML = h;
+}
+
 /* 能作为曲线来源的 tag：当前运行、验收基线（`S.optimalTag`），以及所有跑完的历史运行。 */
 function chartCandidates() {
   const out = [];
@@ -1297,15 +1367,25 @@ async function drawChart() {
 
   const t0 = Math.min(...shown.map((s) => s.d.t[0]));
   const t1 = Math.max(...shown.map((s) => s.d.t[s.d.t.length - 1]));
+  // 缩放窗口：[0,1] 相对 t0..t1 的区间；双击/切换视图重置。
+  let z = S.chartZoom;
+  if (!z || z.view !== view) z = S.chartZoom = { lo: 0, hi: 1, view };
+  const lo = t0 + (t1 - t0) * z.lo;
+  const hi = t0 + (t1 - t0) * z.hi;
   let vmin = Infinity, vmax = -Infinity;
   for (const s of shown) {
-    for (const v of s.y) { const u = fwd(view, v); if (u < vmin) vmin = u; if (u > vmax) vmax = u; }
+    for (let i = 0; i < s.y.length; i++) {
+      const tt = s.d.t[i];
+      if (tt < lo || tt > hi) continue;
+      const u = fwd(view, s.y[i]);
+      if (u < vmin) vmin = u; if (u > vmax) vmax = u;
+    }
   }
   if (view === 'dd') vmax = 0;                 // 回撤视图顶部固定 0%
   const pad = (vmax - vmin) * 0.08 || 0.05;
   vmin -= pad;
   if (view !== 'dd') vmax += pad;
-  const X = (t) => P.l + (t - t0) / (t1 - t0) * (W - P.l - P.r);
+  const X = (t) => P.l + (t - lo) / (hi - lo) * (W - P.l - P.r);
   const Y = (v) => P.t + (vmax - fwd(view, v)) / (vmax - vmin) * (H - P.t - P.b);
 
   ctx.strokeStyle = cBorder; ctx.lineWidth = 1; ctx.font = '10.5px system-ui';
@@ -1343,9 +1423,9 @@ async function drawChart() {
   }
 
   ctx.fillStyle = cMuted; ctx.textAlign = 'left'; ctx.font = '10.5px system-ui';
-  ctx.fillText(fmtCN(t0, 'date'), P.l, H - 7);
+  ctx.fillText(fmtCN(lo, 'date'), P.l, H - 7);
   ctx.textAlign = 'right';
-  ctx.fillText(fmtCN(t1, 'date'), W - P.r, H - 7);
+  ctx.fillText(fmtCN(hi, 'date'), W - P.r, H - 7);
 
   const last = shown[shown.length - 1];
   ctx.fillStyle = cText; ctx.textAlign = 'left'; ctx.font = '11.5px system-ui';
@@ -1353,6 +1433,226 @@ async function drawChart() {
     ? `最大回撤 ${(last.mdd * 100).toFixed(2)}%`
     : `末值 ${last.d.final.toFixed(3)}×`;
   ctx.fillText(`${last.tag} · ${head}  (${last.d.start} → ${last.d.end})`, P.l, P.t + 11);
+  if (z.lo > 0 || z.hi < 1) {
+    ctx.textAlign = 'center'; ctx.fillStyle = cMuted;
+    ctx.fillText('双击重置缩放 · 滚轮缩放 · 悬停看值', (P.l + W - P.r) / 2, P.t + 11);
+  }
+
+  /* ---- hover 十字线 + 数值 / 滚轮缩放 / 双击重置 ---- */
+  bindChartHover(cv, { shown, X, Y, P, W, H, view, vmin, vmax, lo, hi, cBorder, cMuted, cText });
+}
+
+/* hover：十字线 + 最近点数值；滚轮：缩放时间轴；双击：重置。用 on* 直接赋值，
+ * 每次 drawChart 重画后覆盖旧监听，不会叠挂。 */
+function bindChartHover(cv, o) {
+  const { shown, X, Y, P, W, H, view, cBorder, cMuted, cText } = o;
+  let hoverX = null;
+
+  const redraw = () => drawChart();
+
+  cv.onmousemove = (e) => {
+    const rect = cv.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    if (x < P.l || x > W - P.r) { if (hoverX != null) { hoverX = null; redraw(); } return; }
+    hoverX = x;
+    redraw();
+    // 在重画之后叠加十字线 + 数值
+    const ctx = cv.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    // 最近点：对每条曲线找最接近 x 的点
+    let best = null, bestDist = Infinity;
+    for (const s of shown) {
+      for (let i = 0; i < s.d.t.length; i++) {
+        const px = X(s.d.t[i]);
+        const dist = Math.abs(px - x);
+        if (dist < bestDist) { bestDist = dist; best = { s, i, px, py: Y(s.y[i]) }; }
+      }
+    }
+    if (!best) return;
+    ctx.strokeStyle = cMuted; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(best.px + .5, P.t); ctx.lineTo(best.px + .5, H - P.b); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = best.s.c; ctx.beginPath(); ctx.arc(best.px, best.py, 3, 0, Math.PI * 2); ctx.fill();
+    // 数值标签
+    const val = view === 'dd' ? (best.s.y[best.i] * 100).toFixed(2) + '%'
+      : view === 'log' ? Math.exp(best.s.y[best.i]).toFixed(3) + '×'
+      : best.s.y[best.i].toFixed(3) + '×';
+    const date = fmtCN(best.s.d.t[best.i], 'date');
+    const label = `${best.s.tag} · ${date} · ${val}`;
+    ctx.font = '11px system-ui';
+    const tw = ctx.measureText(label).width;
+    let bx = best.px + 8; if (bx + tw > W - P.r) bx = best.px - tw - 8;
+    ctx.fillStyle = 'var(--panel-2)';
+    ctx.fillRect(bx - 4, P.t - 2, tw + 8, 16);
+    ctx.strokeStyle = cBorder; ctx.strokeRect(bx - 4, P.t - 2, tw + 8, 16);
+    ctx.fillStyle = cText; ctx.fillText(label, bx, P.t + 10);
+  };
+
+  cv.onmouseleave = () => { if (hoverX != null) { hoverX = null; redraw(); } };
+
+  cv.onwheel = (e) => {
+    e.preventDefault();
+    const rect = cv.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const frac = (x - P.l) / (W - P.l - P.r);
+    const z = S.chartZoom || { lo: 0, hi: 1 };
+    const span = z.hi - z.lo;
+    const k = e.deltaY > 0 ? 1.25 : 0.8;   // 上滚放大，下滚缩小
+    let nspan = Math.min(1, Math.max(0.02, span * k));
+    let center = z.lo + span * frac;
+    let nlo = center - nspan * frac;
+    let nhi = nlo + nspan;
+    if (nlo < 0) { nlo = 0; nhi = nspan; }
+    if (nhi > 1) { nhi = 1; nlo = 1 - nspan; }
+    S.chartZoom = { lo: nlo, hi: nhi, view: o.view };
+    redraw();
+  };
+
+  cv.ondblclick = () => { S.chartZoom = { lo: 0, hi: 1, view: o.view }; redraw(); };
+}
+
+/* ---- 增强分析：回撤区间 / 月度热力图 / 敞口序列 ----
+ * 数据来自 `/api/equity/<tag>/detail`（后端从 baseline.pkl 全量序列算，不下采样）。 */
+async function loadDetail() {
+  const tag = S.detail && S.detail.tag;
+  const el = $('#detailBody');
+  if (!el) return;
+  if (!tag) { el.innerHTML = '<div class="empty">运行一次回测后显示增强分析。</div>'; return; }
+  if (S.detailTag === tag && S.detailData) { paintDetail(S.detailData); return; }
+  try {
+    const r = await fetch('/api/equity/' + encodeURIComponent(tag) + '/detail');
+    if (!r.ok) { el.innerHTML = '<div class="empty">该运行无增强分析数据。</div>'; return; }
+    const d = await r.json();
+    if (!d || !d.monthly) { el.innerHTML = '<div class="empty">该运行无增强分析数据。</div>'; return; }
+    S.detailTag = tag; S.detailData = d;
+    paintDetail(d);
+  } catch (e) {
+    el.innerHTML = '<div class="empty">增强分析加载失败。</div>';
+  }
+}
+
+function paintDetail(d) {
+  const el = $('#detailBody');
+  if (!el) return;
+  const h = [];
+  // 1) 回撤区间表
+  if (d.drawdowns && d.drawdowns.length) {
+    h.push(`<div class="sub"><b>最深回撤区间</b>（全量序列，与报告同口径）</div>`);
+    h.push(`<div class="tblwrap" style="max-height:220px"><table class="cmp"><thead><tr>
+      <th>#</th><th>起点</th><th>谷底</th><th>结束</th><th>深度</th><th>持续天数</th></tr></thead><tbody>`);
+    d.drawdowns.forEach((r, i) => {
+      h.push(`<tr><td class="num">${i + 1}</td><td>${esc(r.start)}</td>
+        <td>${esc(r.trough)}</td><td>${esc(r.end)}</td>
+        <td class="num" style="color:var(--down)">${(r.depth * 100).toFixed(2)}%</td>
+        <td class="num">${r.days}</td></tr>`);
+    });
+    h.push(`</tbody></table></div>`);
+  }
+  // 2) 月度热力图
+  if (d.monthly && d.monthly.length) {
+    h.push(`<div class="sub" style="margin-top:12px"><b>月度收益热力图</b>（绿色正、红色负）</div>`);
+    h.push(monthlyHeatmap(d.monthly));
+  }
+  // 3) 敞口序列
+  if (d.gross || d.net || d.beta) {
+    h.push(`<div class="sub" style="margin-top:12px"><b>敞口序列</b>（毛 / 净 / beta）</div>`);
+    h.push(`<canvas class="chart small" id="expChart" style="height:160px"></canvas>`);
+  }
+  el.innerHTML = h.join('');
+  if (d.gross || d.net || d.beta) drawExposure(d);
+}
+
+function monthlyHeatmap(rows) {
+  const years = [...new Set(rows.map((r) => r.y))].sort();
+  // 热力图颜色：正绿负红（本项目涨红跌绿是**行情**，收益热力图用红绿表示盈亏正负）
+  const color = (v) => {
+    if (v == null || !isFinite(v)) return 'transparent';
+    const a = Math.min(Math.abs(v) / 0.15, 1);   // ±15% 封顶
+    return v >= 0
+      ? `rgba(46,160,67,${0.08 + 0.72 * a})`       // 绿 = 正
+      : `rgba(218,54,51,${0.08 + 0.72 * a})`;      // 红 = 负
+  };
+  let h = `<div style="overflow:auto"><table class="hm"><thead><tr><th>年</th>`;
+  for (let m = 1; m <= 12; m++) h += `<th>${m}月</th>`;
+  h += `<th>全年</th></tr></thead><tbody>`;
+  const byKey = {};
+  for (const r of rows) byKey[r.y + '-' + r.m] = r.ret;
+  for (const y of years) {
+    const rets = [];
+    for (let m = 1; m <= 12; m++) rets.push(byKey[y + '-' + m]);
+    const yr = rets.reduce((a, v, i) => (isFinite(v) ? a * (1 + v) : a), 1) - 1;
+    h += `<tr><td class="num">${y}</td>`;
+    for (let m = 1; m <= 12; m++) {
+      const v = byKey[y + '-' + m];
+      h += `<td class="hmc" style="background:${color(v)}" title="${y}-${m} ${isFinite(v) ? (v * 100).toFixed(2) + '%' : '—'}">${isFinite(v) ? (v * 100).toFixed(1) : ''}</td>`;
+    }
+    h += `<td class="num" style="font-weight:650;color:${yr >= 0 ? 'var(--ok)' : 'var(--danger)'}">${(yr * 100).toFixed(1)}%</td></tr>`;
+  }
+  h += `</tbody></table></div>`;
+  return h;
+}
+
+function drawExposure(d) {
+  const cv = $('#expChart');
+  if (!cv || !cv.clientWidth) return;
+  const ctx = cv.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  const css = getComputedStyle(document.body);
+  const cMuted = css.getPropertyValue('--muted').trim();
+  const cBorder = css.getPropertyValue('--border').trim();
+  const cText = css.getPropertyValue('--text-2').trim();
+  const series = [];
+  if (d.gross) series.push({ k: 'gross', label: '毛敞口', c: PALETTE[0], s: d.gross });
+  if (d.net) series.push({ k: 'net', label: '净敞口', c: PALETTE[2], s: d.net });
+  if (d.beta) series.push({ k: 'beta', label: '|beta|', c: PALETTE[3], s: d.beta });
+  if (!series.length) return;
+  const tmin = Math.min(...series.map((x) => x.s.t[0]));
+  const tmax = Math.max(...series.map((x) => x.s.t[x.s.t.length - 1]));
+  let vmin = Infinity, vmax = -Infinity;
+  for (const x of series) for (const v of x.s.v) { if (v < vmin) vmin = v; if (v > vmax) vmax = v; }
+  if (vmin === vmax) { vmin -= 0.1; vmax += 0.1; }
+  const pad = (vmax - vmin) * 0.08;
+  vmin -= pad; vmax += pad;
+  const P = { l: 44, r: 12, t: 12, b: 22 };
+  const X = (t) => P.l + (t - tmin) / (tmax - tmin) * (W - P.l - P.r);
+  const Y = (v) => P.t + (vmax - v) / (vmax - vmin) * (H - P.t - P.b);
+  ctx.strokeStyle = cBorder; ctx.font = '10.5px system-ui';
+  ctx.fillStyle = cMuted; ctx.textAlign = 'right';
+  for (let i = 0; i <= 3; i++) {
+    const u = vmin + (vmax - vmin) * i / 3;
+    const y = Math.round(Y(u)) + .5;
+    ctx.beginPath(); ctx.moveTo(P.l, y); ctx.lineTo(W - P.r, y); ctx.stroke();
+    ctx.fillText(u.toFixed(2), P.l - 6, y + 3.5);
+  }
+  // 零线
+  ctx.strokeStyle = cMuted; ctx.setLineDash([3, 3]);
+  ctx.beginPath(); ctx.moveTo(P.l, Y(0)); ctx.lineTo(W - P.r, Y(0)); ctx.stroke();
+  ctx.setLineDash([]);
+  for (const x of series) {
+    ctx.beginPath();
+    for (let i = 0; i < x.s.t.length; i++) {
+      const px = X(x.s.t[i]), py = Y(x.s.v[i]);
+      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    }
+    ctx.strokeStyle = x.c; ctx.lineWidth = 1.6; ctx.stroke();
+  }
+  // 图例
+  ctx.fillStyle = cText; ctx.textAlign = 'left'; ctx.font = '11px system-ui';
+  let lx = P.l;
+  for (const x of series) {
+    ctx.fillStyle = x.c; ctx.fillRect(lx, P.t - 2, 10, 10);
+    ctx.fillStyle = cText; ctx.fillText(x.label, lx + 14, P.t + 7);
+    lx += 14 + ctx.measureText(x.label).width + 16;
+  }
+  ctx.fillStyle = cMuted; ctx.textAlign = 'left'; ctx.font = '10.5px system-ui';
+  ctx.fillText(fmtCN(tmin, 'date'), P.l, H - 6);
+  ctx.textAlign = 'right';
+  ctx.fillText(fmtCN(tmax, 'date'), W - P.r, H - 6);
 }
 
 /* ============================== 运行与轮询 ============================== */
@@ -1372,10 +1672,11 @@ async function runNow() {
   const label = `${sub} · ${S.cli.bar} · ${S.cli.rebalance_days}d · cap${S.ov['portfolio.max_weight_per_instrument']} · tvol${S.ov['execution.max_daily_turnover']}`;
 
   btn.disabled = true; btn.textContent = '提交中…';
+  const tag = (($('#runTag') || {}).value || '').trim();
   try {
     const res = await (await fetch('/api/run', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ overrides, cli, stages: S.stages, preset: S.preset, label }),
+      body: JSON.stringify({ overrides, cli, stages: S.stages, preset: S.preset, label, tag }),
     })).json();
     if (res.error) { alert(res.error); return; }
     S.selected = res.id; S.logOffset = 0;
@@ -1476,6 +1777,11 @@ async function selectRun(id) {
   S.detail = d;
   // 刚选中的运行默认要出现在曲线上（用户之前手动关掉过也要重新显示）
   if (d.tag) delete S.chartOff[d.tag];
+  // 运行记录本质是「回测结果」：在交易台/交易记录 tab 下点它，就是「去看这次结果」，
+  // 应平滑切回回测结果页。否则页面留在 live/trades 却在底下渲染结果，视觉上像「跳转」。
+  if (S.tab === 'live') {
+    switchTab('result');
+  }
   // Keep the 交易记录 tab pointing at the run that was just picked.
   if (S.tab === 'trades' && d.tag) {
     S.trTag = d.tag;
@@ -1488,6 +1794,28 @@ async function selectRun(id) {
   S.logOffset = lp.offset || 0;
   d._log = lp.text || '';
   renderContent();
+}
+
+async function deleteRun(id) {
+  const run = S.runs.find((r) => r.id === id);
+  if (!run) return;
+  const tag = run.tag || run.id;
+  const ok = confirm(`删除运行记录「${run.label || id}」（tag: ${tag}）？\n\n` +
+    (run.tag === S.optimalTag
+      ? '该 tag 是验收基线，只会移除列表与日志，盘上产物会保留。\n\n'
+      : '删除后会同时清理盘上产物目录（若该 tag 未被其他记录共用）。\n\n') +
+    '此操作不可撤销。');
+  if (!ok) return;
+  try {
+    const resp = await fetch('/api/runs/' + encodeURIComponent(id), { method: 'DELETE' });
+    const d = await resp.json();
+    if (!resp.ok) { alert(d.error || ('删除失败 HTTP ' + resp.status)); return; }
+    if (S.selected === id) { S.selected = null; S.detail = null; S.trTag = null; }
+    await pollRuns();
+    renderContent();
+  } catch (e) {
+    alert('删除失败：' + (e && e.message || e));
+  }
 }
 
 function startLog(d) {
@@ -1533,6 +1861,37 @@ $('#runBtn').onclick = runNow;
 
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
 
+/* ---- 全局快捷键：1/2/3 切 tab，R 运行回测，? 帮助 ----
+ * 只在非输入控件上触发：焦点在 input/textarea/select 里时打字不该切页。 */
+function switchTab(tab) {
+  if (S.tab === tab) return;
+  S.tab = tab;
+  const hash = tab === 'trades' ? '#trades' : (tab === 'live' ? '#live' : '#result');
+  try { history.replaceState(null, '', hash); } catch { }
+  renderContent();
+  if (tab === 'trades') ensureTrades();
+  if (tab === 'live') ensureLive();
+}
+
+function initHotkeys() {
+  window.addEventListener('keydown', (e) => {
+    const el = document.activeElement;
+    const tag = el && el.tagName ? el.tagName.toLowerCase() : '';
+    if (tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const k = e.key;
+    if (k === '1') { e.preventDefault(); switchTab('result'); }
+    else if (k === '2') { e.preventDefault(); switchTab('trades'); }
+    else if (k === '3') { e.preventDefault(); switchTab('live'); }
+    else if (k === 'r' || k === 'R') { e.preventDefault(); runNow(); }
+    else if (k === '?') {
+      e.preventDefault();
+      alert('快捷键：\n  1 / 2 / 3 — 结果 / 交易记录 / 交易台\n  R — 运行回测\n  ? — 本帮助');
+    }
+  });
+}
+
+
 /* =========================================================================
    交易台
    -------------------------------------------------------------------------
@@ -1577,6 +1936,24 @@ const LIVE_LIMIT_FIELDS = [
   ['max_leverage', '账户杠杆上限 (×)', '请求杠杆超过此值即拒绝下单'],
 ];
 
+/* 吸顶操作条：模式 + 连接/熔断状态 + 主按钮。页面 6 个面板很长，主操作不用滚到底。 */
+function liveBarHtml() {
+  const L = S.live;
+  const st = L.status || {};
+  const modeLabel = ({ paper: '本地模拟', demo: 'OKX 模拟盘', live: '实盘' })[L.mode] || L.mode;
+  const stateTxt = st.kill_switch ? '已熔断' : (st.connected ? '已连接' : '未连接');
+  const stateCls = st.kill_switch ? 'danger' : (st.connected ? 'ok' : 'muted');
+  const plan = L.plan && L.plan.plan;
+  const blocked = !!L.plan && (!!L.plan.blocked || (L.plan.violations || []).some((v) => v.sev === 'block'));
+  return `<span class="lbmode">${esc(modeLabel)}</span>
+    <span class="lbstate" style="color:var(--${stateCls})">${esc(stateTxt)}</span>
+    ${plan ? `<span class="lbstate">${plan.n_orders} 笔 · ${fmt.dol(plan.order_notional)}</span>` : ''}
+    <span class="spacer"></span>
+    <span class="kbd">R</span><span class="lbstate" style="font-size:11px">运行</span>
+    <button class="btn sm ${L.busy ? '' : 'primary'}" id="liveBarPrepare" ${L.busy ? 'disabled' : ''}>⚡ 一键准备</button>
+    ${plan ? `<button class="btn sm ${L.mode === 'live' ? 'danger' : 'primary'}" id="liveBarGo" ${blocked || !plan.n_orders ? 'disabled' : ''}>${L.mode === 'live' ? '确认下单' : (L.mode === 'demo' ? '模拟盘下单' : '执行调仓')}</button>` : ''}`;
+}
+
 function liveSkeleton() {
   const L = S.live;
   const note = L.statusErr
@@ -1584,11 +1961,8 @@ function liveSkeleton() {
     : '';
   return `${note}
   <h2 class="sec">交易台 <small>信号与回测同源 · 下单前必过风控闸门</small></h2>
-  <div class="panel"><div class="head"><h3>模式</h3><span class="spacer"></span>
-    <span class="muted" style="font-size:11.5px">模式决定密钥槽与是否真实成交</span></div>
-    <div class="body" id="liveMode">${L.meta ? '' : '<div class="empty">正在读取…</div>'}</div></div>
-
-  <div class="grid2" style="margin-top:14px">
+  <div class="livebar" id="liveBar">${liveBarHtml()}</div>
+  <div class="grid2">
     <div class="panel"><div class="head"><h3>账户与连接</h3><span class="spacer"></span>
       <span class="muted" style="font-size:11.5px" id="liveConnPill"></span></div>
       <div class="body" id="liveAcct"><div class="empty">正在读取…</div></div></div>
@@ -1597,21 +1971,28 @@ function liveSkeleton() {
       <div class="body" id="liveSignal"><div class="empty">正在读取…</div></div></div>
   </div>
 
-  <div class="panel" style="margin-top:14px"><div class="head"><h3>风控闸门</h3>
-    <span class="spacer"></span><span class="muted" style="font-size:11.5px">任何一条「拦截」都会让整批订单不发出</span></div>
-    <div class="body" id="liveGates"><div class="empty">尚未生成计划</div></div></div>
-
-  <div class="panel" style="margin-top:14px"><div class="head"><h3>自动任务</h3>
-    <span class="spacer"></span><span class="muted" style="font-size:11.5px">独立进程运行，关掉本页面也继续；只按调仓日下单</span></div>
-    <div class="body" id="liveAuto"><div class="empty">正在读取…</div></div></div>
-
   <div class="panel" style="margin-top:14px"><div class="head"><h3>下单计划</h3>
     <span class="spacer"></span><span class="muted" style="font-size:11.5px" id="livePlanMeta"></span></div>
     <div class="body" id="livePlan"><div class="empty">点「生成下单计划」开始</div></div></div>
 
-  <div class="panel" style="margin-top:14px"><div class="head"><h3>执行日志</h3>
-    <span class="spacer"></span><span class="muted mono" id="liveJobMeta"></span></div>
-    <div class="body" id="liveJob"><div class="empty">还没有执行记录</div></div></div>
+  <div class="panel" style="margin-top:14px"><div class="head"><h3>风控闸门</h3>
+    <span class="spacer"></span><span class="muted" style="font-size:11.5px">任何一条「拦截」都会让整批订单不发出</span></div>
+    <div class="body" id="liveGates"><div class="empty">尚未生成计划</div></div></div>
+
+  <details class="livefold" style="margin-top:14px">
+    <summary>模式与交易场所 <small>模式决定密钥槽与是否真实成交；通常设一次就不动</small></summary>
+    <div class="body" id="liveMode">${L.meta ? '' : '<div class="empty">正在读取…</div>'}</div>
+  </details>
+
+  <details class="livefold" style="margin-top:10px">
+    <summary>自动任务 <small>独立进程运行，关掉本页面也继续；只按调仓日下单</small></summary>
+    <div class="body" id="liveAuto"><div class="empty">正在读取…</div></div>
+  </details>
+
+  <details class="livefold" style="margin-top:10px">
+    <summary>执行日志 <small id="liveJobMeta"></small></summary>
+    <div class="body" id="liveJob"><div class="empty">还没有执行记录</div></div>
+  </details>
 
   <div class="panel" style="margin-top:14px"><div class="head">
     <div class="seg sm" id="liveSeg">
@@ -1782,6 +2163,7 @@ function livePaintAll() {
     put('livePlan', livePlanHtml());
     put('liveJob', liveJobHtml());
     put('liveHist', liveHistHtml());
+    put('liveBar', liveBarHtml());
     /* 子标签高亮必须在这里同步。以前它只出现在 liveSkeleton() 里，而
      * livePaintAll() 只重绘 #liveHist —— 于是点「成交」表格换了、按钮还亮在
      * 「订单」上，看起来就是"切不过去"。 */
@@ -1966,25 +2348,49 @@ function liveAcctHtml() {
   return h;
 }
 
+function signalAge(iso) {
+  // 最新已收盘 K 线距现在多久。输入是 UTC ISO（或 epoch ms）。返回 {txt, stale}。
+  const ms = _ms(iso);
+  if (ms == null || !isFinite(ms)) return null;
+  const delta = Date.now() - ms;
+  const min = Math.round(delta / 60000);
+  if (min < 0) return { txt: '刚刚', stale: false };
+  if (min < 1) return { txt: '刚刚', stale: false };
+  if (min < 60) return { txt: `${min} 分钟前`, stale: false };
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return { txt: `${hr} 小时 ${min % 60} 分前`, stale: hr >= 1 };
+  const d = Math.floor(hr / 24);
+  return { txt: `${d} 天前`, stale: true };
+}
+
 function liveSignalHtml() {
   const L = S.live;
   const pl = L.plan;
   let h = `<div class="split">
-    <button class="btn sm" id="liveRefreshData">↻ 刷新行情数据</button>
-    <button class="btn sm ${L.busy ? '' : 'primary'}" id="livePlanBtn" ${L.busy ? 'disabled' : ''}>生成下单计划</button>
+    <button class="btn sm ${L.busy ? '' : 'primary'}" id="livePrepareBtn" ${L.busy ? 'disabled' : ''}>⚡ 一键准备（刷新行情＋生成计划）</button>
+    <button class="btn sm ghost" id="liveRefreshData" ${L.busy ? 'disabled' : ''}>↻ 仅刷新行情</button>
     <button class="btn sm ghost" id="livePlanFresh" ${L.busy ? 'disabled' : ''}>强制重算信号</button>
   </div>`;
   if (!pl || !pl.target) {
-    h += `<p class="desc" style="margin:11px 0 0">首次生成计划要跑一次完整回测（本机约 40–60 秒），之后 30 分钟内走缓存。信号由 <span class="mono">run_backtest</span> 产出，与报告完全同源。</p>`;
+    h += `<p class="desc" style="margin:11px 0 0">「一键准备」会先刷新行情缓存、再生成下单计划（首次要跑一次完整回测，本机约 40–60 秒；之后 30 分钟内走缓存）。信号由 <span class="mono">run_backtest</span> 产出，与报告完全同源。</p>`;
     return h;
   }
   const t = pl.target;
   const dg = t.diagnostics || {};
+  // 信号新鲜度：最新已收盘 K 线（panel_last_ts / newest_bar）距离现在多久。
+  // 计划走 30 分钟缓存，看不出信号是几分钟前的就容易在过期信号上下单。
+  const age = signalAge(t.panel_last_ts);
+  const ageTxt = age == null ? ''
+    : age.stale
+      ? `<b style="color:var(--danger)">${age.txt}</b>（数据偏旧，建议一键准备刷新）`
+      : age.txt;
   h += `<div class="kv" style="margin-top:11px">
     <div class="cell"><div class="k">信号日</div><div class="v" style="font-size:12.5px">${esc(fmtCN(t.decision_ts))}</div>
       <div class="s">bar ${esc(fmtCN(t.panel_last_ts))}</div></div>
     <div class="cell"><div class="k">下次调仓</div><div class="v" style="font-size:12.5px">${esc(fmtCN(t.next_decision_ts))}</div>
       <div class="s">${t.rebalance_due ? '<b style="color:var(--danger)">已到调仓日</b>' : `还需 ${Math.max(0, (t.rebalance_bars || 0) - (t.bars_since_decision || 0))} 根 bar`}</div></div>
+    <div class="cell"><div class="k">数据新鲜度</div><div class="v">${ageTxt || '—'}</div>
+      <div class="s">${age && age.stale ? '超过 1 小时未更新' : '最新 K 线距现在'}</div></div>
     <div class="cell"><div class="k">可选池宽</div><div class="v">${dg.n_universe != null ? dg.n_universe : '—'}</div>
       <div class="s">多 ${dg.n_long ?? '—'} / 空 ${dg.n_short ?? '—'}</div></div>
     <div class="cell"><div class="k">目标毛敞口</div><div class="v">${fmt.n(t.gross, 4)}</div>
@@ -2525,8 +2931,12 @@ function liveBind() {
   if (k) k.onclick = () => liveKill(!((L.status || {}).kill_switch));
   const rd = $('#liveRefreshData');
   if (rd) rd.onclick = liveRefreshData;
-  const pb = $('#livePlanBtn');
-  if (pb) pb.onclick = () => livePlan(false);
+  const pp = $('#livePrepareBtn');
+  if (pp) pp.onclick = livePrepare;
+  const bp = $('#liveBarPrepare');
+  if (bp) bp.onclick = livePrepare;
+  const bg = $('#liveBarGo');
+  if (bg) bg.onclick = () => liveExecute(false);
   const pf = $('#livePlanFresh');
   if (pf) pf.onclick = () => livePlan(true);
   const go = $('#liveGo');
@@ -2744,6 +3154,13 @@ function pollLiveJob(id) {
       await liveLoadHist();
       livePaintAll();
       if (j.status === 'failed') L.note = j.error || '失败';
+      // 真实下单完成后自动对账一次（dry/plan/flatten/reconcile 不触发）
+      if (j.status === 'done' && j.kind === 'execute' && L.pendingReconcile) {
+        L.pendingReconcile = false;
+        L.note = '下单完成，自动对账中…';
+        livePaintAll();
+        liveReconcile();
+      }
     }
   }, 1200);
 }
@@ -2774,6 +3191,58 @@ function livePlan(fresh) {
     fresh ? '强制重算信号' : '生成下单计划');
 }
 
+/* 一键准备：先刷新行情缓存、再生成计划，串行跑，期间只有一个进度提示。
+ * 以前「刷新行情」和「生成计划」是两个按钮，中间要干等 40–60 秒还要记顺序。 */
+async function livePrepare() {
+  const L = S.live;
+  if (L.busy) return;
+  L.busy = true;
+  try {
+    // 第一步：刷新行情（/api/live/refresh-data 本身就是一个 job）
+    let job = await liveApi('/api/live/refresh-data', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bar: '1h' }),
+    });
+    if (job.error) throw new Error(job.error);
+    L.job = job; L.note = '① 刷新行情中…';
+    livePaintAll();
+    await waitJob(job.id);
+    // 第二步：生成计划
+    L.note = '② 生成下单计划中…';
+    livePaintAll();
+    job = await liveApi('/api/live/plan', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(Object.assign({ mode: L.mode, fresh: false, limits: L.limits },
+        liveTradeSettings())),
+    });
+    if (job.error) throw new Error(job.error);
+    L.job = job; L.note = '';
+    livePaintAll();
+    pollLiveJob(job.id);
+  } catch (e) {
+    L.busy = false;
+    L.job = { kind: 'error', status: 'failed', label: '一键准备',
+      error: String(e && e.message || e), log: [], elapsed: 0 };
+    L.note = '';
+    livePaintAll();
+  }
+}
+
+/* 阻塞等待一个 job 到终态（done/failed）。供串行链用，不触发 UI 轮询。 */
+function waitJob(id) {
+  return new Promise((resolve) => {
+    const t = setInterval(async () => {
+      let j = null;
+      try { j = await liveApi('/api/live/job/' + encodeURIComponent(id)); } catch (e) { return; }
+      if (!j || j.error) return;
+      if (j.status === 'done' || j.status === 'failed') {
+        clearInterval(t);
+        resolve(j);
+      }
+    }, 1000);
+  });
+}
+
 function liveSelectedOnly() {
   const L = S.live;
   const p = L.plan && L.plan.plan;
@@ -2794,6 +3263,8 @@ function liveExecute(dry) {
       return;
     }
   }
+  // 真实下单（非 dry）完成后自动对账一次，不必再手动点「对账」。
+  L.pendingReconcile = !dry;
   liveSubmit('/api/live/execute', Object.assign({
     mode: L.mode, dry_run: !!dry, confirm: L.confirm, force: L.force,
     only: liveSelectedOnly(), limits: L.limits,

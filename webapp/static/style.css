@@ -294,7 +294,7 @@ pre.log .stage { color: var(--accent); }
 
 .runs { display: flex; flex-direction: column; gap: 7px; }
 .runrow {
-  display: grid; grid-template-columns: 1fr auto auto auto; gap: 10px; align-items: center;
+  display: grid; grid-template-columns: auto 1fr auto auto auto auto; gap: 10px; align-items: center;
   padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px;
   background: var(--panel); cursor: pointer; transition: .12s;
 }
@@ -304,6 +304,8 @@ pre.log .stage { color: var(--accent); }
 .runrow .lbl b { font-size: 12.5px; font-weight: 600; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .runrow .lbl small { color: var(--muted); font-size: 11px; }
 .runrow .m { font-family: var(--mono); font-size: 12px; color: var(--text-2); white-space: nowrap; }
+.runrow .delrun { cursor: pointer; opacity: .55; }
+.runrow .delrun:hover { opacity: 1; color: var(--danger); border-color: var(--danger); }
 
 .state { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; font-weight: 600; }
 .state .dot2 { width: 7px; height: 7px; border-radius: 50%; }
@@ -447,6 +449,49 @@ pre.log .stage { color: var(--accent); }
 .cbar i { position: absolute; top: 3px; bottom: 3px; background: color-mix(in srgb, var(--accent) 45%, transparent); border-radius: 2px; }
 .split { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .mono { font-family: var(--mono); font-size: 11.5px; }
+
+/* 交易台吸顶操作条：模式 + 状态 + 主按钮，滚到底也能一键准备/执行 */
+.livebar {
+  position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 9px 12px; margin: 0 0 14px;
+  background: var(--panel-2);
+  border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--shadow, #000) 18%, transparent);
+}
+.livebar .lbmode { font-weight: 700; font-size: 13px; }
+.livebar .lbstate { font-size: 12px; color: var(--muted); }
+.livebar .spacer { flex: 1; }
+
+/* 交易台次要面板折叠：模式/自动任务/执行日志默认收起，主流程（账户/信号/计划/闸门）突出 */
+details.livefold {
+  border: 1px solid var(--border); border-radius: 10px; background: var(--panel);
+  overflow: hidden;
+}
+details.livefold > summary {
+  cursor: pointer; list-style: none; user-select: none;
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 11px 14px; font-size: 13px; font-weight: 600;
+}
+details.livefold > summary::-webkit-details-marker { display: none; }
+details.livefold > summary small { font-weight: 400; font-size: 11.5px; color: var(--muted); }
+details.livefold > summary::after { content: '▸'; margin-left: auto; color: var(--muted); font-size: 12px; }
+details.livefold[open] > summary::after { content: '▾'; }
+details.livefold > .body { padding: 2px 14px 12px; }
+details.livefold[open] > summary { border-bottom: 1px solid var(--border); }
+.kbd { display:inline-block; padding:1px 6px; border:1px solid var(--border); border-radius:5px;
+  font-size:11px; font-family:var(--mono); color:var(--muted); background:var(--panel); }
+.runrow .cmp { display:flex; align-items:center; padding:0 6px; }
+table.cmp { min-width: 560px; }
+table.cmp th, table.cmp td { padding: 6px 10px; text-align: left; font-size: 12.5px; }
+table.cmp td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.sub { font-size: 12.5px; color: var(--text-2); margin-bottom: 6px; }
+.sub b { color: var(--text-1); }
+.chart.small { width: 100%; height: 160px; display: block; }
+table.hm { border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; }
+table.hm th { padding: 3px 6px; text-align: center; color: var(--muted); font-weight: 600; }
+table.hm td { padding: 3px 6px; text-align: center; min-width: 44px; }
+table.hm td.hmc { color: var(--text-1); border: 1px solid var(--border); }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; }
 .chip {
   font-family: var(--mono); font-size: 11px; padding: 3px 8px; border-radius: 6px;

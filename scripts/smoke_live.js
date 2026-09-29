@@ -740,7 +740,7 @@ const LOADING = ['正在读取…', '正在读取账户…'];
 
   /* --- 6. 信号区（尚无计划时的分支） --- */
   check('信号区给出三个动作按钮',
-    ['liveRefreshData', 'livePlanBtn', 'livePlanFresh'].every((i) => region('liveSignal').includes(`id="${i}"`)));
+    ['liveRefreshData', 'livePrepareBtn', 'livePlanFresh'].every((i) => region('liveSignal').includes(`id="${i}"`)));
 
   /* --- 7. 灌入真实计划：闸门 / 账单 / 下单表 --- */
   S.live.plan = preview;
@@ -950,7 +950,7 @@ const LOADING = ['正在读取…', '正在读取账户…'];
   /* --- 12. 每个按钮 id 真的存在于渲染树里 --- */
   // `$('#id')` 取不到时绑定会被 `if (el)` 静默跳过：按钮点了没反应、控制台干净。
   // 注意 paper 模式本来就没有「密钥配置」开关，所以它不在这张表里（见第 13 节）。
-  for (const id of ['liveKill', 'liveRefreshData', 'livePlanBtn', 'livePlanFresh',
+  for (const id of ['liveKill', 'liveRefreshData', 'livePrepareBtn', 'livePlanFresh',
     'liveGo', 'liveDry', 'liveReconcile', 'liveFlatDry', 'liveFlat', 'liveExport',
     'lvAll', 'lvForce']) {
     check(`#${id} 在当前渲染树里可达`, sandbox.document.getElementById(id) != null);
@@ -1447,7 +1447,7 @@ const LOADING = ['正在读取…', '正在读取账户…'];
   check('无计划时回到「点生成计划」空态', region('livePlan').includes('点「生成下单计划」开始'));
   check('无计划时闸门回到空态', region('liveGates').includes('尚未生成计划'));
   check('无计划时但按钮仍在（可点）',
-    sandbox.document.getElementById('livePlanBtn') != null);
+    sandbox.document.getElementById('livePrepareBtn') != null);
   check('无计划时 #liveGo 不存在（不会出现无源按钮）',
     sandbox.document.getElementById('liveGo') == null);
 

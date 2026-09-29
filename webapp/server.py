@@ -309,6 +309,128 @@ def read_equity(tag, max_points=900):
         return None
 
 
+def _load_bars(tag):
+    """Return the raw `bars` DataFrame from `baseline.pkl`, or None."""
+    pkl = os.path.join(tag_dir(tag), "baseline.pkl")
+    if not os.path.exists(pkl):
+        return None
+    try:
+        import pickle
+        with open(pkl, "rb") as f:
+            return pickle.load(f)["result"].bars
+    except Exception:
+        return None
+
+
+def _downsample_pair(idx, v, max_points=600):
+    """Downsample a series to <= max_points, preserving per-bucket min/max/tail.
+
+    Same rule as `read_equity` (min/max/tail per bucket) so the exposure/heatmap
+    lines never skip a peak or trough.  Returns parallel lists (t_ms, values).
+    """
+    import numpy as np
+    arr = np.asarray(v, dtype="float64")
+    keep = np.isfinite(arr)
+    arr, idx = arr[keep], idx[keep]
+    if arr.size == 0:
+        return [], []
+    n = arr.size
+    step = max(1, int(math.ceil(n / max_points)))
+    if step == 1:
+        sel = list(range(n))
+    else:
+        picked = set()
+        for a in range(0, n, step):
+            b2 = min(a + step, n)
+            seg = arr[a:b2]
+            picked.add(int(a + int(np.argmin(seg))))
+            picked.add(int(a + int(np.argmax(seg))))
+            picked.add(b2 - 1)
+        sel = sorted(picked)
+    return ([int(t.timestamp() * 1000) for t in idx[sel]],
+            [float(x) for x in arr[sel]])
+
+
+def read_equity_detail(tag, max_points=600):
+    """Extra series for the result panel: drawdown ranges, monthly returns,
+    gross/net/beta exposure time-series.  All computed from `baseline.pkl` so the
+    numbers match the report exactly (not re-derived from the downsampled equity).
+    """
+    bars = _load_bars(tag)
+    if bars is None or "equity" not in bars:
+        return None
+    import numpy as np
+    try:
+        eq = bars["equity"]
+        keep = np.isfinite(eq.to_numpy(dtype="float64"))
+        eq, idx = eq[keep], eq.index[keep]
+        if eq.size == 0:
+            return None
+        v = eq.to_numpy(dtype="float64")
+
+        # --- Top-N drawdown ranges (full resolution, same algo as report) ---
+        peak = np.maximum.accumulate(v)
+        dd = np.where(peak > 0, v / peak - 1.0, 0.0)
+        ranges = []
+        # walk the drawdown series and capture each excursion below a threshold
+        under = dd < -0.005            # ignore sub-0.5% ripples
+        i = 0
+        while i < dd.size:
+            if not under[i]:
+                i += 1
+                continue
+            j = i
+            while j < dd.size and under[j]:
+                j += 1
+            seg = dd[i:j]
+            depth = float(seg.min())
+            trough = int(i + int(np.argmin(seg)))
+            ranges.append({
+                "start": str(idx[i].date()),
+                "trough": str(idx[trough].date()),
+                "end": str(idx[j - 1].date()),
+                "depth": depth,
+                "days": int((idx[j - 1] - idx[i]).total_seconds() / 86400.0) + 1,
+            })
+            i = j
+        ranges.sort(key=lambda r: r["depth"])
+        drawdowns = ranges[:5]
+
+        # --- Monthly returns (sum of daily net_ret), full resolution ---
+        monthly = []
+        if "net_ret" in bars:
+            s = bars["net_ret"]
+            keep = np.isfinite(s.to_numpy(dtype="float64"))
+            s = s[keep]
+            daily = s.resample("1D").sum()
+            if daily.size:
+                m = daily.resample("1ME").apply(
+                    lambda x: float(np.prod(1.0 + x.to_numpy(dtype="float64")) - 1.0))
+                for ts, r in m.items():
+                    monthly.append({"y": int(ts.year), "m": int(ts.month),
+                                    "ret": float(r)})
+
+        # --- Exposure series (downsampled, min/max/tail) ---
+        def series(name):
+            if name not in bars:
+                return None
+            s = bars[name]
+            keep = np.isfinite(s.to_numpy(dtype="float64"))
+            s, si = s[keep], s.index[keep]
+            t, vals = _downsample_pair(si, s.to_numpy(dtype="float64"), max_points)
+            return {"t": t, "v": vals}
+
+        return {
+            "drawdowns": drawdowns,
+            "monthly": monthly,
+            "gross": series("gross_exposure"),
+            "net": series("net_exposure"),
+            "beta": series("beta_exposure"),
+        }
+    except Exception:
+        return None
+
+
 def stage_report(run):
     """Parse the log for per-stage timing and the stage-failure marker.
 
@@ -503,9 +625,15 @@ class Handler(BaseHTTPRequestHandler):
                 return self._file(os.path.join(ARTIFACTS, tag, "charts", name),
                                   "image/png")
             if p.startswith("/api/equity/"):
-                tag = p.split("/")[3]
+                parts = p.split("/")
+                tag = parts[3]
                 if os.path.basename(tag) != tag:
                     return self._err(400, "bad tag")
+                if len(parts) >= 5 and parts[4] == "detail":
+                    d = read_equity_detail(tag)
+                    if d is not None:
+                        return self._json(d)
+                    return self._err(404, "no detail for " + tag)
                 e = read_equity(tag)
                 if e:
                     return self._json(e)
@@ -564,6 +692,19 @@ class Handler(BaseHTTPRequestHandler):
             # `shutil.rmtree`), and an *unanswered* request is indistinguishable
             # from "the server died" -- the browser sees a dropped connection
             # and there is nothing to diagnose.  A JSON 500 costs nothing.
+            try:
+                self._err(500, traceback.format_exc()[-1200:])
+            except Exception:                                    # noqa: BLE001
+                pass
+
+    def do_DELETE(self):                                         # noqa: N802
+        u = urlparse(self.path)
+        try:
+            if u.path.startswith("/api/runs/"):
+                rid = u.path.split("/")[3]
+                return self._delete_run(rid)
+            return self._err(404, "not found")
+        except BaseException:                                    # noqa: BLE001
             try:
                 self._err(500, traceback.format_exc()[-1200:])
             except Exception:                                    # noqa: BLE001
@@ -836,7 +977,16 @@ class Handler(BaseHTTPRequestHandler):
         while rid in RUNS:
             rid = new_run_id() + f"_{n}"
             n += 1
-        tag = rid
+        # 用户可以在运行框里指定 tag（否则永远产不出 `v5_1d_all5` 这种有意义的名字）。
+        # 只接受安全的标识符，且不允许覆盖盘上已有产物（`_submit` 前已有同名目录会静默复用）。
+        tag = None
+        raw_tag = (body.get("tag") or "").strip()
+        if raw_tag:
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", raw_tag):
+                return self._err(400, "tag 只允许字母/数字/._- 且以字母数字开头")
+            tag = raw_tag
+        if not tag:
+            tag = rid
         argv = build_run_args(ov, cli, stages, tag, int(body.get("n_jobs") or 4))
         run = {
             "id": rid, "tag": tag, "label": body.get("label") or preset,
@@ -867,6 +1017,72 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json({"id": rid, "status": "cancelled"})
         return self._json({"id": rid, "status": r["status"],
                            "note": "只能取消排队中或正在运行的任务"})
+
+    def _delete_run(self, rid):
+        """Delete a finished run from the list and, when safe, its artifacts.
+
+        Only `done` / `partial` / `failed` / `cancelled` runs may be removed;
+        a queued or running task must be cancelled first, otherwise the worker
+        would keep writing into a directory the UI just told the user is gone.
+
+        Artifacts are only removed when the run's tag is *owned* by this run --
+        i.e. the tag directory is not also referenced by another surviving run
+        and is not the accepted/optimal tag.  Two runs can share a tag (the user
+        re-ran the same name), and `v3` / `v5_1d_all5` are the accepted baselines
+        the rest of the console reads from, so deleting those on disk would break
+        the headline.  In those cases we drop the list entry + log but leave the
+        directory in place.
+
+        The artifact directory is *renamed into `artifacts/.trash/`*, not
+        `shutil.rmtree`-ed.  This machine's host installs a safe-delete guard
+        (`sitecustomize.py`) that aborts `shutil.rmtree` with `SystemExit` once a
+        session has deleted too many files -- and a `SystemExit` is not an
+        `Exception`, so the HTTP handler's `except Exception` cannot catch it and
+        the request dies mid-flight with no response.  Renaming never trips it
+        (same pattern as `store.reset_mode`), and keeps the bytes recoverable
+        until the user empties `.trash` by hand.
+        """
+        with RUNS_LOCK:
+            r = RUNS.get(rid)
+            if r is None:
+                return self._err(404, "no such run")
+            if r["status"] in ("queued", "running"):
+                return self._err(409, "先取消再进行删除")
+            tag = r.get("tag")
+            tag_owned = bool(tag) and tag != OPTIMAL_TAG
+            if tag_owned:
+                # another surviving run with the same tag => dir still in use
+                for other_id, other in RUNS.items():
+                    if other_id != rid and other.get("tag") == tag:
+                        tag_owned = False
+                        break
+            del RUNS[rid]
+            write_runs(RUNS)
+        removed_dir = None
+        if tag_owned:
+            d = tag_dir(tag)
+            if os.path.isdir(d):
+                # rename -> artifacts/.trash/<tag>__<rid>/ ; never recursive-delete
+                try:
+                    trash = os.path.join(ARTIFACTS, ".trash")
+                    os.makedirs(trash, exist_ok=True)
+                    dest = os.path.join(trash, f"{tag}__{rid}")
+                    n = 1
+                    while os.path.exists(dest):
+                        dest = os.path.join(trash, f"{tag}__{rid}_{n}")
+                        n += 1
+                    os.replace(d, dest)
+                    removed_dir = dest
+                except BaseException:                        # noqa: BLE001
+                    removed_dir = None                       # best effort, never fatal
+        lp = log_path(rid)
+        if os.path.exists(lp):
+            try:
+                os.remove(lp)
+            except BaseException:                            # noqa: BLE001
+                pass
+        return self._json({"id": rid, "deleted": True,
+                           "removed_dir": removed_dir})
 
 
 def main():
