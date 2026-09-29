@@ -122,7 +122,8 @@ def run_backtest(panels: Panels, cfg: BacktestConfig,
                  disable_risk_overlays: bool = False,
                  disable_costs: bool = False,
                  extra_gross: Optional[np.ndarray] = None,
-                 dec_offset_bars: int = 0) -> BacktestResult:
+                 dec_offset_bars: int = 0,
+                 flip_book: bool = False) -> BacktestResult:
     """Run one backtest.  Pure function of (panels, cfg, flags).
 
     `factor_subset=None` falls back to `cfg.factors.subset`, so a factor-set
@@ -136,6 +137,16 @@ def run_backtest(panels: Panels, cfg: BacktestConfig,
     a grid-phase question ("place orders at 23:30 Beijing instead") can be
     answered with a measurement instead of an opinion --- see
     `scripts/exp_grid_phase.py`.
+
+    `flip_book` reverses every position: the names the signal wants **short** are
+    bought and vice versa, at **identical** sizes.  It negates the assembled target
+    (rather than negating the score) so that `select_book` and
+    `inverse_vol_weights` never see the flip -- the selected set and the |weights|
+    stay bit-identical and the only thing that changes is the direction of every
+    leg.  That makes the "run it backwards" falsification test exact: if the
+    original book has real directional information, the mirrored one must lose,
+    and by roughly `2 x cost` more than it gains.  See
+    `scripts/exp_reverse_strategy.py`.
     """
     if factor_subset is None:
         factor_subset = cfg.factors.subset
@@ -313,6 +324,13 @@ def run_backtest(panels: Panels, cfg: BacktestConfig,
                 base[sel.long_idx] += u_long * g_long
             if sel.short_idx.size:
                 base[sel.short_idx] -= u_short * g_short
+            if flip_book:
+                # Reverse every position at identical sizes.  Applied *here*, after the
+                # selection and the sizing are already fixed, so this is an exact mirror
+                # of the normal book: same names, same |weights|, opposite sides.  The
+                # risk overlays below are NOT bypassed -- they react to the reversed
+                # equity path, which is what actually happens if you trade it backwards.
+                base = -base
             gsum = float(np.abs(base).sum())
             base_unit = base / gsum if gsum > 0 else base
 
