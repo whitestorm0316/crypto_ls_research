@@ -403,3 +403,40 @@ def test_pid_alive_accepts_the_system_process(live):
         assert store_mod._pid_alive(4) is True
     else:
         pytest.skip("POSIX 上 pid 4 不保证存在")
+
+
+# -- CLI start: 没给网格时的兜底必须真的能取到默认值 -----------------------------
+
+def test_cli_start_without_a_grid_falls_back_to_the_verified_default(live, monkeypatch):
+    """`auto_ctl --mode demo`（不传 `--rebalance-days`，磁盘上也没有历史网格）。
+
+    这正是 `AUTO_TRADER_README.md` §七 写给用户的命令，而它**曾经在到达
+    `start()` 之前就 ImportError 死掉**：兜底那一行从 `..backtest.engine`
+    导入 `DEFAULT_SIGNAL`，但那个符号不在那里 —— 它是**实盘**的 v3 配置，
+    住在 `execution.engine`。只有兜底分支受影响：显式传 `--rebalance-days`、
+    或磁盘上已有网格，都会绕过它，所以这个洞一直没被踩到。
+
+    断言落在**传给 `start()` 的数值**上，而不是"没抛异常"：一个静默取到
+    错数字的兜底同样能让"跑起来了"通过。
+    """
+    from crypto_ls_research.execution.engine import DEFAULT_SIGNAL
+
+    seen: dict = {}
+
+    def fake_start(mode, **kw):
+        seen["mode"] = mode
+        seen.update(kw)
+        return {"ok": True, "mode": mode, "ctl": {}}
+
+    monkeypatch.setattr(auto_ctl, "start", fake_start)
+    monkeypatch.setattr(auto_ctl, "wait_for_heartbeat",
+                        lambda mode, timeout=0.0: {"ok": True, "state": {}})
+
+    rc = auto_ctl.main(["--mode", "demo"])
+
+    assert rc == 0
+    assert seen["mode"] == "demo", "mode 没有透传到 start()"
+    assert seen["rebalance_days"] == float(DEFAULT_SIGNAL["rebalance_days"]), (
+        "兜底没有取到 DEFAULT_SIGNAL 的网格；"
+        f"拿到的是 {seen.get('rebalance_days')!r}")
+

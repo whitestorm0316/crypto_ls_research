@@ -34,6 +34,7 @@ import sys
 import time
 from typing import Optional
 
+from ..config.settings import ACCEPTED_REBALANCE_DAYS
 from .store import LIVE_DIR, Store, _pid_alive
 
 CTL_FILE = "auto.pid"
@@ -115,12 +116,15 @@ def _spawn(mode: str, rebalance_days: float, interval_min: float, bar: str,
            dry_run: bool, allow_live: bool,
            exec_window: Optional[str] = None,
            exec_window_tol: float = 5.0,
-           exec_window_utc: bool = False) -> dict:
+           exec_window_utc: bool = False,
+           refresh_after_hours: Optional[float] = None) -> dict:
     argv = [sys.executable, "-m", "crypto_ls_research.execution.auto_trader",
             "--mode", mode,
             "--interval", str(interval_min),
             "--rebalance-days", str(rebalance_days),
             "--bar", bar]
+    if refresh_after_hours is not None:
+        argv += ["--refresh-after-hours", str(refresh_after_hours)]
     if exec_window:
         argv += ["--exec-window", str(exec_window),
                  "--exec-window-tol", str(exec_window_tol)]
@@ -177,12 +181,14 @@ def _popen(argv: list, kwargs: dict, log_path: str):
         return subprocess.Popen(argv, **kwargs)
 
 
-def start(mode: str, *, rebalance_days: float = 3.0, interval_min: float = 30.0,
+def start(mode: str, *, rebalance_days: float = ACCEPTED_REBALANCE_DAYS,
+          interval_min: float = 30.0,
           bar: str = "1h", dry_run: bool = False,
           allow_live: bool = False,
           exec_window: Optional[str] = None,
           exec_window_tol: float = 5.0,
-          exec_window_utc: bool = False) -> dict:
+          exec_window_utc: bool = False,
+          refresh_after_hours: Optional[float] = None) -> dict:
     """Start the daemon.  Refuses rather than fighting for the same mode.
 
     Two auto-traders on one mode would each read the same starting book and each
@@ -214,7 +220,7 @@ def start(mode: str, *, rebalance_days: float = 3.0, interval_min: float = 30.0,
     try:
         info = _spawn(mode, float(rebalance_days), float(interval_min), bar,
                       dry_run, allow_live, exec_window, exec_window_tol,
-                      exec_window_utc)
+                      exec_window_utc, refresh_after_hours)
     except OSError as e:
         return {"ok": False, "error": f"启动失败：{type(e).__name__}: {e}"}
 
@@ -228,6 +234,11 @@ def start(mode: str, *, rebalance_days: float = 3.0, interval_min: float = 30.0,
            "exec_window": exec_window,
            "exec_window_tol": float(exec_window_tol) if exec_window else None,
            "exec_window_utc": bool(exec_window_utc) if exec_window else None,
+           # None = "let the daemon use its own default", which is not the same
+           # as 0 ("never refresh").  Record it so a reader can tell the two
+           # apart without parsing argv.
+           "refresh_after_hours": (None if refresh_after_hours is None
+                                   else float(refresh_after_hours)),
            # `pid` above is the process *we spawned*, which on Windows is a
            # launcher, not the daemon.  Keep it (it is what we can kill if the
            # daemon never reports in) but record the distinction explicitly so a
@@ -415,6 +426,10 @@ def main(argv: Optional[list] = None) -> int:
                     help="调仓网格（天）。默认沿用当前请求值，没有则用 3（v3）")
     ap.add_argument("--interval", type=float, default=30.0, help="检查间隔（分钟）")
     ap.add_argument("--bar", default="1h")
+    ap.add_argument("--refresh-after-hours", type=float, default=None,
+                    help="数据落后超过这么多小时就先增量刷新。不传 = 用守护进程"
+                         "自己的默认值（当前 1.0 = 每个 tick 都刷新，见 "
+                         "auto_trader --help）。0 = 从不刷新。")
     ap.add_argument("--dry-run", action="store_true", help="只算不下单")
     ap.add_argument("--allow-live", action="store_true",
                     help="live 模式必须显式带上")
@@ -441,6 +456,7 @@ def main(argv: Optional[list] = None) -> int:
             "exec_window": st.get("exec_window"),
             "exec_window_min": st.get("exec_window_min"),
             "exec_window_utc": st.get("exec_window_utc"),
+            "refresh_after_hours": ctl.get("refresh_after_hours"),
             "forced_runs": st.get("forced_runs"),
             "checks": st.get("checks"), "trades": st.get("trades"),
         }, ensure_ascii=False, indent=1))
@@ -457,13 +473,22 @@ def main(argv: Optional[list] = None) -> int:
         g = grid_for(a.mode)
         rd = g.get("rebalance_days")
         if rd is None:
-            from ..backtest.engine import DEFAULT_SIGNAL
+            # `DEFAULT_SIGNAL` lives in `execution.engine`, not `backtest.engine`
+            # (it is the *live* accepted config: bar + grid + asset class +
+            # overrides).  Importing it from `backtest.engine` raised ImportError,
+            # so the very first `auto_ctl --mode demo` without `--rebalance-days`
+            # -- the documented command in AUTO_TRADER_README.md §七 -- crashed
+            # instead of starting.  Only the fallback path was affected: passing
+            # `--rebalance-days` explicitly, or having a previous grid on disk,
+            # both skip this branch.
+            from .engine import DEFAULT_SIGNAL
             rd = float(DEFAULT_SIGNAL["rebalance_days"])
     r = start(a.mode, rebalance_days=float(rd), interval_min=a.interval,
               bar=a.bar, dry_run=a.dry_run, allow_live=a.allow_live,
               exec_window=a.exec_window,
               exec_window_tol=a.exec_window_tol,
-              exec_window_utc=a.exec_window_utc)
+              exec_window_utc=a.exec_window_utc,
+              refresh_after_hours=a.refresh_after_hours)
     if not r.get("ok"):
         print(json.dumps(r, ensure_ascii=False, indent=1))
         return 1

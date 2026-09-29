@@ -460,6 +460,7 @@ src += `
   liveModeHtml, liveAcctHtml, liveSignalHtml, liveGatesHtml, livePlanHtml, liveJobHtml,
   liveHistHtml, liveLimitsHtml, liveBind, liveExport, tabBar, LIVE_LABEL,
   liveAutoHtml, liveLoadAuto, LIVE_ACTION_LABEL, LIVE_SKIP_LABEL,
+  fmtCN,
   LIVE_LIMIT_FIELDS, liveLeverageHtml, liveTradeSettings, pollRuns, renderSide,
   liveNetHtml, startLog, stopLog };
 /* 用 typeof 守卫：SMOKE_APP 指向旧版 app.js 做变异测试时，那里还没有 runsSig，
@@ -467,6 +468,13 @@ src += `
 if (typeof runsSig === 'function') globalThis.__T.runsSig = runsSig;
 if (typeof limitsDiff === 'function') globalThis.__T.limitsDiff = limitsDiff;
 if (typeof limitsStateHtml === 'function') globalThis.__T.limitsStateHtml = limitsStateHtml;
+/* 「N 天」的唯一格式化点。断言必须用它推导，不能在测试里再写一遍 fmt.n(v, 2) + ' 天'
+ * —— 那就是第二份定义，改了页面而测试照样绿。 */
+if (typeof gridDaysText === 'function') globalThis.__T.gridDaysText = gridDaysText;
+if (typeof optGridDays === 'function') globalThis.__T.optGridDays = optGridDays;
+if (typeof diffFromOptimal === 'function') globalThis.__T.diffFromOptimal = diffFromOptimal;
+/* 网格候选表也导出：测试要从中取一个「不是验收口径」的网格，而不是自己写死 3。 */
+if (typeof AUTO_GRID_CHOICES !== 'undefined') globalThis.__T.AUTO_GRID_CHOICES = AUTO_GRID_CHOICES;
 `;
 vm.createContext(sandbox);
 vm.runInContext(src, sandbox, { filename: 'app.js' });
@@ -510,6 +518,10 @@ const LOADING = ['正在读取…', '正在读取账户…'];
   const S = T.S;
   S.spec = spec.spec; S.presets = spec.presets; S.bundles = spec.bundles;
   S.lib = spec.lib_defaults || {}; S.baseline = spec.baseline; S.optimalTag = spec.optimal_tag;
+  /* 必须和 app.js::boot() 逐字段对齐。漏掉 `optimal_cli` 的后果不是报错，而是
+   * `optGridDays()` 恒为 null：页面既不给选项标「当前验收口径」，也不会在守护进程
+   * 跑的网格不符时警告 —— 这两种「什么都不说」和「一切正常」长得一模一样。 */
+  S.optimalCli = spec.optimal_cli || {};
   S.acceptance = spec.acceptance || null; S.headline = spec.optimal_headline || null;
   T.applyPreset('v3_optimal');
   S.runs = [];
@@ -545,9 +557,20 @@ const LOADING = ['正在读取…', '正在读取账户…'];
   const _i0 = contentHtml.indexOf('class="banners"');
   const _i1 = contentHtml.indexOf('核心指标');
   const ban = (_i0 >= 0 && _i1 > _i0) ? contentHtml.slice(_i0, _i1) : contentHtml;
+  /* 先确认页面自己认为「当前参数 = 已验收最优」。这条是上面两条横幅断言的前提：
+   * 只要 `diffFromOptimal()` 非空，横幅就走「有 N 处不同」那条分支，一个字都不提
+   * Sharpe 与验收条数，而失败信息只会印一个 `baseline.sharpe=…`，看上去像产物读错了。
+   *
+   * 它真正守的是：**前端不留一份服务端事实的拷贝**。app.js 曾经硬编码
+   * `rebalance_days: 3`（与 spec.py::OPTIMAL_CLI 的 1 天不符），于是页面刚加载、
+   * 参数明明就是最优，pill 却显示「偏离最优 1 处」。换口径时不会报错，只会静静撒谎。 */
+  const _diffs = (T.diffFromOptimal ? T.diffFromOptimal() : []);
+  check('参数就是已验收最优（最优参数集来自 /api/spec，前端不写死）',
+    _diffs.length === 0,
+    _diffs.length ? JSON.stringify(_diffs) : `optimal_cli=${JSON.stringify(S.optimalCli)}`);
   check('横幅显示基线 Sharpe（来自产物）',
     !!(b0 && b0.sharpe != null) && ban.includes(T.fmt.n(b0.sharpe)),
-    `baseline.sharpe=${b0 && b0.sharpe}`);
+    `baseline.sharpe=${b0 && b0.sharpe} · 横幅=${ban.replace(/<[^>]*>/g, ' ').slice(0, 90)}`);
   /* 「不能写死」这个断言必须检查**来源**，不能检查字面值。
    * 它原本是 `!ban.includes('1.937')`，想法是「1.937 只可能来自硬编码」。
    * 但只要基线本身算出来就是 1.93733…（fmt 之后就是 `1.937`），这个判据就自相矛盾：
@@ -653,7 +676,14 @@ const LOADING = ['正在读取…', '正在读取账户…'];
   T.livePaintAll();
   const staleH = region('liveAcct');
   check('陈旧时出横幅', staleH.includes('行情数据已过期'));
-  check('横幅显示「最新已收盘 bar」的时间戳', staleH.includes('2026-09-26 00:00'));
+  /* 期望值必须用**页面自己的格式化器**推出来。这里原来写死的是
+   * `'2026-09-26 00:00'`，那是横幅还按 UTC 渲染时的样子；横幅改成 `fmtCN`
+   * （本地时区）之后，同一个 `newest_bar` 显示成 `2026-09-26 08:00`，
+   * 断言就永久变红 —— 而代码是对的。一条与正确性无关的红，最后只会训练人
+   * 忽略失败。 */
+  const wantNb = T.fmtCN('2026-09-26T00:00:00+00:00');
+  check('横幅显示「最新已收盘 bar」的时间戳（本地时区，与页面同一格式化器）',
+    !!wantNb && staleH.includes(wantNb));
   check('横幅显示 bar 落后 32.1 小时', staleH.includes('32.1'));
   check('横幅显示缓存文件 24.5 小时未更新', staleH.includes('24.5'));
   check('横幅提示用增量刷新（十几秒）', staleH.includes('增量') || staleH.includes('十几秒'));
@@ -831,6 +861,14 @@ const LOADING = ['正在读取…', '正在读取账户…'];
         lvh.includes('不放大收益') && lvh.includes('爆仓风险'));
       check('杠杆面板给出回撤放大的具体数字（报告 §16）',
         lvh.includes('42.9%') && lvh.includes('毛敞口上限'));
+      /* 「指向一个不存在的控件」这类缺陷，只断言**文案**永远抓不到：那句话一直在，
+       * 而它指的那个输入框一直不存在（`max_gross_frac` 服务端有、`limitsDiff` 也比，
+       * 就是没渲染 —— 用户被指去改一个页面上没有的东西）。
+       * 所以这条断言的是**引用能解析到控件**，不是字面。同一条纪律见页头横幅那段：
+       * 检查来源，不检查字面值。 */
+      check('杠杆面板指向的「总敞口上限」在限额表里真的有输入框',
+        lvh.includes('总敞口上限') && h.includes('data-limit="max_gross_frac"'),
+        `面板提到=${lvh.includes('总敞口上限')} 有控件=${h.includes('data-limit="max_gross_frac"')}`);
       check('杠杆面板无 NaN/undefined', dirty(lvh).length === 0, dirty(lvh).join(','));
       check('限额表包含「总名义额上限」与绝对金额的解释',
         h.includes('总名义额上限') && h.includes('连错账户'));
@@ -1422,6 +1460,16 @@ const LOADING = ['正在读取…', '正在读取账户…'];
     const savedAuto = L.auto;
     const render = () => T.liveAutoHtml();
 
+    /* 「哪个网格是验收口径」只能问服务端。这一块以前写死 `rd === 1`（1 天 =
+     * **不是**已验收配置），验收口径换成 1 天（`v4_1d`）之后，同一个判据就开始
+     * 断言相反的事实 —— 而页面上看不出任何异常。所以先钉住契约，再按契约推导。 */
+    const accGrid = Number((S.optimalCli || {}).rebalance_days);
+    check('/api/spec 下发 optimal_cli.rebalance_days（页面据此判断验收口径）',
+      isFinite(accGrid) && accGrid > 0, `optimal_cli=${JSON.stringify(S.optimalCli)}`);
+    /* 取一个**和验收口径不同**的网格，从页面自己的选项表里取（别写死 3）。 */
+    const otherGrid = (T.AUTO_GRID_CHOICES || []).map(([d]) => d).find((d) => d !== accGrid);
+    const gridTxt = (d) => (T.gridDaysText ? T.gridDaysText(d) : `<无 gridDaysText(${d})>`);
+
     L.auto = null;
     check('自动任务：无数据时不冒充已就绪', render().includes('正在读取'));
 
@@ -1433,11 +1481,11 @@ const LOADING = ['正在读取…', '正在读取账户…'];
     check('自动任务：未运行时不给「停止」按钮可用的假象',
       !hIdle.includes('id="autoStop"') || hIdle.includes('disabled'));
 
-    // (b) 正在运行，心跳已确认
+    // (b) 正在运行，心跳已确认 —— 网格**就是验收口径**（从服务端取，不写死 1）
     L.auto = { mode: 'paper', running: true,
-      ctl: { pid: 4242, rebalance_days: 1 },
-      grid: { rebalance_days: 1, bar: '1h', interval_min: 30, source: 'heartbeat' },
-      state: { enabled: true, pid: 4242, rebalance_days: 1, interval_min: 30,
+      ctl: { pid: 4242, rebalance_days: accGrid },
+      grid: { rebalance_days: accGrid, bar: '1h', interval_min: 30, source: 'heartbeat' },
+      state: { enabled: true, pid: 4242, rebalance_days: accGrid, interval_min: 30,
                started_str: '2026-09-28 21:43:08', checks: 12, trades: 3,
                dry_run: false, kill_switch: false, notify: { ready: false },
                skips: { not_due: 9 },
@@ -1446,31 +1494,98 @@ const LOADING = ['正在读取…', '正在读取账户…'];
                        next_decision_ts: '2026-09-29T02:00:00+00:00',
                        target_gross: 1.174 } } };
     const hOn = render();
-    check('自动任务：运行时显示 pid 与网格', hOn.includes('4242') && hOn.includes('1 天'));
-    check('自动任务：1 天网格带风险提示（不是已验收配置）',
-      hOn.includes('1 天调仓不是已验收配置'));
+    /* 期望值由页面**同一个格式化器**推导（`gridDaysText`），不在这里再写一遍
+     * `fmt.n(v, 2) + ' 天'` —— 那是第二份定义。代价要认：纯格式改动（比如退回
+     * 「1.00 天」）不会被这条判据抓住，因为它不是缺陷，是口味。但「格式化器返回
+     * 空串」必须抓：`includes('')` 恒真，这条断言会当场退化成恒真判据。 */
+    check('自动任务：运行时显示 pid 与网格',
+      hOn.includes('4242') && gridTxt(accGrid).includes(String(accGrid))
+      && hOn.includes(gridTxt(accGrid)),
+      `期望含 ${gridTxt(accGrid)}`);
+    /* 网格 = 验收口径时**不能**出那条警告。这一条和下面 (c) 是一条判据的两半：
+     * 只测一半（比如只测「不符时有警告」）时，把条件写成恒真也会绿。 */
+    check('自动任务：跑的网格就是验收口径时不出「不是验收口径」警告',
+      !hOn.includes('不是验收口径'));
+    check('自动任务：调仓选项把「当前验收口径」标在服务端说的那个网格上',
+      new RegExp(`<option value="${accGrid}"[^>]*>[^<]*（当前验收口径）`).test(hOn)
+      && !new RegExp(`<option value="${otherGrid}"[^>]*>[^<]*（当前验收口径）`).test(hOn),
+      `accGrid=${accGrid}, other=${otherGrid}`);
     check('自动任务：跳过原因翻成人话，不铺代码常量',
-      hOn.includes('未到调仓日') && !hOn.includes('not_due'));
+      hOn.includes(T.LIVE_SKIP_LABEL.not_due) && !hOn.includes('not_due'));
+
+    // (b2) 跳过原因必须能自圆其说。
+    // 日网格下「未到调仓日」是**错的** —— 网格点今天就到了，只是面板还没走到它；
+    // 旧文案还会把「下次」印成一个已经过去的时刻。这两件事合起来读起来就是
+    // 「根本没跑」，而这正是这块面板存在的意义。
+    //
+    // 窗口是**边沿**：`bars_since_decision === 1` 才是可执行的那一刻。所以「再确认
+    // N 根后打开」这种按到**调仓点**的距离算的旧提示是错的。到窗口还差 `R - since`
+    // 根（不再 `+ 1`）：实盘路径会给面板补一根执行 bar，所以不必再等一根 bar 收盘。
+    const R_SKIP = 24, SINCE_SKIP = 22;
+    L.auto.state.last = { action: 'skip', reason: 'not_due',
+      decision_ts: '2026-09-28T02:00:00+00:00',
+      next_decision_ts: '2026-09-29T02:00:00+00:00',
+      rebalance_due: false,
+      bars_since_decision: SINCE_SKIP, rebalance_bars: R_SKIP,
+      target_gross: 1.174,
+      not_due_explain: '本周期不在窗口内：目标持仓取自 2026-09-28 10:00 的调仓，'
+        + `已过 ${SINCE_SKIP}/${R_SKIP} 根 bar；窗口在调仓点收盘后打开，`
+        + `还差 ${R_SKIP - SINCE_SKIP} 根到下个窗口` };
+    const hSkip = render();
+    check('自动任务：不再断言「未到调仓日」',
+      !hSkip.includes('未到调仓日'), '日网格下这句每天都自相矛盾');
+    check('自动任务：窗口提示按 bar 数说，根数从 fixture 派生',
+      hSkip.includes(`${SINCE_SKIP}/${R_SKIP}`)
+      && hSkip.includes(`还差 <b>${R_SKIP - SINCE_SKIP}</b> 根`),
+      '窗口是边沿；到窗口还差 R - since 根');
+    check('自动任务：不再用「再确认 N 根后打开」的旧口径',
+      !hSkip.includes('再确认'), '那个数说的是到调仓点，不是到窗口');
+    check('自动任务：展示后端原话，前端不重算那道闸门',
+      hSkip.includes('本周期不在窗口内'));
+    // 窗口打开那一刻：面板末尾 = 调仓点，实盘路径给它补了一根执行 bar，于是
+    // `bars_since_decision === 1`。这一根之差就是「今天没下单」和「今天下单」的分界。
+    L.auto.state.last = { action: 'skip', reason: 'not_due',
+      decision_ts: '2026-09-29T02:00:00+00:00',
+      next_decision_ts: '2026-09-30T02:00:00+00:00',
+      rebalance_due: true,
+      bars_since_decision: 1, rebalance_bars: R_SKIP,
+      target_gross: 1.174 };
+    const hOpen = render();
+    check('自动任务：窗口打开时显示「已到，可以执行」',
+      hOpen.includes('已到，可以执行'),
+      '`bars_since_decision === 1` 就是可执行的那一刻');
+    check('自动任务：不再说「正压在调仓点上 / 只有 1 根宽」',
+      !hOpen.includes('正压在') && !hSkip.includes('只有 1 根宽'),
+      '补执行 bar 之后那个中间态已经不可达');
+    L.auto.state.last = { action: 'traded', reason: 'executed',
+      decision_ts: '2026-09-28T02:00:00+00:00',
+      next_decision_ts: '2026-09-29T02:00:00+00:00', target_gross: 1.174 };
     check('自动任务：运行时「停止」按钮可用（不 disabled）',
       /id="autoStop"(?![^>]*disabled)/.test(hOn));
 
-    // (c) 3 天网格不该触发 1 天的警告
-    L.auto.grid = { rebalance_days: 3, bar: '1h', interval_min: 30, source: 'heartbeat' };
-    L.auto.state.rebalance_days = 3;
-    check('自动任务：3 天网格不出现 1 天的警告',
-      !render().includes('1 天调仓不是已验收配置'));
-    L.auto.grid = { rebalance_days: 1, bar: '1h', interval_min: 30, source: 'heartbeat' };
+    // (c) 网格 ≠ 验收口径时必须说话。方向由服务端定：1 天曾经是「不是已验收配置」，
+    //     现在是验收口径本身。所以这里不写 `rd === 1`，取一个与 accGrid 不同的网格。
+    L.auto.grid = { rebalance_days: otherGrid, bar: '1h', interval_min: 30, source: 'heartbeat' };
+    L.auto.state.rebalance_days = otherGrid;
+    const hOff = render();
+    check(`自动任务：网格 ${otherGrid} 天 ≠ 验收口径 ${accGrid} 天时明确提示`,
+      hOff.includes('不是验收口径') && hOff.includes(gridTxt(otherGrid)),
+      hOff.includes('不是验收口径') ? '' : '页面什么也没说 —— 绩效对不上时无从判断');
+    check('自动任务：警告里的验收口径取自服务端（不写死网格）',
+      hOff.includes(gridTxt(accGrid)));
+    L.auto.grid = { rebalance_days: accGrid, bar: '1h', interval_min: 30, source: 'heartbeat' };
+    L.auto.state.rebalance_days = accGrid;
 
     // (d) 请求了但守护没写出心跳 —— 绝不能显示成「正在运行」
-    L.auto.grid = { rebalance_days: 1, bar: '1h', interval_min: 30,
+    L.auto.grid = { rebalance_days: accGrid, bar: '1h', interval_min: 30,
                     source: 'requested-not-confirmed' };
     const hUnconf = render();
     check('自动任务：网格未确认时明确说不确认（不冒充生效）',
       hUnconf.includes('网格未确认'));
 
     // (e) 控制文件在、进程已死
-    L.auto = { mode: 'paper', running: false, ctl: { pid: 4242, rebalance_days: 1 },
-               grid: { rebalance_days: 1, source: 'requested-not-confirmed' },
+    L.auto = { mode: 'paper', running: false, ctl: { pid: 4242, rebalance_days: accGrid },
+               grid: { rebalance_days: accGrid, source: 'requested-not-confirmed' },
                state: { enabled: true, pid: 4242 } };
     check('自动任务：进程已死时不显示成运行中',
       render().includes('未运行') || render().includes('进程已不在'));

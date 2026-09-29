@@ -36,7 +36,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import pandas as pd
 
-from ..config.settings import BARS_PER_DAY, CostConfig, SECONDS_PER_BAR
+from ..config.settings import (ACCEPTED_FACTORS, ACCEPTED_REBALANCE_DAYS,
+                               BARS_PER_DAY, CostConfig, SECONDS_PER_BAR)
 from ..data.okx_client import OKXClient
 from ..data.store import CACHE
 from .credentials import kill_switch_on, load_creds
@@ -50,14 +51,20 @@ from .specs import InstSpec, load_specs
 from .store import (RebalanceBusy, Store, display_ts, new_run_id,  # noqa: F401
                     rebalance_lock)
 
-#: The v3 verified configuration.  Kept here (not in webapp/spec.py) so the
-#: execution layer does not depend on the UI.
+#: The accepted configuration.  Kept in the execution layer (not `webapp/spec.py`)
+#: so the desk does not depend on the UI -- but **derived from the same constants
+#: the UI reads** (`config.settings.ACCEPTED_REBALANCE_DAYS` for the grid,
+#: `ACCEPTED_FACTORS` for the factor set), so the two cannot disagree about
+#: either.  Older bases are *records* (`artifacts/v3` = 3 days,
+#: `artifacts/v4_1d` = two factors), not defaults: a default that disagrees with
+#: the daemon is exactly how the desk came to generate 3-day plans while the
+#: daemon traded daily.
 DEFAULT_SIGNAL: dict = {
     "bar": "1h",
-    "rebalance_days": 3.0,
+    "rebalance_days": ACCEPTED_REBALANCE_DAYS,
     "asset_class": "crypto",
     "overrides": {
-        "factors.subset": ["range_pos", "hitrate"],
+        "factors.subset": list(ACCEPTED_FACTORS),
         "portfolio.max_weight_per_instrument": 0.20,
         "execution.max_daily_turnover": 0.20,
     },
@@ -67,10 +74,27 @@ PRICE_TTL = 15.0          # seconds; public tickers are re-fetched at most this 
 _PUBLIC = {"cli": None, "lock": None}
 
 #: A cache older than this is reported as stale.  12h at 1h bars = half a
-#: trading day; the signal steps every 3 days, so a half-day lag changes the
-#: bars the decision is taken on without looking any different in the UI.
+#: trading day.  The signal steps every `ACCEPTED_REBALANCE_DAYS`, so a half-day
+#: lag moves the decision onto different bars without looking any different in
+#: the UI -- and on a 1-day grid that is half of one grid step, not a sixth of
+#: one, so the same absolute lag now costs more.
 STALE_AFTER_HOURS = 12.0
 _NEWEST_CACHE: Dict[str, tuple] = {}
+
+
+def grid_days(target, bar: str) -> Optional[float]:
+    """The rebalance grid the target was actually built on, in days, or `None`.
+
+    Derived from the target rather than assumed: the grid is a configuration
+    value that has already changed once (3 days -> 1 day, 2026-09-29), and a
+    literal here is how a user-visible message ends up explaining a deviation
+    using a schedule nobody is running.
+    """
+    rb = getattr(target, "rebalance_bars", None)
+    bpd = BARS_PER_DAY.get(str(bar or "1h"))
+    if not rb or not bpd:
+        return None
+    return float(rb) / float(bpd)
 
 
 def _age_str(h) -> str:
@@ -560,7 +584,9 @@ class LiveEngine:
         violations = check_plan(plan, self.limits, mode=self.mode, nav=acct["nav"],
                                 rebalance_due=target.rebalance_due,
                                 leverage=self.set_leverage,
-                                venue_insts=self.venue_instruments())
+                                venue_insts=self.venue_instruments(),
+                                rebalance_days=grid_days(
+                                    target, self.signal_kwargs.get("bar")))
         stale = self.data_staleness()
         if stale.get("stale"):
             violations.append(Violation(
@@ -621,7 +647,9 @@ class LiveEngine:
         violations = check_plan(plan, self.limits, mode=self.mode, nav=nav,
                                 rebalance_due=target.rebalance_due, force=force,
                                 leverage=self.set_leverage,
-                                venue_insts=self.venue_instruments())
+                                venue_insts=self.venue_instruments(),
+                                rebalance_days=grid_days(
+                                    target, self.signal_kwargs.get("bar")))
         blocked = blocking(violations)
         p("⑤ 风控闸门拦截，未发送任何订单" if blocked else "⑤ 风控闸门通过 ✓")
         record: dict = {

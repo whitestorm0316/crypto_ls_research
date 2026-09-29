@@ -43,7 +43,11 @@ class _Target:
         self.decision_ts = "2026-09-28T07:00:00+00:00"
         self.next_decision_ts = "2026-10-01T07:00:00+00:00"
         self.panel_last_ts = "2026-09-28T07:00:00+00:00"
-        self.bars_since_decision = 1
+        # `since == 1` IS the window (`rebalance_window_open`), so a not-due
+        # target must not carry it -- otherwise the fixture describes a state
+        # the real gate can never produce and the tests below would be pinning
+        # an impossible combination.
+        self.bars_since_decision = 1 if due else 72
         self.rebalance_bars = 72
         self.rebalance_due = due
         self.gross = 1.03
@@ -111,6 +115,74 @@ def test_not_due_never_reaches_execute(tmp_live, monkeypatch):
     assert not any(isinstance(c, tuple) and c[0] == "execute" for c in eng.calls), \
         "未到调仓日却调用了 execute —— 这正是服务端不拦的那条路"
     assert out["next_decision_ts"] and out["rebalance_due"] is False
+
+
+def test_not_due_explains_the_wait_in_bars_not_with_a_past_timestamp():
+    """跳过原因必须能自圆其说。
+
+    日网格下「未到调仓日」是**错的**：网格点今天就到了，只是面板还没走到它。
+    旧文案 `未到调仓日（… 下次 2026-09-29 10:00）` 把一个**已经过去**的时刻写成
+    「下次」，在日网格下每天自相矛盾一次 —— 而这块面板存在的唯一理由，就是让人
+    能区分「跑了但正确地没下单」和「根本没跑」。
+
+    这里取**窗口前一根**（`since == R - 1`），即唯一还差 1 根就到窗口的状态。
+    `since == R`（面板正好压在调仓点上）已不可达：实盘路径会补一根执行 bar 把那个
+    调仓点记上账，见 `test_the_panel_cannot_book_the_grid_point_it_ends_on`。
+    """
+    t = _Target(due=False)
+    t.decision_ts = "2026-09-28T02:00:00+00:00"
+    t.next_decision_ts = "2026-09-29T02:00:00+00:00"          # 已经过去了
+    t.bars_since_decision = t.rebalance_bars - 1              # 窗口前一根
+    want = t.rebalance_bars - t.bars_since_decision           # = 1，从 fixture 派生
+
+    msg = at_mod.explain_not_due(t)
+
+    assert f"还差 {want} 根" in msg, f"没有说清还差几根: {msg}"
+    assert "未到调仓日" not in msg, msg
+    assert "下次" not in msg, f"把一个已经过去的时刻写成「下次」: {msg}"
+    assert "再确认" not in msg, f"「到调仓点还差几根」的旧口径又回来了: {msg}"
+
+
+def test_not_due_says_out_of_window_when_the_panel_is_past_it():
+    """窗口过后不能谎称「未到」，也不能谎称「已执行」。
+
+    `since` 落在 (1, R) 时，目标持仓仍是 `decision_ts` 那一笔 —— 面板已经走过
+    窗口，但**没有 per-period 状态**能证明窗口到底是被抓住了还是被漏掉了。
+    所以只能陈述事实，不能替用户下结论。
+
+    根数从 fixture **派生**（`R - since`）。写死就抓不到差一根的错：后端与
+    `app.js` 的 `dueHint` 曾经对同一段等待印出两个不同的数。是 `R - since` 而不是
+    `R - since + 1`，因为面板不必再等一根 bar **收盘**才能给上一根记账。
+    """
+    t = _Target(due=False)
+    t.decision_ts = "2026-09-28T02:00:00+00:00"
+    t.bars_since_decision = 22
+    t.rebalance_bars = 24
+    want = t.rebalance_bars - t.bars_since_decision           # = 2
+
+    msg = at_mod.explain_not_due(t)
+
+    assert "不在窗口内" in msg, msg
+    assert "22/24" in msg, msg
+    assert f"还差 {want} 根" in msg, f"窗口还差 {want} 根，消息里写的不是这个数: {msg}"
+    assert "已执行" not in msg, f"没有状态却断言已执行: {msg}"
+    assert "未到调仓日" not in msg, msg
+
+
+def test_the_heartbeat_carries_enough_to_render_the_wait(tmp_live, monkeypatch):
+    """心跳里必须有 `rebalance_bars`。
+
+    否则页面只能把 `bars_since_decision` 显示成一个没有分母的分子，或者退回
+    「未到」这种自相矛盾的话 —— 而「还差几根 bar」正是用户唯一能据以判断
+    「到底跑没跑」的东西。
+    """
+    eng = FakeEngine(due=False)
+    out = _bot(tmp_live, monkeypatch, eng, interval_min=60).once()
+
+    assert out["reason"] == "not_due"
+    assert out["rebalance_bars"] == 72, out.get("rebalance_bars")
+    assert out["bars_since_decision"] == 72
+    assert out.get("not_due_explain"), "心跳里没有可展示的解释"
 
 
 def test_due_executes_once_and_never_passes_force(tmp_live, monkeypatch):

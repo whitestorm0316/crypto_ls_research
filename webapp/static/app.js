@@ -1,6 +1,7 @@
 /* =========================================================================
    参数中台 —— 交互逻辑
-   默认参数 = 已验收最优配置（v3）。页面会实时告警本仓库已经证伪过的配置。
+   默认参数 = 已验收最优配置（版本号与网格取自 /api/spec，不在前端写死）。
+   页面会实时告警本仓库已经证伪过的配置。
    ========================================================================= */
 'use strict';
 
@@ -69,15 +70,27 @@ function fmtCN(v, w = 'min') {
   return `${day} ${hms}`;
 }
 
-/* ---- 已验收最优（唯一事实来源在 webapp/spec.py） ---- */
-const OPT = {
-  cli: { bar: '1h', rebalance_days: 3, asset_class: 'crypto' },
-  ov: {
-    'factors.subset': ['range_pos', 'hitrate'],
-    'portfolio.max_weight_per_instrument': 0.20,
-    'execution.max_daily_turnover': 0.20,
-  },
-};
+/* ---- 已验收最优（唯一事实来源在 webapp/spec.py，经 /api/spec 下发） ----
+ *
+ * 参数集**不在前端留拷贝**：
+ *   - cli    ← `optimal_cli`（spec.py::OPTIMAL_CLI）
+ *   - 覆盖项 ← 「已验收最优」那条预设的 `overrides`（spec.py::OPTIMAL_OVERRIDES）
+ *
+ * 这里以前硬编码了 `{bar:'1h', rebalance_days:3, asset_class:'crypto'}`。验收口径
+ * 从 3 天换成 1 天（`v3` → `v4_1d`）之后，那份拷贝当场过期：页面刚加载、参数明明
+ * 就是最优，`diffFromOptimal()` 却报 1 处不同 —— 于是 pill 显示「偏离最优 1 处」，
+ * 而横幅因为走了「有差异」那条分支，连 Sharpe 都不再印。页面看起来完全正常，
+ * 只是每个数字都在说另一件事。这正是「前端留一份服务端事实的拷贝」的必然结局：
+ * 换口径时不会报错，只会静静地开始撒谎。
+ *
+ * `id` 保持 `v3_optimal`（服务端与前端都按这个 id 选中它；标签里已经没有版本号，
+ * 用户看到的是「已验收最优 · 1 天网格」）。 */
+const OPTIMAL_PRESET_ID = 'v3_optimal';
+function optCli() { return S.optimalCli || {}; }
+function optOv() {
+  const p = (S.presets || []).find((x) => x.id === OPTIMAL_PRESET_ID);
+  return (p && p.overrides) || {};
+}
 
 const S = {
   spec: null, presets: [], bundles: [], lib: {}, baseline: null,
@@ -143,6 +156,7 @@ async function boot() {
     const d = await r.json();
     S.spec = d.spec; S.presets = d.presets; S.bundles = d.bundles;
     S.lib = d.lib_defaults || {}; S.baseline = d.baseline; S.optimalTag = d.optimal_tag;
+    S.optimalCli = d.optimal_cli || {};
     S.acceptance = d.acceptance || null; S.headline = d.optimal_headline || null;
   } catch (e) {
     $('#content').innerHTML = `<div class="banner danger"><div class="ico">!</div>
@@ -387,9 +401,10 @@ function refreshWarnings() {
 
 function diffFromOptimal() {
   const out = [];
-  for (const k in OPT.ov) if (!eq(S.ov[k], OPT.ov[k])) out.push({ k, want: OPT.ov[k], got: S.ov[k] });
-  for (const k in OPT.cli) if (String(S.cli[k]) !== String(OPT.cli[k]))
-    out.push({ k: '--' + k.replace('_', '-'), want: OPT.cli[k], got: S.cli[k] });
+  const ov = optOv(), cli = optCli();
+  for (const k in ov) if (!eq(S.ov[k], ov[k])) out.push({ k, want: ov[k], got: S.ov[k] });
+  for (const k in cli) if (String(S.cli[k]) !== String(cli[k]))
+    out.push({ k: '--' + k.replace('_', '-'), want: cli[k], got: S.cli[k] });
   return out;
 }
 
@@ -425,13 +440,33 @@ function acceptanceText() {
   return a.complete ? head : `${head}（证据不全，完整需 ${a.expected} 项）`;
 }
 
+/* 「已验收最优」的标签一律取自服务端（`optimal_tag` / `optimal_cli`），**不在前端
+ * 写死版本号或网格**。验收口径已经换过一次（3 天 `v3` → 1 天 `v4_1d`），写死的文案
+ * 会在换口径之后继续断言旧口径，而页面看起来完全正常。 */
+function optTagLabel() { return S.optimalTag || '基线'; }
+function optGridDays() {
+  const v = Number((S.optimalCli || {}).rebalance_days);
+  return isFinite(v) && v > 0 ? v : null;
+}
+/* 「N 天」只此一处格式化。同一个数在这块面板里出现四次（运行横幅、控制文件兜底、
+ * 启动提示、验收口径标签），各写各的精度就会同时印出「1 天」和「1.00 天」两种说法
+ * —— 和 `dueHint`/`explain_not_due` 那对渲染点是同一类毛病。整数不带小数位。 */
+function gridDaysText(v) {
+  const d = Number(v);
+  return (isFinite(d) && d > 0) ? `${fmt.n(d, d % 1 ? 2 : 0)} 天` : '—';
+}
+function optGridText() {
+  const d = optGridDays();
+  return d == null ? '调仓网格以 /api/spec 为准' : `${gridDaysText(d)}调仓`;
+}
+
 function updateOptPill() {
   const el = $('#optPill');
   if (!el) return;
   const n = diffFromOptimal().length;
   if (!n) {
     el.className = 'pill ok';
-    el.textContent = '已验收最优 v3 ✓';
+    el.textContent = `已验收最优 ${optTagLabel()} ✓`;
     el.title = baselineHeadlineText();
   } else {
     el.className = 'pill warn';
@@ -462,16 +497,16 @@ function renderContent() {
   if (!diffs.length) {
     const bh = baselineHeadline();
     if (bh) {
-      h += banner('ok', '✓', '当前参数 = 已验收最优配置（v3）',
+      h += banner('ok', '✓', `当前参数 = 已验收最优配置（${optTagLabel()}）`,
         `Sharpe <b>${esc(bh.sharpe)}</b> / CAGR <b>${esc(bh.cagr)}</b> / 最大回撤 <b>${esc(bh.mdd)}</b>，`
         + `${esc(acceptanceText())}。<br><span class="muted">指标来自 <span class="mono">`
         + `${esc(bh.tag)}</span> 的产物（${esc(bh.span)}），随数据重建自动更新，不再写死在页面里。`
         + `</span> 因子子集 = range_pos + hitrate；换手预算 20%；单名上限 20%；
-           1h 频率、3 天调仓、crypto 池。直接点右上角即可复现。`);
+           1h 频率、${esc(optGridText())}、crypto 池。直接点右上角即可复现。`);
     } else {
-      h += banner('warn', '⚠', '当前参数 = 已验收最优配置（v3）',
+      h += banner('warn', '⚠', `当前参数 = 已验收最优配置（${optTagLabel()}）`,
         `<b>${esc(baselineHeadlineText())}</b>——页头的指标全部取自产物，`
-        + `而 <span class="mono">artifacts/${esc(S.optimalTag || 'v3')}/tables/01_headline_metrics.json</span> 读不到。`
+        + `而 <span class="mono">artifacts/${esc(optTagLabel())}/tables/01_headline_metrics.json</span> 读不到。`
         + `先跑一次回测把基线产物生成出来，这里就会显示真实数值。`);
     }
   } else {
@@ -505,7 +540,7 @@ function renderContent() {
     ['最大回撤', r && r.mdd, b && b.mdd, 'pct', d && d.delta && d.delta.mdd],
   ];
   const rest = r ? r.metrics.filter((m) => ['年化波动', '回撤持续（天）', 'Calmar', '年换手（倍）', '成本拖累（年）', '资金费盈亏（总）', '平均总敞口', '日胜率'].includes(m.label)) : [];
-  h += `<h2 class="sec">核心指标 <small>${r ? '本配置' : '尚未运行'} ${r ? '· 括号内为与 v3 基线之差' : ''}</small></h2>`;
+  h += `<h2 class="sec">核心指标 <small>${r ? '本配置' : '尚未运行'} ${r ? `· 括号内为与 ${esc(optTagLabel())} 基线之差` : ''}</small></h2>`;
   h += `<div class="kpis">`;
   for (const [k, v, bv, f, dl] of KPI) {
     h += kpiCard(k, fmt.val(v, f), dl, f === 'pct' ? 'pp' : f);
@@ -528,7 +563,7 @@ function renderContent() {
         <div class="legend" id="chartLegend"></div>
       </div></div>
     <div class="panel"><div class="head"><h3>逐年 Sharpe</h3><span class="spacer"></span>
-      <span class="muted" style="font-size:11.5px">与 v3 基线对照</span></div>
+      <span class="muted" style="font-size:11.5px">与 ${esc(optTagLabel())} 基线对照</span></div>
       <div class="body" style="padding:4px 10px 10px">${yearTable(d)}</div></div></div>`;
   h += `</div>`;                       /* /resultOnly */
 
@@ -591,7 +626,7 @@ function renderContent() {
   });
 
   const note = $('#chartNote');
-  if (note && r) note.textContent = `蓝 = 本配置，灰 = v3 基线`;
+  if (note && r) note.textContent = `蓝 = 本配置，灰 = ${optTagLabel()} 基线`;
   if (S.tab === 'result') drawChart();
   if (d) { const lg = $('#log'); if (lg) lg.innerHTML = logHtml(d._log || ''); startLog(d); }
   if (S.tab === 'trades') {
@@ -621,7 +656,7 @@ function kpiCard(k, v, delta, unit) {
   if (delta != null && isFinite(delta)) {
     const cls = Math.abs(delta) < 1e-9 ? 'flat' : (delta > 0 ? 'up' : 'down');
     const t = unit === 'pp' ? fmt.pp(delta) : fmt.sgn(delta);
-    dl = `<div class="d ${cls}">${t} <span class="muted">vs v3</span></div>`;
+    dl = `<div class="d ${cls}">${t} <span class="muted">vs ${esc(optTagLabel())}</span></div>`;
   }
   return `<div class="kpi"><div class="k">${esc(k)}</div><div class="v">${esc(v)}</div>${dl}</div>`;
 }
@@ -629,12 +664,12 @@ function kpiCard(k, v, delta, unit) {
 function yearTable(d) {
   const r = d && d.result;
   const by = (S.baseline && S.baseline.yearly && S.baseline.yearly.years) || [];
-  if (!by.length) return `<div class="empty">缺 v3 基线年度数据</div>`;
+  if (!by.length) return `<div class="empty">缺 ${esc(optTagLabel())} 基线年度数据</div>`;
   const cur = {};
   for (const y of ((r && r.yearly && r.yearly.years) || [])) cur[y.year] = y;
   const full = r && r.yearly && r.yearly.full;
   let h = `<table><thead><tr><th>年份</th>
-      <th class="num">v3 基线</th><th class="num">本配置 (Δ)</th>
+      <th class="num">${esc(optTagLabel())} 基线</th><th class="num">本配置 (Δ)</th>
       <th class="num">年化收益</th></tr></thead><tbody>`;
   for (const y of by) {
     const c = cur[y.year];
@@ -1106,13 +1141,13 @@ function shapeOk(d) {
   return true;
 }
 
-/* 曲线可以同时画多条：v3 基线 + 当前运行 + 用户在图例上点出来的历史运行。
+/* 曲线可以同时画多条：验收基线 + 当前运行 + 用户在图例上点出来的历史运行。
  * 颜色按**候选顺序**分配（不是按当前显示顺序），所以勾选/取消不会让颜色乱跳。 */
 const PALETTE = ['#2f6feb', '#d1495b', '#2a9d8f', '#e9a23b', '#8e6fd8', '#4b8b3b',
   '#c2571a', '#0f7c8a'];
 const CHART_MAX_SERIES = 6;
 
-/* 能作为曲线来源的 tag：当前运行、v3 基线，以及所有跑完的历史运行。 */
+/* 能作为曲线来源的 tag：当前运行、验收基线（`S.optimalTag`），以及所有跑完的历史运行。 */
 function chartCandidates() {
   const out = [];
   const push = (t) => { if (t && out.indexOf(t) < 0) out.push(t); };
@@ -1124,7 +1159,7 @@ function chartCandidates() {
   return out.slice(0, CHART_MAX_SERIES);
 }
 
-/* 默认只画「当前运行 + v3 基线」：六个 tag 一起画会糊成一片。 */
+/* 默认只画「当前运行 + 验收基线」：六个 tag 一起画会糊成一片。 */
 function initChartOff() {
   if (S.chartOffInit) return;
   const cur = S.detail && S.detail.tag;
@@ -1503,8 +1538,10 @@ function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTi
    -------------------------------------------------------------------------
    三条铁律（都是本项目已经用真实数据换来的）：
    1) 信号不能另写一套：目标书由 run_backtest 产出，和报告同源。
-   2) 目标书 ≠ 实际持仓：v3 的实际毛敞口均值 0.472，目标 1.032，
-      因为 20%/期的换手预算永远追不上。实盘必须复刻预算，否则敞口差 2.2 倍。
+   2) 目标书 ≠ 实际持仓：因为每期 20% 的换手预算永远追不上目标，实际毛敞口会明显
+      低于目标。实盘必须复刻这个预算，否则敞口高于回测。3 天网格的记录值是
+      实际 0.472 / 目标 1.032（约 2.2 倍），**但倍数随网格变**（1 天档换手高得多，
+      缺口小得多）—— 别把这两个数当当前值引用，以 /api/spec 与 FINDINGS.md 为准。
    3) 页面上的数字必须和服务端逐位一致：所有金额都由后端算好、前端只负责显示。
    ========================================================================= */
 const LIVE_LABEL = { paper: '本地纸面', demo: 'OKX 模拟盘', live: 'OKX 实盘' };
@@ -1515,11 +1552,22 @@ const LIVE_ACTION_LABEL = { traded: '已调仓', skip: '跳过', blocked: '被�
                             noop: '无需下单', dry_run: '预演（未发单）', error: '出错' };
 const LIVE_SKIP_LABEL = {
   kill_switch: '熔断开关已拉下', data_stale: '行情陈旧（刷新后仍旧）',
-  not_due: '未到调仓日', busy: '另一进程正在调仓', risk_gate: '风控闸门拦截',
+  /* 不是「未到调仓日」。到期闸门量的是 **bar 数**（`bars_since_decision >=
+   * rebalance_bars`），窗口每天只开约一根 bar 宽；日网格下「今天是不是调仓日」
+   * 这个问法本身就不成立 —— 网格点今天就到了，只是面板还没确认那根 bar。
+   * 标成「未到调仓日」会让用户以为策略没在跑。 */
+  not_due: '未到可执行窗口', busy: '另一进程正在调仓', risk_gate: '风控闸门拦截',
   confirm_failed: '确认短语不符', no_orders: '目标与持仓一致，无单可发',
   dry_run: '预演模式', executed: '已执行' };
 const LIVE_LIMIT_FIELDS = [
   ['max_gross_notional', '总名义额上限 (USD)', '绝对上限，不随本金缩放——唯一能挡住「连错账户」的闸门'],
+  /* `max_gross_frac` 是**比例**那一半，也是「想放大收益」时真正要动的那一个。
+   * 它一直存在于服务端（`LiveLimits.max_gross_frac`、闸门 `check_plan`）、也被
+   * `limitsDiff` 纳入比较，**却没有任何输入框** —— 而杠杆面板与 `limits.py` 的
+   * 警告都在告诉用户「调上表的总敞口上限」。指向一个不存在的控件，用户只能去改
+   * `artifacts/live/<mode>/limits.json`。加进来，那句话才成立。
+   * 两个上限是**与**关系：比例允许 2× 而绝对额仍是 $50k 时，实际卡住的还是 $50k。 */
+  ['max_gross_frac', '总敞口上限 (× 净值)', '超过即整批拒绝。它是闸门不是目标——书的大小由策略目标与换手预算决定；与「总名义额上限」取更紧的那个'],
   ['max_order_notional', '单笔上限 (USD)', '任何一笔订单超过即整批拒绝'],
   ['max_orders', '单次订单笔数上限', '超出通常意味着 target 或持仓读数有误'],
   ['max_turnover_frac', '单次换手硬上限 (× 净值)', '超过即整批拒绝。它是闸门，不是节流——每期实际换多少由账户区的「换手预算（策略节流）」决定'],
@@ -1853,7 +1901,7 @@ function liveAcctHtml() {
   const missing = (a.positions || []).filter((p) => posNotional(p) == null).length;
   /* 「换手」在本页有两个长得很像的数字，必须说清是哪一个（用户报的「对不上」）：
    *   · `turnover_budget` = **策略每期的节流预算**，来自信号参数
-   *     `execution.max_daily_turnover`（v3 = 20%）。它决定每期只执行目标变动的百分之几。
+   *     `execution.max_daily_turnover`（验收口径 = 20%）。它决定每期只执行目标变动的百分之几。
    *   · 风控限额表里的 `max_turnover_frac` = **硬闸门**，超过就整批拒绝，不参与节流。
    * 改限额不会、也不该改这里的预算——以前两处都不说来源，只列数字，看起来就是矛盾。
    *
@@ -1997,7 +2045,7 @@ function livePlanHtml() {
     h += `<div class="banner info" style="margin-top:11px"><div class="ico">i</div><div>
       <b>本次只执行目标变动的 ${esc(fmt.pct(p.turnover_scale))}</b>
       <p>目标变动需换手 ${esc(fmt.n(p.turnover_wanted, 2))}× 净值，而策略每期预算只有 ${esc(fmt.pct(p.turnover_budget, 0))}。
-      这不是 bug：回测里 v3 的<b>实际持仓毛敞口均值 ${esc(fmt.n(gAvg))}</b>，而本次原始目标 <b>${esc(fmt.n(rawTgt))}</b>——
+      这不是 bug：回测里 ${esc(optTagLabel())} 的<b>实际持仓毛敞口均值 ${esc(fmt.n(gAvg))}</b>，而本次原始目标 <b>${esc(fmt.n(rawTgt))}</b>——
       报告的 Sharpe ${esc(sharpeTxt)} 来自被预算拖住的账${mult == null ? '' : `。照原始目标下单会让敞口变成 ${esc(mult.toFixed(1))} 倍`}。</p></div></div>`;
   }
   for (const w of (p.warnings || [])) {
@@ -2123,11 +2171,48 @@ function liveJobHtml() {
  * 它是来自心跳（确认生效）还是仅来自请求（还没确认）。把请求当现状显示，
  * 和一个真的生效了的界面长得一模一样 —— 直到那一夜什么都没发生。
  */
+/* 网格选项的提示文字**一个数字都不带**，也**不写死哪个是验收口径**。
+ *
+ * 这里以前写死了「实测 Sharpe 1.855 / MDD −16.8%」「3d 已验收最优 1.935」等一串
+ * 指标。两处都错：(1) 违反本仓硬约定 —— 页面每个数字都要追到产物（`/api/spec`）；
+ * (2) 按当前数据重测，**结论是反的**：1d 的 Sharpe 高于 3d，记录值里的排序不复现。
+ *
+ * 「哪个是当前验收口径」由服务端说（`/api/spec` 的 `optimal_cli.rebalance_days`，
+ * 见 `optGridDays()`）。口径本身换过一次（3 天 `v3` → 1 天 `v4_1d`）—— 把口径写死
+ * 在前端，就等于在页面里留一个换口径之后仍然信誓旦旦的过期事实。
+ *
+ * 真正复现的只有定性结论：1d 换手约 2.9 倍、回撤约 2.2 倍深。所以这里只留结构性
+ * 描述，数值一律去看 artifacts/FINDINGS.md Q22 与 /api/spec。
+ */
 const AUTO_GRID_CHOICES = [
-  [1, '每天（1d）', '换手预算几乎一直吃满：实测 Sharpe 1.855、MDD −16.8%，比 3 天差一档'],
-  [2, '每 2 天（2d）', '实测 Sharpe 1.754、MDD −15.5%，三个网格里最差'],
-  [3, '每 3 天（3d，已验收最优）', 'Sharpe 1.935 / MDD −12.7%，对外交付口径用这个'],
+  [1, '每天（1d）', '调仓最密：换手与回撤都显著重于 3d'],
+  [2, '每 2 天（2d）', '介于两者之间'],
+  [3, '每 3 天（3d）', '3 天网格，保留作对照'],
 ];
+
+/* 「本周期调仓点」的副标签。
+ *
+ * `next_decision_ts` **不是**「未来的下一个决策时刻」：它是「本周期尚未记账的
+ * 那个网格点」。因为回测的执行价取下一根 bar 的开盘，网格点本身在面板里记不了
+ * 账，所以这个时刻**常常已经过去**。旧写法把它标成「未到」，等于把一个已经过去
+ * 的时刻说成还没到 —— 日网格下每天都自相矛盾，读起来就是「根本没跑」。
+ *
+ * 所以按 **bar 数**说。窗口是一个**边沿**而不是水平：`bars_since_decision === 1`
+ * 才是可执行的那一刻。实盘路径会给面板补一根「执行 bar」，所以「面板末尾 = 调仓点」
+ * 和「面板末尾 = 调仓点后一根」**同解**，窗口 = 这两个相邻状态，共 2 根 bar 宽。
+ * 后端 `rebalance_window_open()` 是唯一定义，这里只是把它翻成人话。
+ */
+function dueHint(last) {
+  if (last.rebalance_due) return '<b style="color:var(--danger)">已到，可以执行</b>';
+  const R = Number(last.rebalance_bars);
+  const since = Number(last.bars_since_decision);
+  if (!isFinite(R) || !R || !isFinite(since)) return '—';
+  /* 距下个窗口还差 `R - since` 根 bar。窗口在调仓点**收盘后**就开（实盘路径会补一根
+   * 执行 bar，让引擎把这一笔记上账），所以面板不必再等一根 bar 收盘 —— 不再有 `+ 1`。
+   * 这个式子有两个渲染点（这里和后端 explain_not_due），只改一处就会印出两个数。 */
+  const remain = Math.max(0, R - since);
+  return `已过 ${fmt.n(since, 0)}/${fmt.n(R, 0)} 根 bar · 还差 <b>${fmt.n(remain, 0)}</b> 根到下个窗口`;
+}
 
 function liveAutoHtml() {
   const L = S.live;
@@ -2149,15 +2234,15 @@ function liveAutoHtml() {
   if (running && !confirmed) {
     h += `<div class="banner danger"><div class="ico">!</div><div><b>进程在跑，但网格未确认</b>
       <p>pid ${esc(st.pid)} 已启动，可它还没有写出心跳，所以**无法确认**当前调仓间隔。
-      读到的是 ${rd != null ? fmt.n(rd, 2) + ' 天' : '空'}（来源：${esc(src)}）。
+      读到的是 ${gridDaysText(rd)}（来源：${esc(src)}）。
       在确认之前，别假设它按你要的网格在跑。</p></div></div>`;
   } else if (running) {
     h += `<div class="banner ok"><div class="ico">●</div><div><b>正在运行（独立进程 pid ${esc(st.pid)}）</b>
       <p>启动于 ${esc(st.started_str || '—')} · 每 ${fmt.n(st.interval_min, 0)} 分钟检查一次 ·
-      调仓网格 <b>${rd != null ? fmt.n(rd, 2) : '?'} 天</b>（已确认）</p></div></div>`;
+      调仓网格 <b>${gridDaysText(rd)}</b>（已确认）</p></div></div>`;
   } else if (A.ctl && A.ctl.pid) {
     h += `<div class="banner warn"><div class="ico">!</div><div><b>控制文件还在，但进程已不在</b>
-      <p>上次请求：pid ${esc(A.ctl.pid)}，调仓网格 ${A.ctl.rebalance_days != null ? fmt.n(A.ctl.rebalance_days, 2) + ' 天' : '—'}。
+      <p>上次请求：pid ${esc(A.ctl.pid)}，调仓网格 ${gridDaysText(A.ctl.rebalance_days)}。
       这一轮没有跑起来，请重新启动。</p></div></div>`;
   } else {
     h += `<div class="banner warn"><div class="ico">!</div><div><b>未运行</b>
@@ -2183,9 +2268,9 @@ function liveAutoHtml() {
            st.kill_switch ? '不会下任何单' : '未拦截')}
     ${cell('通知', (st.notify || {}).ready ? esc((st.notify || {}).provider) : '未启用',
            (st.notify || {}).ready ? '' : '配 config/notify.json 后自动生效')}
-    ${cell('下一次决策',
+    ${cell('本周期调仓点',
            `<span class="mono">${esc(fmtCN(last.next_decision_ts) || '—')}</span>`,
-           last.rebalance_due ? '<b style="color:var(--danger)">已到调仓日</b>' : '未到')}
+           dueHint(last))}
     ${cell('最新已收盘 K 线',
            `<span class="mono" style="font-size:12.5px">${esc(fmtCN(last.newest_bar) || '未知')}</span>`,
            last.bar_age_hours != null
@@ -2199,10 +2284,18 @@ function liveAutoHtml() {
       / ${esc(LIVE_SKIP_LABEL[last.reason] || last.reason)}
       · 信号日 ${esc(fmtCN(last.decision_ts) || '—')}
       · 目标毛敞口 ${last.target_gross != null ? fmt.n(last.target_gross, 3) : '—'}</div>`;
+    /* 原话优先。后端是唯一知道「窗口还差几根 bar」的地方（它算的就是那个闸门），
+     * 前端再推一遍就是第二个定义，迟早跟闸门漂移。 */
+    if (last.not_due_explain) {
+      h += `<div class="muted" style="font-size:11.5px;margin-top:2px">`
+        + `${esc(last.not_due_explain)}</div>`;
+    }
   }
 
+  const accGrid = optGridDays();
   const opts = AUTO_GRID_CHOICES.map(([d, label, tip]) =>
-    `<option value="${d}" ${rd === d ? 'selected' : ''}>${label} — ${tip}</option>`).join('');
+    `<option value="${d}" ${rd === d ? 'selected' : ''}>${label} — ${tip}`
+    + `${accGrid === d ? '（当前验收口径）' : ''}</option>`).join('');
   const dis = L.busy ? 'disabled' : '';
   h += `<div class="row" style="margin-top:12px;gap:8px;align-items:flex-end;flex-wrap:wrap">
     <label style="min-width:330px"><span class="muted" style="font-size:11.5px">调仓间隔</span><br>
@@ -2216,12 +2309,17 @@ function liveAutoHtml() {
     <button class="btn sm ghost" id="autoStop" ${(!running || L.busy) ? 'disabled' : ''}>停止</button>
   </div>`;
 
-  if (running && rd === 1) {
+  /* 跑着的网格 ≠ 验收口径时要说话。方向反过来了：1 天曾经是「不是已验收配置」，
+   * 现在是验收口径本身（`v4_1d`）。所以判据不能写死 `rd === 1`，要拿服务端给的
+   * `optimal_cli` 比 —— 否则换口径之后横幅会在断言相反的事实。 */
+  if (running && accGrid != null && rd != null && rd !== accGrid) {
     h += `<div class="banner warn" style="margin-top:10px"><div class="ico">!</div><div>
-      <b>1 天调仓不是已验收配置</b><p>实测（本机、同一面板）：Sharpe 1.855 vs 3 天的 1.935，
-      最大回撤 −16.8% vs −12.7%，回撤更深 4.1pp，年化波动 16.3% vs 11.9%。
-      换手预算 20%/天 会被顶满，调仓总次数约为 3 天档的三倍。
-      对外口径请仍用 3 天（Sharpe 1.60 / 2021–2025 分窗）。</p></div></div>`;
+      <b>守护进程跑的网格不是验收口径</b><p>验收口径是 <b>${esc(optGridText())}</b>
+      （${esc(optTagLabel())}），而这里跑的是 ${esc(gridDaysText(rd))} ——
+      绩效对不上基线时先看这一条。这里**不列任何旧数字**：以前写死的
+      「1 天 Sharpe 1.855 vs 3 天 1.935」按当前数据<b>不复现，排序甚至翻转</b>，
+      横幅因此在断言与实测相反的话 —— 而写死的数字会跟着数据一起过期，
+      还会继续断言下去。实测以 artifacts/FINDINGS.md Q22 与 /api/spec 为准。</p></div></div>`;
   }
   return h;
 }
@@ -2328,8 +2426,10 @@ function liveLeverageHtml(lim) {
  *   已保存   → 报出文件路径与时间戳，用户能自己去核对。 */
 function limitsDiff(saved) {
   const cur = S.live.limits || {};
-  const keys = LIVE_LIMIT_FIELDS.map((f) => f[0])
-    .concat(['max_gross_frac', 'require_rebalance_due']);
+  /* 与上面那张表**同一份字段清单**（`max_gross_frac` 现在也在表里），加上那个不在
+   * 表里的勾选框。以前这里额外 concat 了 `max_gross_frac`，于是「全部字段都不同」
+   * 的判据要写成 `+2` —— 两份清单各说各的，加一个字段就会让那条判据永远不成立。 */
+  const keys = LIVE_LIMIT_FIELDS.map((f) => f[0]).concat(['require_rebalance_due']);
   if (!saved) return { never: true, changed: true, keys: keys };
   const norm = (v) => (v == null || v === '' ? null : v);
   const changed = keys.filter((k) => norm(cur[k]) !== norm(saved[k]));
@@ -2351,7 +2451,7 @@ function limitsStateHtml() {
   if (d.changed) {
     return `<div class="banner warn" style="margin-top:9px"><div class="ico">!</div><div>
       <b>有未保存的改动</b>
-      <p>${d.keys.length === LIVE_LIMIT_FIELDS.length + 2
+      <p>${d.keys.length === LIVE_LIMIT_FIELDS.length + 1
         ? '表单里的值与磁盘上那份不同'
         : `以下字段与已保存的值不同：<span class="mono">${esc(d.keys.join('、'))}</span>`}。
       它们对<b>本次计划</b>已经生效，但<b>不会</b>在重启后保留——点「保存限额」写入磁盘。</p>
@@ -2550,7 +2650,7 @@ async function liveAutoStart() {
     /* `confirmed` = 心跳已读到。没确认成功就不说成功 —— 进程被拉起来了但
      * 一秒后自己退掉，和「启动成功」在页面上长得一样，而后果是当天不下单。 */
     if (d.confirmed) {
-      L.note = `自动任务已启动（pid ${(d.state || {}).pid}），调仓网格 ${fmt.n((d.grid || {}).rebalance_days, 2)} 天`;
+      L.note = `自动任务已启动（pid ${(d.state || {}).pid}），调仓网格 ${gridDaysText((d.grid || {}).rebalance_days)}`;
     } else {
       /* 未确认心跳时，最常见的原因不是"参数错"，而是**父进程在沙箱进程树里**：
        * 参数中台自己是从工具调用的 shell 起出来的，它 spawn 的守护进程会在

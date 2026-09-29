@@ -26,7 +26,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from spec import (  # noqa: E402
-    OPTIMAL_HEADLINE, OPTIMAL_TAG, PRESETS, SPEC, STAGE_BUNDLES,
+    OPTIMAL_CLI, OPTIMAL_HEADLINE, OPTIMAL_TAG, PRESETS, SPEC, STAGE_BUNDLES,
     build_run_args, check_traps,
 )
 import trades  # noqa: E402
@@ -105,10 +105,25 @@ def tag_dir(tag):
     return os.path.join(ARTIFACTS, tag)
 
 
-# How many pass/fail gates a *complete* full-stage run produces.  The recorded
-# v3 run reported 16/16; that is the yardstick for "do we have all the evidence
-# on disk right now", so a partial re-run is reported as partial instead of
-# quietly looking like a pass.
+# How many pass/fail gates a *complete* full-stage run produces.  That is the
+# yardstick for "do we have all the evidence on disk right now", so a partial
+# re-run is reported as partial instead of quietly looking like a pass.
+#
+# The recorded v3 write-up said "16/16", and `acceptance_checks` does return 16
+# **rows** for a complete run -- but three of them are deliberately `pass=None`
+# *informational* rows (the funding term's sign is not stable, so the criterion
+# that judges it is not a gate; see `tests/test_acceptance_funding.py`).  Gates and
+# rows are different units, and comparing a gate count against the row count made
+# `complete` unreachable: a full run on disk reported "证据不全：完整需 16 项" while
+# holding all 13 gates.  Count gates.
+#
+# 2026-09-29: 13 -> 16.  The 13 was the count for a run **without `--stages mc`**,
+# and the three placebo nulls were not merely unevaluated -- they produced no rows
+# at all, so the summary read a clean 13/13 with the only falsifiable criterion
+# missing.  `acceptance_checks` now emits those rows explicitly when the artifact
+# is absent (see `tests/test_acceptance_completeness.py`), and the accepted tag
+# `v5_1d_all5` is the first on disk that actually ran the stage, so the complete
+# count is 16.  A tag that skipped `mc` still reports 13 gates -- and now says so.
 _ACCEPT_EXPECTED = 16
 _ACCEPT_CACHE: dict = {}
 
@@ -449,6 +464,11 @@ class Handler(BaseHTTPRequestHandler):
                     "spec": SPEC, "presets": self._presets(hl),
                     "bundles": STAGE_BUNDLES,
                     "optimal_tag": OPTIMAL_TAG,
+                    # The accepted revision's *grid*, so the page can say which
+                    # configuration the acceptance actually describes instead of
+                    # hardcoding it in JS.  `/api/live/auto` reports the grid the
+                    # daemon is running; these two are compared in the UI.
+                    "optimal_cli": dict(OPTIMAL_CLI),
                     # Live numbers win over the recorded ones; the recorded dict is
                     # kept only as the fallback for fields with no artifact.
                     "optimal_headline": hl,
@@ -636,12 +656,12 @@ class Handler(BaseHTTPRequestHandler):
         return sanitize(out)
 
     def _presets(self, headline):
-        """PRESETS with the v3 entry's description filled from the live headline.
+        """PRESETS with the accepted entry's description filled from the live headline.
 
         The picker used to restate "Sharpe 1.937 / CAGR 25.09% / MDD −12.72%" while
-        the header banner computed 1.758 from the artifacts -- the same page, two
-        answers.  Copy before mutating: PRESETS is module state that `check_traps`
-        and the run builder also read.
+        the header banner computed a different number from the artifacts -- the same
+        page, two answers.  Copy before mutating: PRESETS is module state that
+        `check_traps` and the run builder also read.
         """
         out = []
         for p in PRESETS:

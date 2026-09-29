@@ -34,6 +34,62 @@ SECONDS_PER_BAR: Dict[str, int] = {
 
 
 # ----------------------------------------------------------------------------
+# the accepted configuration
+# ----------------------------------------------------------------------------
+#: The rebalance grid of the **accepted** configuration -- the one the unattended
+#: daemon trades, and therefore the one the acceptance headline has to describe.
+#:
+#: It lives here, in the config layer, because *three* places need the number and
+#: none of them may own a copy of the others':
+#:
+#:   * `execution.engine.DEFAULT_SIGNAL` -- the strategy the desk plans on, and
+#:     the argparse default of `auto_trader` / `run_live` / `auto_ctl`,
+#:   * `webapp.spec.OPTIMAL_CLI` -- what the console calls "已验收最优",
+#:   * the acceptance run itself (`artifacts/<OPTIMAL_TAG>/`).
+#:
+#: A second literal is not a hypothetical.  `DEFAULT_SIGNAL` said 3.0 while the
+#: daemon was started with `--rebalance-days 1`; nothing compared them, so the
+#: desk kept generating **3-day** plans and printing 「下次调仓」 three days out
+#: while the daemon traded every day.  Nothing errored -- the plan was simply a
+#: plan for a different strategy than the one running.
+#:
+#: History: the basis was 3 days until 2026-09-29, when it moved to 1 day so the
+#: acceptance describes the configuration actually running.  Both runs are on
+#: disk (`artifacts/v3` = 3 days, `artifacts/v4_1d` = 1 day) and **both numbers
+#: must be quoted together** -- see `webapp/spec.py::OPTIMAL_HEADLINE` and
+#: `artifacts/FINDINGS.md` Q22.  Moving this value is a re-designation of the
+#: acceptance basis, not a parameter tweak.
+ACCEPTED_REBALANCE_DAYS: float = 1.0
+
+#: The **factor set** of the accepted configuration, for the same reason as the
+#: grid above and read by the same three surfaces:
+#:
+#:   * `execution.engine.DEFAULT_SIGNAL["overrides"]["factors.subset"]` -- the
+#:     strategy the desk plans on and the daemon trades,
+#:   * `webapp.spec.OPTIMAL_OVERRIDES["factors.subset"]` -- what the console
+#:     calls 「已验收最优」,
+#:   * the acceptance run itself, recorded in
+#:     `artifacts/<OPTIMAL_TAG>/tables/00_run_meta.json` (`factor_subset`).
+#:
+#: Note this is **not** `FactorConfig.subset`.  That one is the *schema* default
+#: (the research brief's four factors, with `rev_short` deliberately absent so
+#: every pre-existing number stays bit-identical); this one is the *accepted
+#: model choice*, which is a different question and has been a different value
+#: at every stage of the project's history.  Conflating the two is how a page
+#: ends up describing a book nobody measured.
+#:
+#: History: pruned to `range_pos + hitrate` while the brief's four factors were
+#: the default; widened to all five on 2026-09-29 after the acceptance run in
+#: `artifacts/v5_1d_all5/` cleared 16/16 gates -- including the three placebo
+#: nulls, which no earlier tag had ever produced.  `artifacts/v4_1d/` stays on
+#: disk as the two-factor record and `artifacts/v3/` as the 3-day one; moving
+#: this value is a re-designation of the acceptance basis, not a parameter tweak.
+#: See `artifacts/FINDINGS.md` Q32/Q33 and `tests/test_accepted_factor_set.py`.
+ACCEPTED_FACTORS: Tuple[str, ...] = ("momentum", "flow", "range_pos", "hitrate",
+                                     "rev_short")
+
+
+# ----------------------------------------------------------------------------
 # execution / cost model
 # ----------------------------------------------------------------------------
 @dataclass

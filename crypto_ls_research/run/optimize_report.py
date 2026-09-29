@@ -24,6 +24,12 @@ import pandas as pd
 ART = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                    "..", "artifacts"))
 
+#: The placebo nulls `stage_mc` writes into `22_montecarlo_summary.json`.  Named
+#: at module level so the completeness test can check them against the stage
+#: that produces them: a rename on either side would otherwise drop a gate
+#: silently, which is the defect this list exists to prevent.
+MC_KINDS = ("cross_section_permute", "random_score", "block_shuffle")
+
 
 def _read(tag: str, name: str) -> Optional[pd.DataFrame]:
     p = os.path.join(ART, tag, "tables", name)
@@ -113,6 +119,19 @@ def acceptance_checks(tag: str) -> List[Dict[str, object]]:
         })
 
     # 2. placebo nulls
+    #
+    # This is the only gate here that can actually *falsify* the strategy: the
+    # book is dollar-neutral by construction, so its beta is ~0 whether or not
+    # there is any signal, and a beta test cannot tell skill from a lucky book.
+    # Permuting the score can.
+    #
+    # Which is why the `if mc:` guard below was a defect, not a convenience.
+    # A tag whose run did not include `--stages mc` produced **no rows at all**,
+    # so `acceptance_checks` returned a clean 13/13 and the console reported a
+    # full sweep.  That is what happened to every archived tag on disk --
+    # `logs/research_v4_1d.log` shows the accepted run's stage list and `mc` is
+    # not in it.  A placebo test that was never run must not look like one that
+    # passed, so the absence is now stated explicitly.
     mc = _read_json(tag, "22_montecarlo_summary.json")
     if mc:
         for kind, d in mc.items():
@@ -121,17 +140,30 @@ def acceptance_checks(tag: str) -> List[Dict[str, object]]:
                 continue
             rows.append({"criterion": f"MC null: {kind}",
                          "value": f"p={p}", "pass": bool(p is not None and p <= 0.05)})
+    else:
+        for kind in MC_KINDS:
+            rows.append({
+                "criterion": f"MC null: {kind}",
+                "value": "未评估：22_montecarlo_summary.json 不在盘上"
+                         "（这次运行没有跑 `--stages mc`）",
+                "pass": None,
+            })
 
     # 3. cost bookkeeping
     # (a) The strong form: the per-bar ledger identity must hold exactly.  Both of
     #     this project's ledger bugs (funding sign, forced-close cost missing from
     #     the itemised columns) would show up here as a non-zero residual.
     pkl = os.path.join(ART, tag, "baseline.pkl")
+    bars = None
+    name_fund = None
     if os.path.exists(pkl):
         try:
             import pickle
             with open(pkl, "rb") as f:
-                b = pickle.load(f)["result"].bars
+                res = pickle.load(f)["result"]
+            b = res.bars
+            bars = b
+            name_fund = getattr(res, "name_fund", None)
             net = b["net_ret"].to_numpy()
             rhs = (b["gross_ret"] - (b["fee"] + b["spread"] + b["impact"])
                    + b["funding"]).to_numpy()
@@ -163,12 +195,55 @@ def acceptance_checks(tag: str) -> List[Dict[str, object]]:
             })
             fund_total = headline(tag).get("Funding P&L (total, frac)")
             if fund_total is not None:
+                ft = float(fund_total)
                 rows.append({
-                    "criterion": "funding term is a credit (net receiver)",
-                    "value": f"funding P&L = {float(fund_total):+.4f}, "
-                             f"net - no_funding = {b_:+.4f}",
-                    "pass": bool(float(fund_total) >= 0 and b_ >= 0),
+                    "criterion": "funding term is a credit (roadmap expectation)",
+                    "value": f"funding P&L = {ft:+.4f}, net - no_funding = {b_:+.4f} "
+                             f"(both agree in sign -- that part IS a property)",
+                    "pass": bool(ft >= 0 and b_ >= 0),
                 })
+                # 3(c) **The sign is not a property of this strategy, and this row
+                #      exists so nobody re-derives that conclusion from scratch.**
+                #      The roadmap asserted "net receiver".  On the rebuilt data the
+                #      same configuration is a net *payer* (-3.0%), while on 2021-2024
+                #      alone it is a net receiver (+3.8%) -- so the sign is decided by
+                #      where the sample ends, not by the design of the book.  The net
+                #      is only ~14% of the gross funding, and a single instrument
+                #      outweighs the whole net.  Gating on it made the verdict depend
+                #      on the window, which is why the disclosure below is a row rather
+                #      than a footnote.  It is informational (`pass=None`) so it does
+                #      not change the gate count: the roadmap's criterion still reports
+                #      as FAILING, because it does.
+                disc = [f"funding P&L = {ft:+.4f}"]
+                if bars is not None:
+                    fr = bars["funding"]
+                    gross = float(fr.abs().sum())
+                    disc.append(f"net/gross = {abs(ft) / gross:.3f}" if gross else "n/a")
+                    disc.append("逐年 " + ", ".join(
+                        f"{y}:{v:+.1%}" for y, v in fr.groupby(fr.index.year).sum().items()))
+                if name_fund is not None:
+                    import numpy as _np
+                    per = _np.asarray(name_fund, dtype="float64").sum(axis=0)
+                    biggest = float(_np.abs(per).max()) if per.size else 0.0
+                    if biggest:
+                        disc.append(f"单币最大 |贡献| = {biggest:.4f} "
+                                    f"(净额是它的 {abs(ft) / biggest:.2f} 倍)")
+                rows.append({
+                    "criterion": "funding term: sign is NOT stable (informational)",
+                    "value": "; ".join(disc),
+                    "pass": None,
+                })
+                if bars is not None:
+                    fr = bars["funding"]
+                    early = fr[fr.index.year <= 2024].sum()
+                    late = fr[fr.index.year >= 2025].sum()
+                    rows.append({
+                        "criterion": "funding term: the sample split decides the sign "
+                                     "(informational)",
+                        "value": f"2021-2024 = {early:+.4f} (credit), "
+                                 f"2025-now = {late:+.4f} (cost)",
+                        "pass": None,
+                    })
 
     # 4. plateau, not spike
     mult = _read(tag, "16_multiplicity_summary.csv")

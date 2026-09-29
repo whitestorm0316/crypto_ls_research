@@ -2,48 +2,102 @@
 
 Single source of truth for:
   * which config fields the UI exposes, and how to render each one,
-  * the **verified-optimal defaults** (revision v3),
+  * the **verified-optimal defaults** (the accepted revision, see `OPTIMAL_TAG`),
   * the list of configurations this project has already *falsified*, so the
     console can warn before the user spends 40 minutes re-running a known
     dead end.
 
 The trap table is not decoration.  Every entry below cost a real experiment;
 the console exists partly so nobody has to pay for it twice.
+
+This module owns the *presentation* of the accepted configuration, not the
+numbers in it: the grid comes from `config.settings.ACCEPTED_REBALANCE_DAYS`,
+which is also what `execution.engine.DEFAULT_SIGNAL` reads.  A literal here is
+how the console and the desk end up describing two different strategies.
 """
 from __future__ import annotations
 
+# The accepted rebalance grid and factor set.  Imported, never re-typed:
+# `execution.engine` reads the same two constants, and the whole point is that
+# the desk's plan and the console's "已验收最优" cannot drift apart.  (The grid
+# did: the desk planned on 3 days while the daemon traded daily, and nothing
+# compared the two.  The factor set had the same exposure with no guard at all --
+# see `tests/test_accepted_factor_set.py`.)
+from crypto_ls_research.config.settings import (ACCEPTED_FACTORS,
+                                                ACCEPTED_REBALANCE_DAYS)
+
 # ---------------------------------------------------------------------------
-# the verified optimum (artifacts/OPTIMIZATION_RESULTS.md, tag `v3`)
+# the verified optimum (artifacts/OPTIMIZATION_RESULTS.md, tag `v5_1d_all5`)
 # ---------------------------------------------------------------------------
-OPTIMAL_TAG = "v3"
+#: The accepted revision's artifact namespace.  `v5_1d_all5` is the **five-factor
+#: set on the 1-day grid** -- the grid the unattended daemon trades and the
+#: factor set it now trades too, so the acceptance describes the configuration
+#: that is actually running.  It cleared 16/16 gates, and it is the **first tag
+#: on disk whose acceptance includes the three placebo nulls**: every earlier run
+#: was launched without `--stages mc`, so those criteria were silently absent
+#: from the count (`tests/test_acceptance_completeness.py`).
+#:
+#: Older bases stay on disk as records and remain comparable; they are simply no
+#: longer the basis:
+#:   * `v4_1d` -- two factors (`range_pos + hitrate`) on the 1-day grid,
+#:   * `v3`    -- two factors on the 3-day grid.
+#: See `artifacts/FINDINGS.md` Q22 (the grid move), Q32/Q33 (the factor move).
+OPTIMAL_TAG = "v5_1d_all5"
 OPTIMAL_CLI = {
     "bar": "1h",
-    "rebalance_days": 3.0,
+    "rebalance_days": ACCEPTED_REBALANCE_DAYS,
     "asset_class": "crypto",
 }
 OPTIMAL_OVERRIDES = {
-    "factors.subset": ["range_pos", "hitrate"],
+    "factors.subset": list(ACCEPTED_FACTORS),
     "portfolio.max_weight_per_instrument": 0.20,
     "execution.max_daily_turnover": 0.20,
 }
 
-# The headline recorded when v3 was accepted.  It is a **historical record**, not
-# the current truth: the console must report what the artifacts on disk say, so
-# `server.py::_headline` overrides every field it can measure from
-# `artifacts/v3/tables/01_headline_metrics.json` and keeps this dict only as the
-# fallback for fields with no artifact (and for when the tag has not been re-run).
+# The headline recorded when the accepted revision was measured.  It is a
+# **historical record**, not the current truth: the console must report what the
+# artifacts on disk say, so `server.py::_headline` overrides every field it can
+# measure from `artifacts/<OPTIMAL_TAG>/tables/01_headline_metrics.json` and keeps
+# this dict only as the fallback for fields with no artifact (and for when the tag
+# has not been re-run).
 #
-# This distinction is not pedantry.  After the market data was rebuilt the same
-# configuration measured Sharpe 1.758 instead of 1.937, so shipping this dict as
-# "the" headline made the page claim both numbers at once.
+# This distinction is not pedantry.  After the market data was rebuilt the 3-day
+# configuration measured Sharpe 1.758 instead of the recorded 1.937, so shipping a
+# recorded dict as "the" headline made the page claim both numbers at once.
+#
+# 2026-09-29 (a): the acceptance basis moved from the 3-day grid (`v3`) to the
+# 1-day grid (`v4_1d`) -- the one the daemon actually trades.
+# 2026-09-29 (b): the basis moved again, from the pruned two factors to all five
+# (`v5_1d_all5`).  The record below is that run.
+#
+# The two earlier bases, for reference (same dataset):
+#   * 1 day, two factors (`v4_1d`): Sharpe 1.821 / CAGR 32.53% / MDD −16.79%
+#     / 年换手 70.23 / 成本拖累 6.05%.
+#   * 3 days, two factors (`v3`): Sharpe 1.758 / CAGR 21.24% / MDD −7.57%
+#     / 年换手 23.90.
+# **Both numbers belong in any citation.**  The 1-day grid buys CAGR and Sharpe
+# and pays 2.22x the drawdown and 2.94x the turnover; the five-factor set buys
+# further on the same grid but **loses the locked 2026 slice** (2.172 vs 2.740)
+# and the two most recent calendar years -- see FINDINGS Q33 before quoting any
+# of this as an improvement.
 OPTIMAL_HEADLINE = {
-    "sharpe": 1.937327,
-    "cagr": 0.250868,
-    "mdd": -0.127185,
-    "dd_days": 245.92,
-    "cost_drag": 0.017090,
-    "funding": 0.020574,
-    "ann_turnover": 23.887,
+    "sharpe": 1.937163,
+    "cagr": 0.391165,
+    "mdd": -0.133149,
+    "dd_days": 155.83,
+    "cost_drag": 0.047710,
+    # `funding` is the field where the sign question matters most, so it is spelled
+    # out.  On this run the book measured **+0.091827** -- but the level is not
+    # comparable to the 1-day two-factor run's +0.0095, because the *same* table
+    # says the sign is decided by where the sample ends (2021-2024 = +0.1458
+    # credit, 2025-now = −0.0540 cost) and net/gross is 0.263.  The roadmap
+    # expected a net receiver; `optimize_report.acceptance_checks` reports that as
+    # a pass/fail gate and discloses the instability in two `pass=None`
+    # informational rows next to it.  So **do not quote this number as a property
+    # of the strategy**, and do not "fix" the acceptance by inverting the
+    # criterion -- see `tests/test_acceptance_funding.py`.
+    "funding": 0.091827,
+    "ann_turnover": 70.297,
     "acceptance": "16/16 通过",
 }
 
@@ -71,14 +125,20 @@ SPEC: dict = {
         {
             "id": "factors",
             "label": "因子",
-            "desc": "决定横截面打分用什么信号。这是全项目收益最大的一项——"
-                    "把冗余因子剪掉值 +0.371 Sharpe。",
+            "desc": "决定横截面打分用什么信号。这是全项目收益最大的一项："
+                    "在简报的 4 因子上**加** rev_short 值 +0.076 Sharpe，"
+                    "而 4 因子本身又优于把因子剪到只剩 2 个的旧口径。"
+                    "注意这一项的排序在换网格时会反转（见 FINDINGS Q32）。",
             "items": [
                 {"key": "factors.subset", "label": "因子子集", "type": "multi",
                  "options": FACTOR_NAMES, "level": "core",
                  "default": OPTIMAL_OVERRIDES["factors.subset"],
+                 # Derived, not typed: this sentence named the old optimum by hand
+                 # and would have kept saying `range_pos + hitrate` after the basis
+                 # moved to all five.  A help string is a number like any other.
                  "help": "复合打分实际使用的因子。被选中的因子按 profile 权重内部重新归一化。"
-                         "★ 实测最优 = range_pos + hitrate。"},
+                         "★ 实测最优 = " + " + ".join(OPTIMAL_OVERRIDES["factors.subset"])
+                         + "。"},
                 {"key": "factors.neutralize", "label": "因子中性化", "type": "bool",
                  "default": False, "level": "core",
                  "help": "让每个因子只保留与其余因子正交的部分。"
@@ -279,9 +339,11 @@ SPEC: dict = {
          "options": ["15m", "1h", "4h"], "default": "1h", "level": "core",
          "help": "★ 1h 最优。15m 会让换手成本吃掉全部收益。"},
         {"key": "_cli.rebalance_days", "label": "调仓间隔（日）", "type": "number",
-         "default": 3.0, "min": 0.25, "max": 30.0, "step": 0.25, "level": "core",
-         "help": "★ 3 天最优。信号是慢的（4h IC 为负、7d IC 才转正），"
-                 "高频调仓必亏。"},
+         "default": 1.0, "min": 0.25, "max": 30.0, "step": 0.25, "level": "core",
+         "help": "★ 当前验收口径 = **1 天**（`v4_1d`），与守护进程实际跑的网格一致。"
+                 "代价必须一起说：1 天档换手约为 3 天的 2.9 倍、回撤约 2.2 倍深。"
+                 "3 天（`v3`）的产物仍在盘上，可作对照。"
+                 "具体数值以 /api/spec 实算为准，不写死在这里。"},
         {"key": "_cli.asset_class", "label": "池子范围", "type": "select",
          "options": ["crypto", "all"], "default": "crypto", "level": "core",
          "help": "crypto = 剔除 OKX 上代币化股票/ETF 与商品标的。"
@@ -320,11 +382,15 @@ STAGE_BUNDLES = [
 # ---------------------------------------------------------------------------
 PRESETS = [
     {
-        "id": "v3_optimal", "label": "v3 已验收最优", "badge": "默认",
+        "id": "v3_optimal", "label": "已验收最优 · 1 天网格", "badge": "默认",
         # 这里**不写指标数字**：它们由 server.py 在 /api/spec 里按产物现算后填进来
         # （见 `_presets`）。写死过一次，数据重建后选择器和页头就对不上了。
-        "desc": "因子取 range_pos + hitrate、换手预算 20%、单名上限 20%、"
-                "1h 频率 3 天调仓、crypto 池。",
+        # 因子名同理——它曾写死成 `range_pos + hitrate`，口径换到五因子后会继续
+        # 说旧的那套。现在从 `OPTIMAL_OVERRIDES` 派生，改口径它自己跟着变。
+        # `id` 保持 `v3_optimal` 是因为前端按 id 选中它；验收口径已改为 1 天网格 +
+        # 五因子（`OPTIMAL_TAG = v5_1d_all5`），见文件顶部。
+        "desc": "因子取 " + " + ".join(OPTIMAL_OVERRIDES["factors.subset"])
+                + "、换手预算 20%、单名上限 20%、1h 频率 1 天调仓、crypto 池。",
         "cli": dict(OPTIMAL_CLI), "overrides": dict(OPTIMAL_OVERRIDES),
     },
     {
@@ -348,8 +414,9 @@ PRESETS = [
             "execution.max_daily_turnover": 0.20},
     },
     {
-        "id": "four_factors", "label": "四因子（不剪枝）",
-        "desc": "保留规格的四个因子，其余取最优。用来单独看「剪因子」值多少。",
+        "id": "four_factors", "label": "四因子（旧规格默认）",
+        "desc": "简报的四个因子，其余取最优。曾经是「剪枝」的对照组，现在反过来"
+                "成了**加因子**的对照组：加上 rev_short 值 +0.076 Sharpe。",
         "cli": dict(OPTIMAL_CLI), "overrides": {
             "factors.subset": ["momentum", "flow", "range_pos", "hitrate"],
             "portfolio.max_weight_per_instrument": 0.20,
@@ -365,9 +432,11 @@ PRESETS = [
             "execution.max_daily_turnover": 0.20},
     },
     {
-        "id": "add_rev_short", "label": "加短周期反转",
-        "desc": "把 rev_short 放进子集——实测该 book 毛 Sharpe 全为负，"
-                "属已否决方向。",
+        "id": "add_rev_short", "label": "2 因子 + rev_short（3 因子）",
+        "desc": "在旧的 2 因子口径上再加 rev_short。全样本 1 天网格上它**抬高** "
+                "Sharpe（1.862→1.937），但 3 天网格排序反转、逐年折 test 均值不占优。"
+                "rev_short 现在是验收口径的一部分，这条留作「只加它、不加另外两个」"
+                "的对照。",
         "cli": dict(OPTIMAL_CLI), "overrides": {
             "factors.subset": ["range_pos", "hitrate", "rev_short"],
             "portfolio.max_weight_per_instrument": 0.20,
@@ -399,12 +468,49 @@ def check_traps(ov: dict, cli: dict) -> list:
             })
         if "rev_short" in subset:
             out.append({
-                "sev": "high", "key": "factors.rev_short",
-                "title": "反转腿已被实测否决",
-                "body": "5 个 horizon 的独立反转 book 毛 Sharpe 全为负"
-                        "（−0.569 / −0.976 / −0.966 / −0.832 / −0.859），"
-                        "方向没写反（rev_short = −rev_raw/vol）。与其混合的 45 个权重"
-                        "格子里最优权重全是 0.0。注意措辞限定为「本实现下不成立」。",
+                # `sev` is no longer "high": `rev_short` is now part of the
+                # *accepted* configuration (`config.settings.ACCEPTED_FACTORS`), so
+                # this entry fires on the console's own default preset.  Greeting
+                # the user's optimum with a red 「已被否决」 banner would be a lie
+                # about the basis.  The verdict changed shape with the basis; the
+                # *evidence* did not change and must not be deleted -- see
+                # `tests/test_accepted_factor_set.py`, which pins both halves.
+                "sev": "info", "key": "factors.rev_short",
+                "title": "反转腿已并入验收口径 —— 稳健性是已知保留项",
+                # History of this entry, because it has been wrong twice:
+                #   1. it quoted five gross Sharpes (-0.569 / -0.976 / ...) that match
+                #      **no artifact on disk** and carried no `RECORDED_NOTE`, while
+                #      the neutralisation entry above does carry one.  The numbers are
+                #      gone rather than refreshed: the sign plus the artifact/column
+                #      name is the traceable form and cannot silently go stale.
+                #   2. it argued from the *standalone book* while the user was changing
+                #      a *composite component*, where rev_short measurably raises
+                #      Sharpe.  A warning whose reason is about a different
+                #      construction than the one being changed teaches the user to
+                #      ignore the table.
+                "body": "**已采纳**，所以这不是「被否决的配置」，而是一条保留项披露。"
+                        "**支持**：它自己的 rank IC 在 1–12 根 bar（≤0.5 天）上显著为正"
+                        "（t=2.5 / 4.6 / 3.2），到 3 天归零、7 天转负；与另外四个因子的"
+                        "相关是 −0.20…−0.49；作为复合分量把全样本 1 天 Sharpe 从 1.862 "
+                        "抬到 1.937（`34_neutralisation_study.csv`）。"
+                        "**保留**：① 换到 3 天网格排序**反转**（1.762 → 1.581）；"
+                        "② 逐年折 test Sharpe 均值不占优（2.029 vs 1.957）而 train 均值"
+                        "高得多（1.872 vs 1.503）—— 拟合的形状；"
+                        "③ **锁定的 2026 段反而更差**（2.740 → 2.172），逐年里 2024 与 "
+                        "2026H1+ 两年退步；"
+                        "④ 复合分数在**实际交易的那个 horizon**（1 天）上 IC 掉到不显著"
+                        "（+0.0225/t=3.10 → +0.0051/t=0.70）—— 收益改善来自选股与分散，"
+                        "不是分数变强。"
+                        "**仍然成立的**：作为**独立 book** 它亏钱 —— 5 个 horizon 的毛 "
+                        "Sharpe 全为负，book 层混合的 45 个权重格子里最优权重也全是 0.0"
+                        "（`at_boundary=true`、`plateau=false`），见 "
+                        "`30_reversal_book.csv` 的 `Sharpe_gross` 列与 "
+                        "`31b_blend_summary.json`。方向没写反（rev_short = −rev_raw/vol）。"
+                        "**零假设检验**（`22_montecarlo_summary.json`，盘上第一份）：三种"
+                        "置换 p = 0.0050 / 0.0050 / 0.0323，安慰剂组合平均 Sharpe "
+                        "−0.74…−1.13 —— 排序确实带信息，不是运气。"
+                        "复现：`scripts/exp_factor_set_grid.py`、"
+                        "`scripts/exp_market_vs_strategy.py`。",
             })
         if not subset:
             out.append({"sev": "high", "key": "factors.subset",
@@ -493,7 +599,9 @@ def build_run_args(ov: dict, cli: dict, stages: list, tag: str, n_jobs: int = 4)
         "-m", "crypto_ls_research.run.research",
         "--tag", tag,
         "--bar", str(cli.get("bar", "1h")),
-        "--rebalance-days", str(cli.get("rebalance_days", 3.0)),
+        # 兜底值取**当前验收口径**（`OPTIMAL_CLI`），不写死数字：验收口径已经换过一次
+        # （3 天 → 1 天），写死的 3.0 会在 cli 缺键时静默跑出一个不是口径的网格。
+        "--rebalance-days", str(cli.get("rebalance_days", OPTIMAL_CLI["rebalance_days"])),
         "--asset-class", str(cli.get("asset_class", "crypto")),
         "--start", str(cli.get("start", "2021-01-01")),
         "--end", str(cli.get("end", "2026-09-26")),

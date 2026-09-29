@@ -40,17 +40,49 @@ for _s in ("stdout", "stderr"):
 # appears immediately even when launched straight from a shell.
 os.environ.setdefault("PYTHONUNBUFFERED", "1")
 
+#: 调仓网格。**取已验收口径本身**，不在这里再写一个字面量：这个数同时被
+#: `engine.DEFAULT_SIGNAL`（交易台的计划）、`webapp/spec.OPTIMAL_CLI`（控制台的
+#: 「已验收最优」）和守护进程读。曾经 `DEFAULT_SIGNAL` 写 3.0、这个脚本写 1.0、
+#: 守护进程命令行又传 1，三处各有一个数，结果是守护进程每天调仓、交易台却生成
+#: 3 天的计划并显示「下次调仓」在 3 天后 —— 没有任何地方报错。
+from crypto_ls_research.config.settings import (  # noqa: E402
+    ACCEPTED_REBALANCE_DAYS as REBALANCE_DAYS)
+
 MODE = "demo"
-REBALANCE_DAYS = 1.0
 INTERVAL_MIN = 30.0
 BAR = "1h"
+#: 数据落后超过这么多小时就先增量刷新。**必须小于一根 bar。**
+#:
+#: `bar_age_hours` 量的是 bar 的**开盘**时间（`engine.py` 里 `newest_cached_bar`
+#: 返回的是 bar 标签 = 开盘时刻），所以刷新刚做完时 `bar_age` 就已经 ≈1.17h。
+#: 阈值设 1.0 的效果不是"每小时刷新"而是"每个 tick 都刷新"；设 2.0 才是每小时。
+#:
+#: 为什么必须小于一根 bar：到期窗口只有 **2 根 bar 宽** ——
+#: `rebalance_window_open` 在 `bars_since_decision == 1` 时为真，而补了「执行
+#: bar」之后这个状态横跨两个面板状态（末尾落在网格点 G、以及落在它后一根 G+1），
+#: 两态是同一笔决策、互为幂等复查。面板每刷新一次最多前进 1 根 bar，所以刷新间隔
+#: 必须 < 1h：到了 1h，漏掉一个 tick 就会让面板一次前进 2 根，`since` 从 0 直接
+#: 跳到 2，**整个窗口被跨过去，整天不成交而日志全是 `not_due`**。
+REFRESH_AFTER_HOURS = 1.0
 #: 执行窗口（本地时间 HH:MM）。**留空 = 不强制，严格跟随回测网格。**
 #:
-#: 当前默认留空，因为下单时刻已经等于回测锚点：调仓网格锚在 UTC02:00
-#: （北京 10:00）产生信号，回测的执行价用的是**下一根 bar 的开盘价**
-#: （`exec_price=next_open`）＝ 北京 11:00，而守护进程的自然到期闸门
-#: `due = bars_since_decision >= R` 也恰好在面板确认那根 bar 后打开
-#: （同样是北京 11:00）。三者天然对齐，**不需要任何窗口来「挪」下单时刻**。
+#: 当前默认留空：守护进程的自然到期闸门已经按回测口径打开，不需要窗口来「挪」
+#: 下单时刻。但**下单时刻并不等于回测的执行价时刻**，这点必须说清楚：
+#:
+#:   信号 bar    UTC 02:00 = 北京 10:00（网格锚点，`dec_idx` 决定）
+#:   回测执行价  UTC 03:00 = 北京 11:00（`exec_price = next_open`）
+#:   守护进程    ≈ 北京 11:10 打开窗口（实测）
+#:
+#: 2026-09-29 修掉了链条末端两处各自 1 小时的**人为**延迟（此前窗口 = 北京
+#: 13:10–14:10）：
+#:   ① `load_panels` 固定丢掉缓存里最新那根（`data/store.py` 的
+#:      `inclusive="left"` off-by-one）→ 实盘路径改走 `extend_to_last=True`；
+#:   ② `dec_idx` 结构上够不到面板最后一行，所以网格点自己那根记不了账 →
+#:      `signal.book_with_execution_bar` 在需要时补一根「执行 bar」。
+#: 两处都不改回测入口，所以 v3 的存档数字不动。
+#:
+#: 修完窗口 = **北京 11:10–13:10**（2 根 bar 宽：面板末尾落在网格点、以及落在它
+#: 后一根，两态同解），30 分钟 tick 有 4 次机会。此前只有 1 根 bar 宽、2 次机会。
 #:
 #: 反过来，若把窗口设成 10:00，会**强行覆盖**到期闸门：10:00 时最新决策点
 #: 就是刚产生的那根 bar，窗口每天都会照发一遍同样的目标书，把换手预算
@@ -80,6 +112,9 @@ def main(argv: list) -> int:
     print(f"  模式        : {MODE}（OKX 模拟盘，真实撮合，不花真钱）")
     print(f"  调仓网格    : 每 {REBALANCE_DAYS:g} 天一次")
     print(f"  检查间隔    : 每 {INTERVAL_MIN:g} 分钟")
+    print(f"  刷新阈值    : 落后 {REFRESH_AFTER_HOURS:g} 小时就增量刷新"
+          f"（{'每个 tick 都刷新' if REFRESH_AFTER_HOURS <= 1.0 else '约每 '
+             f'{REFRESH_AFTER_HOURS:g} 小时'}）")
     print(f"  执行窗口    : "
           + (f"{EXEC_WINDOW} 本地时间（±{EXEC_WINDOW_TOL:g} 分钟）—— 偏离回测网格"
              if EXEC_WINDOW else "无（严格跟随回测网格）"))
@@ -95,9 +130,11 @@ def main(argv: list) -> int:
     else:
         print()
         print("  下单时刻 = 信号产生后立即执行（与回测口径一致）：")
-        print("    信号 bar  北京 10:00（UTC02:00）→ 回测执行价取下一根 bar 开盘"
-              "＝北京 11:00")
-        print("    守护进程在面板确认那根 bar 后自然到期（`due`），两者天然对齐。")
+        print("    信号 bar   北京 10:00（UTC02:00）—— 回测网格锚点")
+        print("    回测执行价 北京 11:00 —— 下一根 bar 的开盘价")
+        print("    实际下单   ≈ 北京 11:10 —— 网格点那根 bar 一收盘，"
+              "实盘路径就补一根执行 bar 把账记上")
+        print("    窗口 11:10–13:10（2 根 bar 宽），30 分钟 tick 有四次机会。")
     print()
 
     # --- 1. notify must be live, or the desk is silent -------------------
@@ -143,7 +180,8 @@ def main(argv: list) -> int:
                        interval_min=INTERVAL_MIN, bar=BAR, dry_run=dry_run,
                        exec_window=EXEC_WINDOW or None,
                        exec_window_tol=EXEC_WINDOW_TOL,
-                       exec_window_utc=False)
+                       exec_window_utc=False,
+                       refresh_after_hours=REFRESH_AFTER_HOURS)
     if not r.get("ok"):
         print(f"  [FAIL] 启动失败：{r.get('error')}")
         return 5

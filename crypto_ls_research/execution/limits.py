@@ -85,7 +85,8 @@ def check_plan(plan: Plan, limits: LiveLimits, *, mode: str, nav: float,
                rebalance_due: bool = True, force: bool = False,
                actions: Sequence[str] = ("rebalance",),
                leverage: Optional[float] = None,
-               venue_insts: Optional[Iterable[str]] = None) -> List[Violation]:
+               venue_insts: Optional[Iterable[str]] = None,
+               rebalance_days: Optional[float] = None) -> List[Violation]:
     """Return every problem with this plan.  An empty list means "cleared".
 
     `force=True` downgrades `require_rebalance_due` only -- it never relaxes a
@@ -105,6 +106,14 @@ def check_plan(plan: Plan, limits: LiveLimits, *, mode: str, nav: float,
     rejected one by one with `51001`, which is worth saying *before* the send.
     A warning, not a block: on demo these names are unplaceable by definition,
     and refusing to rebalance at all would be worse than trading the rest.
+
+    `rebalance_days` is the grid the plan was actually built on, used only to
+    narrate the `not_due` warning.  It is a parameter rather than a literal
+    because the grid is a configuration value that has already changed once
+    (3 days -> 1 day, 2026-09-29): the message used to assert 「每 3 天调仓一次」
+    no matter what the desk was running, so the warning explained the deviation
+    using a schedule nobody was on.  `None` means "unknown" and is narrated as
+    such rather than guessed.
     """
     v: List[Violation] = []
     closing_only = all(a in ("flatten", "close") for a in actions)
@@ -230,9 +239,11 @@ def check_plan(plan: Plan, limits: LiveLimits, *, mode: str, nav: float,
                 "策略的每日换手预算是 20% 毛敞口；一次调仓换掉整个账户一定是出错了。"))
 
     if limits.require_rebalance_due and not rebalance_due and not force and not closing_only:
+        grid = ("每 %.3g 天调仓一次" % float(rebalance_days)
+                if rebalance_days else "按固定网格调仓")
         v.append(Violation(
             "warn", "not_due", "当前不是调仓日",
-            "策略每 3 天调仓一次；现在执行属于计划外操作，需要显式勾选「强制」。"))
+            f"策略{grid}；现在执行属于计划外操作，需要显式勾选「强制」。"))
 
     if mode == "live":
         v.append(Violation(

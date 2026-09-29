@@ -44,6 +44,10 @@ from crypto_ls_research.execution.okx_private import (
 from crypto_ls_research.execution.planner import build_plan
 from crypto_ls_research.execution.signal import LiveTarget
 from crypto_ls_research.execution.specs import InstSpec, SPECS_CACHE
+from crypto_ls_research.backtest.engine import run_backtest
+from crypto_ls_research.data import store as data_store
+
+from .conftest import synth_cfg, synth_panels
 
 
 # ---------------------------------------------------------------------------
@@ -1650,6 +1654,195 @@ def test_book_from_account_normalises_the_display_list():
 
 
 # ---------------------------------------------------------------------------
+# the execution window is an edge, not a level
+#
+# `due` used to be `bars_since_decision >= R`, which is true only when the
+# panel's last bar IS a grid point.  But a grid point cannot be booked while it
+# is the panel's last bar (exec price is `next_open`), so at that instant the
+# newest booked rebalance was still the PREVIOUS grid point -- and the desk
+# traded a book one whole rebalance period stale.  Nothing raised.  The
+# positions were simply a day (or three) old.
+# ---------------------------------------------------------------------------
+def test_the_window_is_open_on_exactly_one_bar_past_a_grid_point():
+    """`== 1`, not `>= R`.  This is the regression guard for the stale book."""
+    assert signal_mod.rebalance_window_open(1) is True
+
+
+def test_the_old_level_trigger_is_not_the_window():
+    """`bars_since_decision == R` means the panel is sitting ON the grid point.
+
+    That is one bar *before* the window: the grid point's own rebalance is not
+    bookable yet, so `target` is still the previous period's book.  Firing here
+    is exactly the bug.
+
+    The live path no longer reports this state at all -- it appends the execution
+    bar instead, so a panel ending on a grid point reports `since == 1` (see
+    `test_the_appended_execution_bar_books_what_the_next_bar_would_have`).  The
+    rule stays pinned anyway: it is the one-line change that would reintroduce a
+    book a full period stale, and nothing else would go red.
+    """
+    for R in (24, 72):                                   # 1-day and 3-day grids
+        assert signal_mod.rebalance_window_open(R) is False, R
+
+
+def test_the_window_is_not_open_everywhere_else_either():
+    """Guard the other direction: a level trigger would rebalance every tick."""
+    for since in (0, 2, 3, 23, 25, 71, 73):
+        assert signal_mod.rebalance_window_open(since) is False, since
+
+
+# ---------------------------------------------------------------------------
+# the execution bar
+#
+# `run_backtest` books a rebalance at bar `t` from the decision taken at `t - 1`,
+# so the panel's last row is the bar the desk is TRADING AT -- not merely the last
+# bar whose OHLC is known.  `dec_idx = arange(warmup + off, T - 1, R)` therefore
+# excludes the panel's last row, and a panel that stops on a grid point cannot book
+# that grid point at all: `rebalances[-1]` is still the PREVIOUS one.
+#
+# Waiting for the next bar to *close* cost a whole hour at 1h bars even though the
+# only field the engine reads from it -- the fill price `open[T-1]` -- is known the
+# instant the bar opens.  Measured 2026-09-29 on the real cache (R=24, 1-day grid):
+# the panel stopped at 09-29T02:00Z, the newest cached candle was 03:00Z, and the
+# desk could not trade until 北京 13:19 -- two hours after bar G closed at 11:00.
+# ---------------------------------------------------------------------------
+def _cut(p, n: int):
+    """The first `n` rows of a panel, i.e. a panel that ends at `p.index[n - 1]`."""
+    import dataclasses
+    return dataclasses.replace(
+        p, **{f: getattr(p, f).iloc[:n]
+              for f in ("open", "high", "low", "close", "vol", "vol_ccy",
+                        "amount", "funding")})
+
+
+def test_the_grid_point_check_fires_on_exactly_one_bar_of_the_period():
+    """One bar too eager and the panel is pushed PAST the grid point, so
+    `bars_since_decision` becomes 2 and the desk never trades at all; one bar too
+    shy and it trades the previous period's book.  Both are silent."""
+    R = 24
+    g = pd.Timestamp("2026-09-29T02:00:00+00:00")            # the grid point
+    booked = g - R * pd.Timedelta(hours=1)                   # what the engine recorded
+
+    assert signal_mod.needs_execution_bar(g, booked, R, "1h") is True
+    for k in (-1, 1, 2, 23, 25):
+        assert signal_mod.needs_execution_bar(
+            g + k * pd.Timedelta(hours=1), booked, R, "1h") is False, k
+    # a 1-bar grid gets the same treatment: the appended bar is never a decision bar
+    assert signal_mod.needs_execution_bar(g, g - pd.Timedelta(hours=1), 1, "1h") is True
+
+
+def _grid_point_index(p, cfg) -> int:
+    """A grid point comfortably inside the panel, derived from the engine itself."""
+    a = int(run_backtest(p, cfg).meta["warmup_bars"])
+    return a + int(cfg.rebalance_bars) * 27
+
+
+def test_the_panel_cannot_book_the_grid_point_it_ends_on():
+    """The regression: without the execution bar the desk is a period stale."""
+    p = synth_panels(n_inst=8, n_bars=3000, bar="15m")
+    cfg = synth_cfg("15m")
+    i = _grid_point_index(p, cfg)
+    p_on = _cut(p, i + 1)                       # panel ends ON the grid point
+
+    last = run_backtest(p_on, cfg).rebalances[-1]
+
+    assert pd.Timestamp(last["ts"]) == p.index[i - int(cfg.rebalance_bars)], \
+        "面板末尾那个调仓点被记账了 —— 前提变了，下面那条等值测试就不再是同一个问题"
+    assert pd.Timestamp(last["ts"]) < p_on.index[-1]
+
+
+def test_the_appended_execution_bar_books_what_the_next_bar_would_have():
+    """The equality the live path depends on, measured on a real backtest.
+
+    Appending a copy of the last closed bar must give the SAME book as waiting for
+    the next bar to arrive -- same legs, same weights, same `exec_ts`.  If this ever
+    drifts, the desk trades something the backtest never booked.
+    """
+    p = synth_panels(n_inst=8, n_bars=3000, bar="15m")
+    cfg = synth_cfg("15m")
+    i = _grid_point_index(p, cfg)
+
+    appended = run_backtest(
+        signal_mod._append_execution_bar(_cut(p, i + 1), "15m"), cfg).rebalances[-1]
+    natural = run_backtest(_cut(p, i + 2), cfg).rebalances[-1]
+
+    assert pd.Timestamp(appended["ts"]) == p.index[i]
+    assert pd.Timestamp(appended["exec_ts"]) == p.index[i + 1]
+    assert appended["exec_ts"] == natural["exec_ts"]
+    for k in ("long", "short", "w_long", "w_short", "exposure", "scale",
+              "long_gross", "short_gross"):
+        assert appended[k] == natural[k], f"{k} 与「等下一根 bar」的结果不一致"
+
+
+def test_the_call_site_actually_appends_when_the_panel_ends_on_a_grid_point():
+    """The append has to happen in the live path, not merely be available.
+
+    `_append_execution_bar` is correct in isolation; the failure this guards is the
+    call site declining to use it, which leaves the desk a full period stale with
+    nothing in the log to show for it.  And the reverse: appending one bar late
+    pushes the panel PAST the grid point, `bars_since_decision` reads 2, and the
+    desk never trades at all.
+    """
+    p = synth_panels(n_inst=8, n_bars=3000, bar="15m")
+    cfg = synth_cfg("15m")
+    i = _grid_point_index(p, cfg)
+
+    p_on, res_on, appended = signal_mod.book_with_execution_bar(_cut(p, i + 1), cfg, "15m")
+    assert appended is True, "面板末尾就在调仓点上，却没有补执行 bar"
+    assert len(p_on.index) == i + 2
+    assert pd.Timestamp(res_on.rebalances[-1]["ts"]) == p.index[i]
+    assert pd.Timestamp(res_on.rebalances[-1]["exec_ts"]) == p.index[i + 1]
+
+    p_past, res_past, appended_past = signal_mod.book_with_execution_bar(
+        _cut(p, i + 2), cfg, "15m")
+    assert appended_past is False, "面板已经走过调仓点，再补一根就把它推过头了"
+    assert len(p_past.index) == i + 2
+    assert pd.Timestamp(res_past.rebalances[-1]["ts"]) == p.index[i]
+
+
+def test_the_execution_bar_carries_only_what_the_last_closed_bar_knew():
+    """No look-ahead: the appended row is a copy, so it adds no information."""
+    p = synth_panels(n_inst=6, n_bars=500, bar="1h")
+    q = signal_mod._append_execution_bar(p, "1h")
+
+    assert len(q.index) == len(p.index) + 1
+    assert q.index[-1] == p.index[-1] + pd.Timedelta(hours=1)
+    assert list(q.insts) == list(p.insts)
+    assert q.list_dt.equals(p.list_dt)
+    for f in ("open", "high", "low", "close", "vol", "vol_ccy", "amount", "funding"):
+        pd.testing.assert_series_equal(getattr(q, f).iloc[-1],
+                                       getattr(p, f).iloc[-1], check_names=False)
+
+
+def test_extend_to_last_reaches_the_newest_cached_bar(tmp_path):
+    """The default stops one bar short of the cache; `extend_to_last` reaches it.
+
+    `pd.date_range(..., inclusive="left")` treats `end` as exclusive, so the rebuild
+    that is supposed to "extend to the last available bar" always stopped one bar
+    short whenever the newest candle sat past `end` -- the normal case for a live
+    caller passing today's date.  The default keeps that behaviour because every
+    archived v3 number was produced with it; the live path opts out.
+    """
+    cdir = tmp_path / "candles" / "1h"
+    cdir.mkdir(parents=True)
+    idx = pd.date_range("2026-09-28 00:00", periods=30, freq="1h", tz="UTC")
+    px = pd.Series(range(100, 130), index=idx, dtype="float64")
+    for inst in ("A-USDT-SWAP", "B-USDT-SWAP"):
+        pd.DataFrame({"open": px, "high": px, "low": px, "close": px,
+                      "vol": 1.0, "vol_ccy": 1.0, "amount": 1e6}
+                     ).to_parquet(cdir / f"{inst}.parquet")
+
+    end = idx[-3].strftime("%Y-%m-%d %H:%M")        # a bound BEHIND the newest bar
+    short = data_store.load_panels("1h", "2026-09-28", end, cache=str(tmp_path))
+    full = data_store.load_panels("1h", "2026-09-28", end, cache=str(tmp_path),
+                                  extend_to_last=True)
+
+    assert short.index[-1] == idx[-2], "默认行为变了（存档结果依赖它）"
+    assert full.index[-1] == idx[-1], "extend_to_last 没取到最新那根"
+    assert len(full.index) == len(short.index) + 1
+
+
+# ---------------------------------------------------------------------------
 # signal cache round trip
 #
 # The worst bug this desk has had was not a wrong number -- it was a *second
@@ -1708,6 +1901,73 @@ def test_a_cache_hit_reaches_the_return_a_miss_would_have(monkeypatch):
     assert t.from_cache is True
     assert t.decision_ts == "2026-09-26T00:00:00Z"
     assert t.rebalance_due is False
+
+
+# ---------------------------------------------------------------------------
+# the cache key must notice a code change
+#
+# `_cache_key` used to be built from data + params only.  A fix to the signal
+# path therefore stayed invisible for up to `ttl` (30 min) and the daemon kept
+# serving a target -- including a `rebalance_due=False` -- computed by the
+# PREVIOUS version.  That symptom is the worst kind: the restart looks like it
+# did not take effect, and the desk silently skips the very window it was just
+# fixed to catch.  `_code_signature()` is the guard.
+# ---------------------------------------------------------------------------
+def _key(**over) -> str:
+    base = dict(bar="1h", rebalance_days=1.0, asset_class="crypto",
+                start="2021-01-01", end="2026-01-01", overrides={},
+                data_sig="D", code_sig="C")
+    base.update(over)
+    return signal_mod._cache_key(**base)
+
+
+def test_the_code_signature_is_part_of_the_cache_identity():
+    """A different code signature must give a different key -- and a same one must not."""
+    assert _key(code_sig="C1") != _key(code_sig="C2")
+    assert _key(code_sig="C1") == _key(code_sig="C1")      # not accidentally unique
+    assert _key(data_sig="D2") != _key()                   # the older half still works
+
+
+def test_the_code_fingerprint_comes_from_the_files_not_from_a_constant():
+    """A constant would make the guard silently absent while looking present."""
+    sig = signal_mod._code_signature()
+    assert "missing" not in sig, sig
+    parts = sig.split("|")
+    assert len(parts) == 2, parts
+    for part in parts:
+        mtime, sep, size = part.partition(":")
+        assert sep == ":" and mtime.isdigit() and size.isdigit(), part
+    # the first component is this module: compare it against the real stat, so a
+    # helper that returned a plausible-looking literal would still fail.
+    st = os.stat(signal_mod.__file__)
+    assert parts[0] == f"{int(st.st_mtime)}:{st.st_size}"
+
+
+class _KeySeen(Exception):
+    """Raised by the `_read_cache` spy so the call site stops before the rebuild."""
+
+
+def test_a_code_change_reaches_the_cache_key_through_the_call_site(monkeypatch):
+    """`_code_signature()` must be *in the key the call site builds*.
+
+    Testing `_cache_key` alone would not catch the interesting mistake: the helper
+    can be perfect and still be dropped from the call.  So drive the real entry
+    point and read the key it actually asked the cache for.
+    """
+    seen: list = []
+
+    def spy(key, ttl):
+        seen.append(key)
+        raise _KeySeen
+
+    monkeypatch.setattr(signal_mod, "_read_cache", spy)
+    for sig in ("code-v1", "code-v2"):
+        monkeypatch.setattr(signal_mod, "_code_signature", lambda s=sig: s)
+        with pytest.raises(_KeySeen):
+            signal_mod.compute_live_target(bar="1h", rebalance_days=1.0,
+                                           use_cache=True, end="2026-01-01")
+    assert len(seen) == 2, seen
+    assert seen[0] != seen[1], "代码变了却拿到同一个 cache key → 会继续吃旧 payload"
 
 
 def test_a_cached_payload_missing_a_required_field_fails_with_a_useful_message():

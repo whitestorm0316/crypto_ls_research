@@ -204,11 +204,20 @@ def _orders_for_instrument(inst: str, cur_sz: float, tgt_sz: float, pos_mode: st
     if abs(cur_sz) <= EPS:
         legs.append(leg("buy" if tgt_sz > 0 else "sell", ps, abs(tgt_sz), "open"))
         return legs
-    d = abs(tgt_sz) - abs(cur_sz)
+    # The side must come from the *signed* delta.  In `long_short_mode` `posSide`
+    # names which book the order acts on and `side` is the direction, so
+    # **increasing a short is a SELL** (and reducing it is a BUY).  Deriving the
+    # side from `abs(tgt) - abs(cur)` throws that sign away and sends every
+    # short leg backwards -- which is silent: the order is accepted, the position
+    # just moves the wrong way.  Measured consequence on the demo account before
+    # this fix: 7 longs at $9,431 against 5 shorts at $817, i.e. a book that is
+    # **92% long** while the strategy targets 47.6% long, so the market-neutral
+    # claim was not being executed at all.
+    d = tgt_sz - cur_sz
     if abs(d) <= EPS:
         return []
     legs.append(leg("buy" if d > 0 else "sell", ps, abs(d),
-                    "increase" if d > 0 else "reduce"))
+                    "increase" if abs(tgt_sz) > abs(cur_sz) else "reduce"))
     return legs
 
 

@@ -74,7 +74,14 @@ def list_cached_insts(bar: str, cache: str = CACHE) -> List[str]:
 
 
 def load_panels(bar: str, start: str, end: str, insts: Optional[List[str]] = None,
-                cache: str = CACHE, drop_unconfirmed: bool = True) -> Panels:
+                cache: str = CACHE, drop_unconfirmed: bool = True,
+                extend_to_last: bool = False) -> Panels:
+    """Load the cache into aligned wide panels.
+
+    `extend_to_last=True` makes the grid reach the newest cached candle itself.
+    The default does not, because every archived v3 number was produced with the
+    off-by-one below in place -- see the comment at the grid construction.
+    """
     cdir = os.path.join(cache, "candles", bar)
     # OKX retains only ~3 months of funding settlements, so long backtests read the
     # spliced OKX+Binance series ("funding_hyb").  Set FUNDING_DIR=funding to force
@@ -117,8 +124,15 @@ def load_panels(bar: str, start: str, end: str, insts: Optional[List[str]] = Non
                          freq=step, inclusive="left")
     # extend to the last available bar so the tail of the sample is not truncated
     last = max(df.index[-1] for df in raw.values() if len(df))
-    if last > grid[-1]:
-        grid = pd.date_range(grid[0], last, freq=step, inclusive="left")
+    # `inclusive="left"` treats `end` as exclusive, so whenever `last` sat past
+    # `end` the rebuild below stopped one bar SHORT of the newest cached candle,
+    # and `grid <= last` cannot recover a timestamp that was never generated.
+    # Every archived v3 number was produced with that off-by-one in place, so the
+    # default keeps it; `extend_to_last=True` reaches `last` itself, which the live
+    # signal path needs (see `execution.signal.compute_live_target`).
+    stop = last + step if extend_to_last else last
+    if stop > grid[-1]:
+        grid = pd.date_range(grid[0], stop, freq=step, inclusive="left")
     grid = grid[grid <= last]
 
     def wide(field: str) -> pd.DataFrame:

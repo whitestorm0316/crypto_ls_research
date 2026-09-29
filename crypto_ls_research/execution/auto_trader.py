@@ -57,10 +57,13 @@ Every decision, **including every skip**, is appended to `auto.jsonl` and
 mirrored into `auto.json`, because "it has been running for a week" and "it died
 on the first night" look identical from the outside.
 
-The strategy is `engine.DEFAULT_SIGNAL` -- the v3 verified configuration (1h
-bars, 3-day rebalance, `range_pos`+`hitrate`, 20% daily turnover throttle).  It
-is the same object the console shows as 「当前最优」, so there is no second
-definition of "optimal" to drift out of sync.
+The strategy is `engine.DEFAULT_SIGNAL` -- the accepted configuration (1h bars,
+the grid in `config.settings.ACCEPTED_REBALANCE_DAYS`, `range_pos`+`hitrate`,
+20% daily turnover throttle).  It is the same object the console shows as
+「已验收最优」, so there is no second definition of "optimal" to drift out of
+sync.  That is not a slogan: the grid used to be a literal in `DEFAULT_SIGNAL`
+that disagreed with the daemon's `--rebalance-days`, and the desk went on
+generating plans for a strategy nobody was running.
 """
 from __future__ import annotations
 
@@ -96,6 +99,54 @@ def bar_hours(bar: str) -> float:
     except ValueError:
         pass
     return 1.0
+
+
+def explain_not_due(target) -> str:
+    """Why this tick did not rebalance — in words that cannot contradict themselves.
+
+    `target.next_decision_ts` is **not** "the next decision, still ahead".  It is
+    `last_booked_grid_point + R`, and the backtest books a rebalance at the
+    *next* bar's open — so the newest grid point stays unbooked until the panel
+    holds a bar after it.  On a 1-day grid that makes `next_decision_ts` normally
+    a moment that has **already passed**.
+
+    The old wording was
+    `未到调仓日（信号日 2026-09-28 10:00，下次 2026-09-29 10:00）`, printed at
+    10:16 on 2026-09-29: it called a grid point sixteen minutes in the past
+    「下次」, and told the user the day was not a rebalance day when it was.  On a
+    daily grid that sentence contradicts itself **every single day**, and it reads
+    as "the bot is not running" — the exact impression this panel exists to
+    prevent.  It is not a cosmetic problem: the only way to tell "it ran and
+    correctly declined" from "it never ran" is this line.
+
+    So say it in **bars**, which is what the gate actually measures.  The window
+    opens when the panel's last bar is **one past** a grid point -- the grid point
+    itself cannot be booked (exec price is `next_open`), so
+    `bars_since_decision == 1` is the trigger.
+
+    That "one bar short" state is no longer reachable: `signal.compute_live_target`
+    appends the execution bar whenever the panel's last bar IS a grid point, so
+    `bars_since_decision` becomes 1 there too.  Hence the wait is `R - since`, with
+    no `+ 1` -- the panel no longer has to wait for a bar to *close* before the
+    decision on the bar before it can be booked.
+    """
+    R = int(getattr(target, "rebalance_bars", 0) or 0)
+    since = int(getattr(target, "bars_since_decision", 0) or 0)
+    dec = display_ts(getattr(target, "decision_ts", "")) or "?"
+    if not R:
+        return f"未到可执行窗口（信号日 {dec}）"
+    # `since` in [2, R-1] is the normal state *after* the window: the target book
+    # is still the one from `decision_ts` and it will not change until the panel
+    # reaches the next grid point.  Do not claim "已执行" -- without per-period
+    # state this function cannot know whether the window was caught.
+    #
+    # `R - since`, and the formula lives in TWO render points (`here` and
+    # `app.js`'s `dueHint`): fixing one and forgetting the other is how the same
+    # wait came to be printed as two different numbers.
+    remain = max(0, R - since)
+    return (f"本周期不在窗口内：目标持仓取自 {dec} 的调仓，"
+            f"已过 {since}/{R} 根 bar；窗口在调仓点收盘后打开，"
+            f"还差 {remain} 根到下个窗口")
 
 
 def parse_hhmm(s: str) -> int:
@@ -179,7 +230,7 @@ class AutoTrader:
     def __init__(self, mode: str = "demo", interval_min: float = 60.0, *,
                  bar: Optional[str] = None,
                  rebalance_days: Optional[float] = None,
-                 refresh_after_hours: float = 2.0,
+                 refresh_after_hours: float = 1.0,
                  dry_run: bool = False,
                  allow_live: bool = False,
                  exec_window: Optional[str] = None,
@@ -200,10 +251,13 @@ class AutoTrader:
         self.interval_min = max(MIN_INTERVAL_MIN, float(interval_min))
         self.interval_sec = self.interval_min * 60.0
         self.bar = bar or DEFAULT_SIGNAL["bar"]
-        # `None` means "whatever `DEFAULT_SIGNAL` says" (3d).  Passing a number
+        # `None` means "whatever `DEFAULT_SIGNAL` says" -- i.e. the accepted
+        # grid, the same number the console calls 已验收最优.  Passing a number
         # overrides only this one field, so a caller can move the rebalance grid
-        # to 1d without having to restate the whole verified configuration and
-        # risk dropping a factor or a cap by omission.
+        # without having to restate the whole accepted configuration and risk
+        # dropping a factor or a cap by omission.  Note that a caller *can* move
+        # it off the accepted grid; when they do, the acceptance headline no
+        # longer describes what is running.
         self.rebalance_days = (float(rebalance_days)
                                if rebalance_days is not None
                                else float(DEFAULT_SIGNAL["rebalance_days"]))
@@ -445,6 +499,11 @@ class AutoTrader:
         out["next_decision_ts"] = target.next_decision_ts
         out["rebalance_due"] = bool(target.rebalance_due)
         out["bars_since_decision"] = int(target.bars_since_decision)
+        # Carried into the heartbeat so the console can say *how far* the panel
+        # still has to advance before the window opens, instead of labelling a
+        # past timestamp 「下一次决策 · 未到」.  See `explain_not_due`.
+        out["rebalance_bars"] = int(getattr(target, "rebalance_bars", 0) or 0)
+        out["panel_last_ts"] = getattr(target, "panel_last_ts", None)
         out["signal_from_cache"] = bool(target.from_cache)
         out["target_gross"] = float(target.gross)
 
@@ -469,8 +528,8 @@ class AutoTrader:
                     f"本次下单偏离回测网格（锚点 UTC02:00/北京10:00），"
                     f"策略绩效不再是 v3 口径。")
             else:
-                self._log(f"未到调仓日（信号日 {display_ts(target.decision_ts)}，"
-                          f"下次 {display_ts(target.next_decision_ts)}），不下单")
+                out["not_due_explain"] = explain_not_due(target)
+                self._log(out["not_due_explain"])
                 if self.exec_window_min is not None:
                     self._log(f"     执行窗口：{self._window_label()}（当前不在窗口内）")
                 return self._finish(out, "skip", "not_due", t0)
@@ -615,19 +674,31 @@ class AutoTrader:
 # ---------------------------------------------------------------------------
 def main(argv: Optional[list] = None) -> int:
     ap = argparse.ArgumentParser(
-        description="无人值守自动调仓（按 engine.DEFAULT_SIGNAL = v3 最优配置）")
+        description="无人值守自动调仓（按 engine.DEFAULT_SIGNAL = 已验收口径）")
     ap.add_argument("--mode", default="demo", choices=["paper", "demo", "live"])
     ap.add_argument("--interval", type=float, default=60.0,
                     help="检查间隔（分钟），下限 %.0f" % MIN_INTERVAL_MIN)
     ap.add_argument("--bar", default=DEFAULT_SIGNAL["bar"])
     ap.add_argument("--rebalance-days", type=float,
                     default=DEFAULT_SIGNAL["rebalance_days"],
-                    help="调仓网格（天）。默认 %.2g = v3 已验收配置；"
-                         "改成 1 表示每天调仓（实测 Sharpe −0.08、MDD 深 4.1pp，"
-                         "但换手预算会一直吃满，详见 artifacts/FINDINGS.md）"
+                    help="调仓网格（天）。默认 %.2g = 已验收口径，与 /api/spec 的 "
+                         "optimal_cli 同源（`config.settings.ACCEPTED_REBALANCE_DAYS`）—— "
+                         "守护进程、交易台的计划、控制台的「已验收最优」读的是同一个数。"
+                         "**换网格就是换口径**：网格越密换手与回撤都越重，越疏越轻，"
+                         "两边的数字必须一起报，不能只说赢的那一半。这里刻意不写具体"
+                         "指标 —— 以前写死的「Sharpe −0.08、MDD 深 4.1pp」按当前数据"
+                         "不复现（实测是 Sharpe 反而略高、回撤深约 2.2 倍），写死的"
+                         "数字会跟着数据过期却继续断言。实测见 artifacts/FINDINGS.md "
+                         "Q22 与 /api/spec。"
                          % DEFAULT_SIGNAL["rebalance_days"])
-    ap.add_argument("--refresh-after-hours", type=float, default=2.0,
-                    help="最新已收盘 bar 落后超过这么多小时就先做增量刷新；0 = 从不刷新")
+    ap.add_argument("--refresh-after-hours", type=float, default=1.0,
+                    help="最新已收盘 bar 落后超过这么多小时就先做增量刷新；0 = 从不刷新。"
+                         "默认 1.0 = **每个 tick 都刷新**，因为刷新刚做完时 bar_age 就已经"
+                         "≈1.17h（`bar_age` 量的是 bar 的**开盘**时间），阈值设 2.0 会让"
+                         "刷新间隔变成 1h。而 `due` 窗口只有 **2 根 bar 宽**（面板末尾"
+                         "落在网格点、以及落在它后一根 —— 补执行 bar 让这两个状态同解，"
+                         "互为幂等复查），间隔必须**小于一根 bar**：漏掉一个 tick 就会让"
+                         "面板一次推进 2 根、把整个窗口跨过去、窗口被静默跳过。")
     ap.add_argument("--once", action="store_true",
                     help="只跑一次决策就退出（用于验证/外部定时器）")
     ap.add_argument("--exec-window", default=None, metavar="HH:MM",

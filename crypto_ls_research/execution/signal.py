@@ -156,14 +156,70 @@ def _drop_forming_bar(panels, bar: str, now: Optional[pd.Timestamp] = None):
     return panels, False
 
 
+def _append_execution_bar(panels, bar: str):
+    """Append the bar the desk is *trading at*, so the engine can book the decision.
+
+    `run_backtest` books a rebalance at bar `t` from the decision taken at
+    `d = t - 1`, and fills it at `open[t]`.  So the panel's LAST row is the
+    **execution** bar, not merely the last bar whose OHLC is known -- and a panel
+    that stops at the decision bar cannot book that decision at all, because
+    `dec_idx = arange(warmup + off, T - 1, R)` structurally excludes the last row.
+
+    `_drop_forming_bar` was written as if the last row were only *information*.
+    Waiting for that row to close costs a whole hour at 1h bars, even though the
+    only field the engine reads from it -- the fill price `open[T-1]` -- is known
+    the instant the bar opens.  The candle cache stores closed bars only, so the
+    live path supplies the row itself as a copy of the last closed bar.
+
+    Not look-ahead: the copy carries nothing that was not already known when the
+    previous bar closed, and the engine never takes a decision on it (`dec_idx`
+    stops at `T - 2`, i.e. the copied bar).  It is read only as `open[T-1]`,
+    `ret_exec[T-1]` and `alive[T-1]`; the last two are discarded.
+    """
+    import dataclasses
+    new_ts = panels.index[-1] + pd.Timedelta(seconds=SECONDS_PER_BAR[bar])
+
+    def grow(df: pd.DataFrame) -> pd.DataFrame:
+        row = df.iloc[[-1]].copy()
+        row.index = pd.DatetimeIndex([new_ts])
+        return pd.concat([df, row])
+
+    return dataclasses.replace(
+        panels, open=grow(panels.open), high=grow(panels.high), low=grow(panels.low),
+        close=grow(panels.close), vol=grow(panels.vol), vol_ccy=grow(panels.vol_ccy),
+        amount=grow(panels.amount), funding=grow(panels.funding))
+
+
 def _cache_key(bar: str, rebalance_days: float, asset_class: str, start: str,
-               end: str, overrides: dict, data_sig: str) -> str:
+               end: str, overrides: dict, data_sig: str, code_sig: str) -> str:
     payload = json.dumps({
         "bar": bar, "rebalance_days": float(rebalance_days), "asset_class": asset_class,
         "start": start, "end": end,
-        "overrides": {k: overrides[k] for k in sorted(overrides)}, "data": data_sig,
+        "overrides": {k: overrides[k] for k in sorted(overrides)},
+        "data": data_sig, "code": code_sig,
     }, sort_keys=True, ensure_ascii=False)
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _code_signature() -> str:
+    """Fingerprint of the code that produced the payload.
+
+    The key has to include it.  Without it a change to the signal path stays
+    invisible for up to `ttl` (30 min) and the daemon serves a target -- including a
+    `rebalance_due=False` -- computed by the PREVIOUS version.  The symptom is the
+    worst kind: the restart looks like it did not take effect, and the desk silently
+    skips the window it was just fixed to catch.
+    """
+    here = os.path.dirname(os.path.abspath(__file__))
+    out = []
+    for path in (os.path.abspath(__file__),
+                 os.path.join(here, "..", "data", "store.py")):
+        try:
+            st = os.stat(path)
+            out.append(f"{int(st.st_mtime)}:{st.st_size}")
+        except OSError:
+            out.append("missing")
+    return "|".join(out)
 
 
 def _data_signature(bar: str) -> str:
@@ -213,6 +269,63 @@ def _write_cache(key: str, payload: dict) -> None:
     os.replace(tmp, SIGNAL_CACHE)
 
 
+def rebalance_window_open(bars_since_decision: int) -> bool:
+    """Is the (one-bar-wide) execution window open?
+
+    The backtest books a rebalance at the **next** bar's open (`exec_price =
+    next_open`), so a grid point can never be booked while it is still the
+    panel's last bar.  That makes `due` an *edge*, not a level: it is true for
+    exactly one value of `bars_since_decision` -- **1**, meaning the panel's last
+    bar is one past a grid point, so that grid point's rebalance is now booked
+    and is the book we should be holding.
+
+    Named and tested rather than inlined because getting it wrong is silent.
+    The rule used to be `bars_since_decision >= R`, which is true only when the
+    panel's last bar **is** a grid point -- so the desk executed the book of the
+    PREVIOUS grid point and the live book sat one whole rebalance period behind
+    the backtest.  Nothing raised, nothing logged: the positions were simply a
+    day (or three) stale.
+    """
+    return int(bars_since_decision) == 1
+
+
+def needs_execution_bar(panel_last, last_booked_ts, R: int, bar: str) -> bool:
+    """Is the panel's last bar itself a rebalance grid point?
+
+    `last_booked_ts` is the newest rebalance the engine actually recorded.  If the
+    panel's last bar sits exactly `R` bars after it, that last bar IS the next grid
+    point -- and the engine cannot book it (`dec_idx` stops at `T - 2`), so the desk
+    would go on holding the PREVIOUS period's book.
+
+    Named and tested rather than inlined because both directions are silent: too
+    eager and every tick looks due; too shy and the desk is a full period stale with
+    nothing in the log.  `_append_execution_bar` fixes it.
+    """
+    step = pd.Timedelta(seconds=SECONDS_PER_BAR[bar])
+    return pd.Timestamp(panel_last) == pd.Timestamp(last_booked_ts) + int(R) * step
+
+
+def book_with_execution_bar(panels, cfg, bar: str):
+    """Run the backtest, appending the execution bar when the panel ends on a grid point.
+
+    Returns `(panels, result, appended)`.  Extracted from `compute_live_target` so
+    the call site itself is testable: without the append the engine cannot book the
+    panel's last bar (`dec_idx` stops at `T - 2`), so `rebalances[-1]` would still be
+    the PREVIOUS grid point and the desk would hold a book a full period stale --
+    silently, because the numbers all look plausible.
+    """
+    res = run_backtest(panels, cfg)
+    if not res.rebalances:
+        raise RuntimeError("回测没有产生任何调仓点，无法生成实盘目标")
+    if not len(panels.index):
+        return panels, res, False
+    R = int(cfg.rebalance_bars)
+    if not needs_execution_bar(panels.index[-1], res.reb_ts[-1], R, bar):
+        return panels, res, False
+    panels = _append_execution_bar(panels, bar)
+    return panels, run_backtest(panels, cfg), True
+
+
 # ---------------------------------------------------------------------------
 def compute_live_target(bar: str = "1h", rebalance_days: float = 3.0,
                         asset_class: str = "crypto",
@@ -225,7 +338,7 @@ def compute_live_target(bar: str = "1h", rebalance_days: float = 3.0,
     overrides = dict(overrides or {})
     end = end or pd.Timestamp.utcnow().strftime("%Y-%m-%d")
     key = _cache_key(bar, rebalance_days, asset_class, start, end, overrides,
-                     _data_signature(bar))
+                     _data_signature(bar), _code_signature())
     if use_cache:
         row = _read_cache(key, ttl)
         if row:
@@ -236,24 +349,45 @@ def compute_live_target(bar: str = "1h", rebalance_days: float = 3.0,
     insts = resolve_insts(bar, asset_class)
     cfg = build_config(bar, rebalance_days, overrides, start=start, end=end,
                        capital=capital)
-    panels = load_panels(bar, start, end, insts=insts)
+    # `extend_to_last=True`: the panel must reach the newest *closed* bar, not stop
+    # one short of it.  See the comment at the grid construction in `data.store`.
+    panels = load_panels(bar, start, end, insts=insts, extend_to_last=True)
     panels, dropped = _drop_forming_bar(panels, bar)
+
+    # Measured 2026-09-29 (R=24, G=09-29T02:00Z): the 1-day grid books 09-28T02:00Z
+    # without the execution bar and 09-29T02:00Z with it, at `exec_ts=09-29T03:00Z`
+    # = 北京 11:00 -- the instant bar G closed, which is the price the backtest
+    # itself fills at.  See `book_with_execution_bar`.
+    panels, res, appended = book_with_execution_bar(panels, cfg, bar)
+    R = int(cfg.rebalance_bars)
+
     if verbose:
         print(f"[signal] {len(panels.index):,} bars x {len(panels.insts)} insts, "
-              f"last={panels.index[-1]}, forming-bar dropped={dropped}", flush=True)
-
-    res = run_backtest(panels, cfg)
-    if not res.rebalances:
-        raise RuntimeError("回测没有产生任何调仓点，无法生成实盘目标")
+              f"last={panels.index[-1]}, forming-bar dropped={dropped}, "
+              f"execution-bar appended={appended}", flush=True)
 
     last = res.rebalances[-1]
-    R = int(cfg.rebalance_bars)
     dec_idx = [i for i, ts in enumerate(panels.index) if ts == last["ts"]]
     d_bar = int(dec_idx[0]) if dec_idx else int(res.meta.get("warmup_bars", 0))
     panel_last = panels.index[-1]
     panel_last_pos = len(panels.index) - 1
     bars_since = panel_last_pos - d_bar
-    due = bars_since >= R
+    # See `rebalance_window_open`.  The old rule was `bars_since >= R`, which
+    # fired when the panel's last bar IS a grid point -- i.e. one bar too early
+    # -- so `last` was still the PREVIOUS grid point's rebalance and the desk
+    # traded a book one full period stale.  Measured 2026-09-29 (R=24,
+    # G=09-28T02:00Z): the old trigger gave book(09-27T02:00Z) (8 long / 10
+    # short); one bar later it is book(09-28T02:00Z) (7 long / 10 short) --
+    # 5 of 18 legs differ, and the newer book's `exec_ts` is the bar that just
+    # closed, i.e. the price the backtest actually filled at.
+    #
+    # `bars_since == 1` now spans TWO panel states, and that is deliberate: the
+    # panel ending at G (with the execution bar appended above) and the panel
+    # ending at G+1 carry the SAME decision and the same `exec_ts`, so the second
+    # is an idempotent re-check.  It also removes the silent-skip failure mode:
+    # one missed tick no longer costs the whole period.  `refresh_after_hours`
+    # must still stay under one bar so the panel never advances two bars at once.
+    due = rebalance_window_open(bars_since)
 
     def add_step(ts: pd.Timestamp, k: int) -> str:
         return (ts + k * pd.Timedelta(seconds=SECONDS_PER_BAR[bar])).isoformat()
@@ -322,6 +456,7 @@ def compute_live_target(bar: str = "1h", rebalance_days: float = 3.0,
         "long_gross": float(sum(w for w in weights.values() if w > 0)),
         "short_gross": float(-sum(w for w in weights.values() if w < 0)),
         "forming_bar_dropped": bool(dropped),
+        "execution_bar_appended": bool(appended),
         "warmup_bars": int(res.meta.get("warmup_bars", 0)),
         "decision_bar_index": d_bar,
         "panel_last_index": panel_last_pos,
