@@ -26,9 +26,12 @@ artifacts/live/
 # 3) 大数据产物（可复算，或需重新下载）
 #    artifacts/ 692M（baseline.pkl / charts / 各 tag 的 CSV）
 #    data_cache/ 305M（K 线 + 资金费缓存，跑 download/funding_build 可重建）
+#    data_cache_binance/ 188M（同一份管线换币安行情，见 FINDINGS Q40）
 #    但保留 artifacts/ 顶层的三份交付文档
 # ============================================================
-data_cache/
+# `data_cache*/` 而不是 `data_cache/`：换场所跑一次就会多出一个 data_cache_<venue>/，
+# 漏掉一个就是 188M 的 parquet 直接进仓库（`git status` 只报目录名，不报体积）。
+data_cache*/
 artifacts/**
 !artifacts/*.md
 

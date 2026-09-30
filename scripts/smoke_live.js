@@ -407,6 +407,11 @@ const canvas = Object.assign(elById('chart'), {
 });
 
 const blobs = [];
+/* `alert` / `confirm` 以前没 stub：`deleteRun()` 第一句就是 `confirm(...)`，
+ * 在 sandbox 里是 ReferenceError —— 所以删除路径一直**测不到**。 */
+const ALERTS = [];
+const CONFIRMS = [];
+let CONFIRM_ANSWER = true;
 const RealURL = URL;
 const CSSV = { '--muted': '#7b8794', '--border': '#e1e5ea', '--text-2': '#4b5563',
   '--accent': '#2f6fed', '--ok': '#2e9e5b', '--danger': '#d64545' };
@@ -436,6 +441,8 @@ const sandbox = {
   getComputedStyle: () => ({ getPropertyValue: (k) => CSSV[k] || '#000' }),
   setTimeout, clearTimeout, setInterval, clearInterval,
   console,
+  alert: (m) => { ALERTS.push(String(m)); },
+  confirm: (m) => { CONFIRMS.push(String(m)); return CONFIRM_ANSWER; },
   Blob,
   URL: new Proxy(RealURL, {
     get(t, k) {
@@ -462,7 +469,7 @@ src += `
   liveAutoHtml, liveLoadAuto, LIVE_ACTION_LABEL, LIVE_SKIP_LABEL,
   fmtCN,
   LIVE_LIMIT_FIELDS, liveLeverageHtml, liveTradeSettings, pollRuns, renderSide,
-  liveNetHtml, startLog, stopLog };
+  liveNetHtml, startLog, stopLog, deleteRun };
 /* 用 typeof 守卫：SMOKE_APP 指向旧版 app.js 做变异测试时，那里还没有 runsSig，
  * 直接写进字面量会让整份源码在加载阶段就 ReferenceError，测试一行都跑不到。 */
 if (typeof runsSig === 'function') globalThis.__T.runsSig = runsSig;
@@ -1614,6 +1621,76 @@ const LOADING = ['正在读取…', '正在读取账户…'];
       dirtyAuto.join(','));
 
     L.auto = savedAuto;
+  }
+
+  /* ==================================================================
+   * 金额必须带两位小数（交易台上的钱要看到「分」）
+   * ==================================================================
+   * `fmt.dol` 以前是 `Math.round(v)`：$2,586.98 显示成 $2,587 —— 看着像对上了，
+   * 其实差 2 分。交易台上的净值 / 未实现 / 持仓名义 / 订单名义额全走这个格式化器。 */
+  {
+    const d = T.fmt.dol;
+    check('金额：$2,586.98 保留两位小数', d(2586.9843) === '$2,586.98', d(2586.9843));
+    check('金额：$56,441.30 保留两位小数', d(56441.303) === '$56,441.30', d(56441.303));
+    check('金额：整数补成 $875.00（而不是 $875）', d(875) === '$875.00', d(875));
+    check('金额：负数把负号放在 $ 前（-$1,234.50，不是 $-1,234.50）',
+      d(-1234.5) === '-$1,234.50', d(-1234.5));
+    check('金额：负的亚分钱同样 -$0.00390', d(-0.0039) === '-$0.00390', d(-0.0039));
+    /* 反向断言：真·亚分钱不能显示成 $0.00 —— 那会假装「这是零」，比不显示小数更糟。 */
+    check('金额：$0.004 不显示成 $0.00', d(0.004) !== '$0.00' && d(0.004).startsWith('$'),
+      d(0.004));
+    check('金额：真·零仍然是 $0.00（不是 -$0.00）', d(0) === '$0.00' && d(-0) === '$0.00',
+      d(0) + ' / ' + d(-0));
+    check('金额：null / NaN 仍是 —', d(null) === '—' && d(NaN) === '—');
+  }
+
+  /* ==================================================================
+   * 删除运行记录：非 JSON 响应必须被解释成人话
+   * ==================================================================
+   * 实测（2026-09-30）：控制台进程比 `webapp/server.py` 旧，`do_DELETE` 还不存在，
+   * `BaseHTTPRequestHandler` 于是回 `501 + HTML`。当时前端写的是 `resp.json()`，
+   * 用户看到的是 `Unexpected token '<', "<!DOCTYPE "... is not valid JSON` ——
+   * 真正的原因（服务端不支持 DELETE / 控制台没重启）一个字都没露出来。 */
+  {
+    const savedRuns = T.S.runs, savedSel = T.S.selected;
+    T.S.runs = [{ id: 'smoke-del-1', tag: 'smoke_del', label: '删除冒烟' }];
+    T.S.selected = 'smoke-del-1';
+    const origFetch4 = sandbox.fetch;
+    /* 只截 DELETE，其余放行 —— 成功分支里 `deleteRun` 会 `await pollRuns()`，
+     * 那是真要去拉 /api/runs；全部截掉会把它喂成删除响应。 */
+    const stub = (resp) => (u, o) => ((o && o.method) === 'DELETE'
+      ? Promise.resolve(resp) : origFetch4(u, o));
+    const runDelete = async (resp) => {
+      ALERTS.length = 0;
+      sandbox.fetch = stub(resp);
+      await T.deleteRun('smoke-del-1');
+      return ALERTS.slice();
+    };
+
+    // (a) 控制台没重启：501 + HTML —— 必须点名真正的原因
+    let a = await runDelete({ ok: false, status: 501,
+      text: async () => '<!DOCTYPE HTML>\n<html><body>501</body></html>' });
+    check('删除：501+HTML 时点名「服务端不支持 DELETE / 多半没重启」',
+      a.length === 1 && a[0].includes('501') && a[0].includes('重启'),
+      a[0] || '(没弹窗)');
+    check('删除：不再把 "Unexpected token" 原样丢给用户',
+      a.length === 1 && !/Unexpected token/.test(a[0]));
+
+    // (b) 服务端回了 JSON 错误：把 error 原文带出来
+    a = await runDelete({ ok: false, status: 404,
+      text: async () => JSON.stringify({ error: 'no such run' }) });
+    check('删除：404+JSON 时带出服务端的 error 原文',
+      a.length === 1 && a[0].includes('404') && a[0].includes('no such run'),
+      a[0] || '(没弹窗)');
+
+    // (c) 反向断言：成功不许弹窗，而且要真的清掉选中项
+    a = await runDelete({ ok: true, status: 200,
+      text: async () => JSON.stringify({ id: 'smoke-del-1', deleted: true }) });
+    check('删除：成功时不该弹任何窗', a.length === 0, a.join(' | '));
+    check('删除：成功时清掉选中项', T.S.selected === null);
+
+    sandbox.fetch = origFetch4;
+    T.S.runs = savedRuns; T.S.selected = savedSel;
   }
 
   console.log(fails ? `\n${fails} 项未通过` : '\n全部通过');

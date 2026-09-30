@@ -17,11 +17,11 @@ from typing import Dict, List, Optional
 import numpy as np
 import pandas as pd
 
-from ..config.settings import SECONDS_PER_BAR, BacktestConfig
+from ..config.settings import CACHE_DIR, SECONDS_PER_BAR, BacktestConfig
 
-CACHE = os.path.abspath(
-    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "data_cache")
-)
+# Single source of truth (`settings.CACHE_DIR`): honours `CRYPTO_CACHE_DIR`, else the
+# historical `data_cache` path.  Do not re-derive it here.
+CACHE = CACHE_DIR
 
 FIELDS = ["open", "high", "low", "close", "vol", "vol_ccy", "amount"]
 

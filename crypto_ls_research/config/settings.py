@@ -8,8 +8,24 @@ Nothing in this file may contain forward-looking information.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Tuple
+
+# ----------------------------------------------------------------------------
+# data cache root
+# ----------------------------------------------------------------------------
+# The cache is a *variable*, not a constant, so the same pipeline can be pointed at
+# a different venue's bars without a second code path: `CRYPTO_CACHE_DIR=... python -m
+# crypto_ls_research.run.research ...`.  It must stay a single definition -- the
+# downloader and the loader disagreeing about which cache they mean is exactly the
+# class of silent bug this project keeps guarding against (cf. the `rebalance_days`
+# literal that was duplicated in five places).
+#
+# The default is byte-for-byte the historical path, so an unset env var changes nothing.
+CACHE_DIR: str = os.environ.get("CRYPTO_CACHE_DIR") or os.path.abspath(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data_cache")
+)
 
 # ----------------------------------------------------------------------------
 # frequency table

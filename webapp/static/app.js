@@ -135,7 +135,22 @@ const fmt = {
     if (a >= 1) return '$' + v.toFixed(0);
     return '$' + v.toFixed(2);
   },
-  dol: (v) => (v == null || !isFinite(v)) ? '—' : '$' + Math.round(v).toLocaleString('en-US'),
+  /* 金额一律**带两位小数**：交易台上的净值 / 未实现 / 持仓名义 / 订单名义额都是钱，
+   * 取整会把 $2,586.98 显示成 $2,587 —— 看着像对账对上了，其实差 2 分。
+   * 只有真·亚分钱（|v| < 0.005）例外：那档用有效数字，因为 "$0.00" 会假装"这是零"，
+   * 比不显示小数更糟。
+   * ⚠️ 负号在 **`$` 之前**（`-$1,234.50`）：直接拼 `'$' + v.toLocaleString()` 会得到
+   * `$-1,234.50` —— 币种符号和负号打架，读起来像坏掉了。所以先取绝对值排版、再补符号。 */
+  dol: (v) => {
+    if (v == null || !isFinite(v)) return '—';
+    const n = Number(v);
+    const a = Math.abs(n);
+    const body = (a > 0 && a < 0.005)
+      ? a.toPrecision(3)
+      : a.toLocaleString('en-US',
+          { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return (n < 0 ? '-$' : '$') + body;
+  },
   int: (v) => (v == null || !isFinite(v)) ? '—' : Math.round(v).toLocaleString('en-US'),
   /* 时间一律走 `fmtCN`（北京时间）。放在这里是为了和其余格式化函数同名前缀，
    * 让「界面上还有没有裸 toLocaleString」可以用 grep 一次查干净。 */
@@ -1808,8 +1823,26 @@ async function deleteRun(id) {
   if (!ok) return;
   try {
     const resp = await fetch('/api/runs/' + encodeURIComponent(id), { method: 'DELETE' });
-    const d = await resp.json();
-    if (!resp.ok) { alert(d.error || ('删除失败 HTTP ' + resp.status)); return; }
+    /* ⚠️ 不要直接 `resp.json()`。
+     *
+     * 控制台**没重启**时，进程里还是改 `webapp/server.py` 之前的代码 —— 那版没有
+     * `do_DELETE`，`BaseHTTPRequestHandler` 于是回一个 `501 Unsupported method`
+     * **加一张 HTML 错误页**（`Content-Type: text/html`）。`resp.json()` 在这上面抛
+     * `Unexpected token '<', "<!DOCTYPE "... is not valid JSON`，用户看到的就是这句，
+     * 而真正的原因（服务端根本不支持 DELETE）一个字都没露出来。
+     *
+     * 所以先取文本、再决定怎么解释它：能当 JSON 就当 JSON，不能就当文本报出来。 */
+    const raw = await resp.text();
+    let d = null;
+    try { d = JSON.parse(raw); } catch { d = null; }
+    if (!resp.ok) {
+      const hint = resp.status === 501
+        ? '服务端不支持 DELETE —— 控制台多半没重启（改过 webapp/ 之后必须重启 8790）。'
+        : (d && d.error) || raw.slice(0, 300);
+      alert('删除失败 HTTP ' + resp.status + '\n\n' + hint);
+      return;
+    }
+    if (!d) { alert('删除失败：服务端返回的不是 JSON\n\n' + raw.slice(0, 300)); return; }
     if (S.selected === id) { S.selected = null; S.detail = null; S.trTag = null; }
     await pollRuns();
     renderContent();

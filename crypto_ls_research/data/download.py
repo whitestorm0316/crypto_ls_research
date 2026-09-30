@@ -1,14 +1,27 @@
-"""Download OKX USDT-perp OHLCV + realised funding into a parquet cache.
+"""Download USDT-perp OHLCV + realised funding into a parquet cache.
 
 Usage:
   python -m crypto_ls_research.data.download --dry-run
   python -m crypto_ls_research.data.download --bars 1h 15m 5m
+  CRYPTO_CACHE_DIR=data_cache_binance python -m crypto_ls_research.data.download \
+      --source binance --bars 1h --reuse-pool --only-candles
 
 Cache layout (all times UTC, ms epoch -> pandas UTC DatetimeIndex):
   <cache>/candles/<bar>/<INST>.parquet
   <cache>/funding/<INST>.parquet
   <cache>/meta/instruments.parquet
   <cache>/meta/candidate_pool.json
+
+Venue (`--source`)
+------------------
+`okx` (default) is the project's primary venue.  `binance` fetches the SAME OHLCV
+series from Binance USDⓈ-M futures instead, keeping the OKX `instId` as the cache
+filename so every downstream stage runs unmodified -- that is what makes a
+venue-robustness comparison a one-flag change rather than a second pipeline.
+
+The instrument *universe* still comes from OKX (the candidate pool), deliberately:
+the question being asked is "does the strategy survive on another venue's bars?",
+which requires holding the universe fixed and moving only the price source.
 """
 from __future__ import annotations
 
@@ -20,10 +33,13 @@ from typing import Dict, List
 
 import pandas as pd
 
+from ..config.settings import CACHE_DIR
+from ..data.binance_client import (KLINES_SAFE_RATE_PER_SEC, BinanceClient,
+                                   okx_base)
 from ..data.okx_client import OKXClient
 
-CACHE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "data_cache")
-CACHE = os.path.abspath(CACHE)
+# Single source of truth (`settings.CACHE_DIR`): honours `CRYPTO_CACHE_DIR`.
+CACHE = CACHE_DIR
 
 COLS = ["ts", "open", "high", "low", "close", "vol", "vol_ccy", "amount", "confirm"]
 
@@ -127,6 +143,24 @@ def _merge_append(path: str, fresh: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _rows_to_df(rows: list) -> pd.DataFrame:
+    """Normalise venue rows (OKX `history-candles` / Binance `klines`) to one frame.
+
+    Shared by both sources on purpose: the two downloaders must not be able to drift
+    apart in their dtype handling, confirm filtering or dedup order, or a venue
+    comparison would silently measure the loader instead of the venue.
+    """
+    df = pd.DataFrame(rows, columns=COLS)
+    df["ts"] = pd.to_datetime(df["ts"].astype("int64"), unit="ms", utc=True)
+    for c in ("open", "high", "low", "close", "vol", "vol_ccy", "amount"):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["confirm"] = pd.to_numeric(df["confirm"], errors="coerce").fillna(0).astype("int8")
+    df = df[df["confirm"] == 1]                          # drop unconfirmed bars
+    df = df.set_index("ts").drop(columns=["confirm"]).sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+    return df.dropna(subset=["close", "amount"])
+
+
 def download_candles(cli: OKXClient, insts: List[str], bar: str, start: str,
                      end: str, refresh: bool = False,
                      incremental: bool = False) -> None:
@@ -169,15 +203,7 @@ def download_candles(cli: OKXClient, insts: List[str], bar: str, start: str,
             return f"ERR:{type(e).__name__}"
         if not rows:
             return "empty"
-        df = pd.DataFrame(rows, columns=COLS)
-        df["ts"] = pd.to_datetime(df["ts"].astype("int64"), unit="ms", utc=True)
-        for c in ("open", "high", "low", "close", "vol", "vol_ccy", "amount"):
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df["confirm"] = pd.to_numeric(df["confirm"], errors="coerce").fillna(0).astype("int8")
-        df = df[df["confirm"] == 1]                          # drop unconfirmed bars
-        df = df.set_index("ts").drop(columns=["confirm"]).sort_index()
-        df = df[~df.index.duplicated(keep="last")]
-        df = df.dropna(subset=["close", "amount"])
+        df = _rows_to_df(rows)
         n_new = 0
         if append:
             before = last
@@ -200,6 +226,55 @@ def download_candles(cli: OKXClient, insts: List[str], bar: str, start: str,
     extra = f"  added_bars={added}" if added else ""
     print(f"[{bar}] done in {time.time()-t0:.0f}s  {kinds}{extra}  req={cli.stats['req']}",
           flush=True)
+
+
+def download_candles_binance(cli: BinanceClient, insts: List[str], bar: str,
+                             start: str, end: str, refresh: bool = False) -> None:
+    """Same OHLCV series, sourced from Binance USDⓈ-M futures.
+
+    The cache filename stays the OKX `instId` (e.g. `PEPE-USDT-SWAP.parquet` even
+    though the Binance contract is `1000PEPEUSDT`).  This is the whole trick: a
+    symbol rename would break `store.load_panels`' join, the frozen asset-class
+    snapshot, the funding series and every downstream table at once.  Only the
+    *contents* change, and only the price columns do.
+
+    Note the 1000x denomination (`1000PEPEUSDT`): returns and `range_pos` are ratios,
+    so a constant scale factor cancels exactly.  `amount` is quoted in USDT on both
+    venues, so it needs no adjustment either.
+    """
+    outdir = os.path.join(CACHE, "candles", bar)
+    start_ms, end_ms = ms(start), ms(end)
+
+    live = cli.perp_symbols()
+    sym_of = {i: cli.match_symbol(okx_base(i), live) for i in insts}
+
+    def task(inst: str):
+        sym = sym_of.get(inst)
+        if not sym:
+            return "no_binance_listing"
+        path = os.path.join(outdir, f"{inst}.parquet")
+        last = _last_ts(path)
+        if last is not None and not refresh:
+            if int(last.timestamp() * 1000) >= end_ms - 4 * 3600_000:
+                return "skip"
+        try:
+            rows = cli.klines_range(sym, bar, start_ms, end_ms)
+        except Exception as e:                             # noqa: BLE001
+            return f"ERR:{type(e).__name__}"
+        if not rows:
+            return "empty"
+        df = _rows_to_df(rows)
+        df.to_parquet(path, compression="zstd")
+        return f"ok:{len(df)}"
+
+    t0 = time.time()
+    res = cli.pmap(task, insts, desc=f"binance-{bar}")
+    kinds: Dict[str, int] = {}
+    for v in res.values():
+        k = v if isinstance(v, str) else "?"
+        kinds[k.split(":")[0]] = kinds.get(k.split(":")[0], 0) + 1
+    print(f"[{bar}] binance done in {time.time()-t0:.0f}s  {kinds}  req={cli.stats['req']} "
+          f"err={cli.stats['err']}", flush=True)
 
 
 def download_funding(cli: OKXClient, insts: List[str], start: str, end: str,
@@ -267,10 +342,19 @@ def main() -> None:
     ap.add_argument("--end", default="2026-09-26")
     ap.add_argument("--rate", type=float, default=11.0)
     ap.add_argument("--workers", type=int, default=12)
+    ap.add_argument("--source", choices=("okx", "binance"), default="okx",
+                    help="price venue; 'binance' writes the same instId-keyed cache "
+                         "from Binance klines (see module docstring)")
     a = ap.parse_args()
 
     ensure_dirs()
-    cli = OKXClient(rate_per_sec=a.rate, max_workers=a.workers)
+    if a.source == "binance":
+        # Weight-limited endpoint: 1500-bar pages cost 10 weight against a 2400/min
+        # budget, so ~4 req/s.  The default 11 would earn 418/429 and back off.
+        rate = a.rate if a.rate != 11.0 else KLINES_SAFE_RATE_PER_SEC
+        cli = BinanceClient(rate_per_sec=rate, max_workers=a.workers)
+    else:
+        cli = OKXClient(rate_per_sec=a.rate, max_workers=a.workers)
 
     pool_path = os.path.join(CACHE, "meta", "candidate_pool.json")
     if a.reuse_pool and os.path.exists(pool_path):
@@ -299,16 +383,24 @@ def main() -> None:
 
     if not a.incremental:
         est = 0
+        # OKX serves 300 bars/page, Binance 1500 -- the request estimate is 5x off if
+        # the page size is assumed rather than read from the source.
+        page = 1500 if a.source == "binance" else 300
         for bar in a.bars:
             p = PLAN[bar]
             insts = todo.get(bar) or []
             days = (pd.Timestamp(a.end, tz="UTC") - pd.Timestamp(p["start"], tz="UTC")).days
-            est += len(insts) * days * 24 * 3600 / ({"1h": 3600, "15m": 900, "5m": 300}[bar]) / 300
-        funding_est = 0 if a.only_candles else (
+            est += len(insts) * days * 24 * 3600 / ({"1h": 3600, "15m": 900, "5m": 300}[bar]) / page
+        funding_est = 0 if (a.only_candles or a.source == "binance") else (
             len(full) * (pd.Timestamp(a.end, tz="UTC") - pd.Timestamp("2021-01-01", tz="UTC")).days * 3 / 100)
         print(f"  estimated requests: candles={est:,.0f}  funding={funding_est:,.0f}  "
               f"total={est+funding_est:,.0f}")
-        print(f"  estimated wall-clock @ {a.rate} req/s = {(est+funding_est)/a.rate/60:,.0f} min")
+        # Print the rate the client will ACTUALLY use, not the flag default: the
+        # binance branch silently lowers it for weight reasons, and a wall-clock
+        # estimate that disagrees with the run is worse than no estimate.
+        eff_rate = cli.limiter.rate
+        print(f"  estimated wall-clock @ {eff_rate:g} req/s = "
+              f"{(est+funding_est)/eff_rate/60:,.0f} min")
     else:
         print(f"  incremental: only the missing tail will be fetched "
               f"(~{sum(len(todo.get(b) or []) for b in a.bars)} requests)")
@@ -319,11 +411,20 @@ def main() -> None:
 
     for bar in a.bars:
         insts = todo.get(bar) or []
-        print(f"\n=== downloading {bar} ({len(insts)} instruments) ===", flush=True)
-        download_candles(cli, insts, bar, PLAN[bar]["start"], a.end,
-                         refresh=a.refresh, incremental=a.incremental)
+        print(f"\n=== downloading {bar} ({len(insts)} instruments) from {a.source} ===",
+              flush=True)
+        if a.source == "binance":
+            download_candles_binance(cli, insts, bar, PLAN[bar]["start"], a.end,
+                                     refresh=a.refresh)
+        else:
+            download_candles(cli, insts, bar, PLAN[bar]["start"], a.end,
+                             refresh=a.refresh, incremental=a.incremental)
 
-    if a.only_candles:
+    if a.source == "binance":
+        print("\nbinance source: funding is NOT downloaded (OKX retains ~3 months "
+              "only; the spliced funding_hyb series is reused so the comparison "
+              "moves one variable).", flush=True)
+    elif a.only_candles:
         print("\nskipping funding (--only-candles)", flush=True)
     else:
         print("\n=== downloading funding (1h candidate pool) ===", flush=True)

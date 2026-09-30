@@ -565,6 +565,30 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             self._err(404, "not found")
 
+    def send_error(self, code, message=None, explain=None):
+        """任何 `/api/` 下的错误都必须回 **JSON**，不能是 HTML。
+
+        `BaseHTTPRequestHandler` 对**没有实现的方法**会走
+        `handle_one_request` -> `send_error(501, ...)`，回一张
+        `Content-Type: text/html` 的错误页。前端 `resp.json()` 在这上面抛
+        `Unexpected token '<', "<!DOCTYPE "... is not valid JSON` —— 用户只看到
+        「JSON 解析失败」，看不到「服务端不支持这个方法」，排查方向直接跑偏。
+
+        实测（2026-09-30）：控制台进程是 09-29 18:51 起的，而 `do_DELETE` 是
+        09-30 00:46 才进仓库的。改过 `webapp/` 却没重启 -> 进程里没有
+        `do_DELETE` -> `DELETE /api/runs/<id>` 回 501 + HTML -> 删除按钮报
+        「JSON 解析失败」。所以 `/api/` 的错误一律换成 JSON 信封；
+        静态资源/页面的错误仍走父类的 HTML 错误页（浏览器直接打开时要好看）。
+        """
+        path = urlparse(getattr(self, "path", "") or "").path
+        if path.startswith("/api/"):
+            try:
+                return self._err(code, message or explain or "error")
+            except Exception:                                    # noqa: BLE001
+                # 头可能已经发出去一半，此时再让父类补一张 HTML 只会更乱。
+                return None
+        return super().send_error(code, message, explain)
+
     def do_GET(self):                                            # noqa: N802
         u = urlparse(self.path)
         q = parse_qs(u.query)
