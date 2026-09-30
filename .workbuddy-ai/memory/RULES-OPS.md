@@ -238,21 +238,32 @@ vs `−0.008691644`（朴素式），**差 0.03%**；**单名臂朴素式连符�
 出厂 `max_daily_turnover = 0.20` 下，从 0 爬到 0.96 毛敞口要 **~5 次调仓**；
 中间态「实际只到目标 30%」是**正常**的，**不是**拒腿 / 方向 / 杠杆问题。
 
-## 保证金模式：已落地为单源常量 + 闸门假设显式化（2026-09-30）
+## 保证金模式：单源常量，**取值 = `isolated`**（2026-09-30 二次决定）
 
 > 下面两节（Q36 / Q38）是**当时测得的事实与推导**，保留不动。这一节记**改法**。
 
-**改了哪些文件（都在这一个改动里）**
+**⚠️ 取值变过一次：`cross` → `isolated`（2026-09-30 同日晚）。两次都是用户要求。**
+- 第一次钉死 `cross`，理由是**频率**：逐仓每条腿 `1/L − mmr`（3× → 32.8%），全仓 `(1−mmr·G)/G`
+  （`G=0.43` → 231%），任意 `L≥1,G≤1` 下**全仓 ≥ 逐仓**。
+- 第二次改 `isolated`，理由是**偿付**：**空头亏损无上限**，全仓下单个合约暴涨打爆**整个账户**
+  （实测最脆弱那条只要 **30.7 倍**）。**频率风险 vs 偿付风险，选了后者。**
+- **两条都成立，不矛盾**：全仓更不容易被强平，但一旦爆就是全部；逐仓封顶在那条腿，但经常被强平。
+- 🔴 **模式必须和杠杆一起动**：逐仓的距离就是 `1/L − mmr`，实测频率（154 标的 × 5.7 年，
+  日内极值=上界，K=10 账本）：**3× → 每年约 29.5 次**强制平仓、2× → 10.1、1.5× → 4.5、**1× → 1.0**。
+  ⇒ **账本按 1× 跑**。代价**不随流动性下降**（三档 ADV $56M/$11M/$3M 的频率 0.671%/0.597%/0.675%），
+  **换宇宙解决不了**。
+
+**改了哪些文件**
 
 | 文件 | 改动 |
 |---|---|
-| `config/settings.py` | 新增 `MARGIN_MODE = "cross"`（**唯一来源**）；`RiskConfig.max_leverage` **改名** `leverage_in_force`（它是**建模假设**，不是上限）；新增 `__post_init__` 校验 `≥ 1` |
-| `execution/engine.py` | `td_mode` 变成**只读 property**（赋值抛 `AttributeError`）；构造传冲突值抛 `ValueError`；运行记录（rebalance + flatten）带 `td_mode`；新增 `margin_headroom()`，`status()["margin_headroom"]` 暴露 |
-| `execution/limits.py` | 新增 `margin_headroom_violations(positions, assumed_leverage, flag_ratio=1.2)`：用 `liqPx` 反推**真实杠杆**与假设对账，**warn 不 block** |
-| `execution/planner.py` / `okx_private.py` | `td_mode` 默认值从字面量 `"cross"` 改为 `MARGIN_MODE` |
-| `risk/engine.py` | `liquidation_ok` 读 `leverage_in_force` + 新增 `leverage=` 覆盖；新增 `isolated_liq_distance` / `implied_leverage`（**从审计脚本下沉**） |
+| `config/settings.py` | `MARGIN_MODE`（**唯一来源**）取值 `isolated`；`RiskConfig.max_leverage` **改名** `leverage_in_force`（它是**建模假设**，不是上限）；新增 `__post_init__` 校验 `≥ 1` |
+| `execution/engine.py` | `td_mode` 是**只读 property**（赋值抛 `AttributeError`）；构造传冲突值抛 `ValueError`；运行记录（rebalance + flatten）带 `td_mode`；新增 `margin_headroom()`，`status()["margin_headroom"]` 暴露 |
+| `execution/limits.py` | `margin_headroom_violations(positions, assumed_leverage, flag_ratio=1.2)`：用 `liqPx` 反推**真实杠杆**与假设对账，**warn 不 block** |
+| `execution/planner.py` / `okx_private.py` | `td_mode` 默认值从字面量改为 `MARGIN_MODE` |
+| `risk/engine.py` | `liquidation_ok` 读 `leverage_in_force` + 新增 `leverage=` 覆盖；新增 `isolated_liq_distance` / `implied_leverage` |
 | `webapp/live_api.py` | `route_post` 对冲突的 `td_mode` 回 **400**（不是静默忽略，也不是 500） |
-| `webapp/static/app.js` | 保证金模式从 `<select>` 改为**只读展示**；`liveTradeSettings()` **不再发** `td_mode` |
+| `webapp/static/app.js` | 模式从 `<select>` 改为**只读展示**；`liveTradeSettings()` **不再发** `td_mode`；**标签从服务端值派生**（原来写死「全仓 cross」⇒ 常量一改就显示**相反**的模式） |
 | `webapp/spec.py` | `risk.max_leverage` → `risk.leverage_in_force`，标签改「清算闸门假设杠杆」 |
 
 **⚠️ 三个必须记住的判断**
@@ -261,18 +272,24 @@ vs `−0.008691644`（朴素式），**差 0.03%**；**单名臂朴素式连符�
 2. **「算不出来」要显式说**：账户有逐仓腿但一条都没读到 `liqPx` ⇒ 输出
    `margin_headroom_unavailable`（「没有评估」，不是「通过」）。
 3. **公式**仍是逐仓口径 ⇒ 这个闸门本质是**波动率筛选**，不是账户偿付约束。
-   改成按模式选公式（`cross` 用 `(1−mmr·G)/G` ≈ 156%）会让它**基本失效** ⇒
-   **宇宙变宽 ⇒ 验收 Sharpe 变**（Q40 已证宇宙宽度极端敏感）。**本次刻意没做。**
+   改成按模式选公式会让它**基本失效** ⇒ **宇宙变宽 ⇒ 验收 Sharpe 变**。**刻意没做。**
 
-**验证**：全量 `568 passed / 1 skipped / 2 xfailed`（+14）；`tests/test_margin_mode.py`
-**28 条 + 2 `xfail(strict)`**；变异 **7/7 全抓**（丢 `leverage=` 覆盖 / 属性改成可写类属性 /
-API 判据取反 / 删「未评估」分支 / 记录丢 `td_mode` / 控制台恢复选择器 / 阈值调到不触发）；
-`node scripts/smoke_live.js` 全部通过。
+**验证**：全量 `568 passed / 1 skipped / 2 xfailed`；`tests/test_margin_mode.py`
+**28 条 + 2 `xfail(strict)`**；变异 **4/5 被抓**（前端标签写死 / `_OTHER_MODE` 塌成同值 /
+只读属性返回字面量 / API 守卫拿字面量比）。**漏掉的第 5 条是「把常量翻回 `cross`」——
+刻意不抓**：测试断言的是**性质**不是**取值**，与 `test_accepted_grid.py` 同一条纪律。
+**反向验证**：常量翻回 `cross` 时全量 568 + 冒烟全过 ⇒ 开关**干净可逆**。
+`node scripts/smoke_live.js` 全部通过（含新增「标签跟着服务端值走」）。
 
-**重启后线上复核**（裸 socket）：`/api/spec` 200（`optimal_headline` 与产物逐字段一致，
-`risk.max_leverage` 旋钮已消失）；`POST /api/live/execute td_mode=isolated` → **400**；
-两模式 `td_mode='cross'`。⚠️ 注意 `positions` 在 `status["account"]["positions"]`，
+⚠️ **测试里的「冲突值」必须派生**：三处曾把 `"isolated"` 写死当冲突值 —— 常量一翻，
+这些测试**不再测试任何东西却依然全绿**。现由 `_OTHER_MODE` 派生。
+
+**重启后线上复核**（裸 socket）：`/api/spec` 200；`POST /api/live/execute td_mode=cross` → **400**；
+两模式 `td_mode='isolated'`。⚠️ 注意 `positions` 在 `status["account"]["positions"]`，
 **不在顶层** —— 读错路径会得到「0 个仓位」的假象。
+
+⚠️ **落地后账户里还有 12 条全仓腿 + 8 条逐仓腿**：模式翻成 `isolated` 后订单带 `tdMode=isolated`
+⇒ **变成 12 条全仓腿动不了**（Q44 的镜像）。存量仓位必须平掉重开。
 
 ### 🔴 Q44：钉死 `cross` 后暴露的**第三条** —— `cur_sz` 跨保证金模式求和（**只诊断，未修**）
 

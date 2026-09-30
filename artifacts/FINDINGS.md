@@ -2135,10 +2135,27 @@ cur_sz[inst] = cur_sz.get(inst, 0.0) + sz      # 不区分 r["mgnMode"]
 所以上表 400% 行的「1/12」是**交易所口径**，账户级模型判**未爆仓**。
 **两个口径都指向同一结论**（全仓远更耐插针），但数字**不同源**，不能混用。
 
-⚠️ **公平的另一面**：逐仓**单腿损失有上限**（爆仓即亏掉该桶保证金，实测最坏 $601/腿、
-8 腿合计 $2,337），全仓理论上是**无限**的（账户爆仓则全部仓位一起被平）。
-所以「怕账户归零」→ 逐仓；「怕被插针打掉仓位」→ 全仓。**但当前账本毛敞口只有 0.43× NAV**：
-全仓那条路要 **231%** 才走得到，逐仓那条路 **26%** 就走到了。
+⚠️ **公平的另一面（这才是决定性的）**：逐仓**单腿损失有上限**（爆仓即亏掉该桶保证金，实测最坏
+$601/腿），而全仓对**空头**是**无上限**的（账户爆仓则全部仓位一起被平）。所以这不是「谁更安全」，
+而是**频率风险 vs 偿付风险**：
+- **全仓**：几乎不会被强平（要 231% 的全腿同向移动），但**一次就归零**。
+- **逐仓**：损失封顶在那条腿，但**经常被强平**。
+
+**逐仓的频率代价，按杠杆实测**（154 标的 × 5.7 年，日内极值，是**上界**；K=10 账本）：
+
+| 爆仓距离 | 对应杠杆 | 每年被强平的腿数（上界） |
+|---:|---:|---:|
+| 32.8% | 3× | **≈ 29.5 次** |
+| 49.0% | 2× | ≈ 10.1 次 |
+| 66.0% | 1.5× | ≈ 4.5 次 |
+| 99.5% | **1×** | **≈ 1.0 次** |
+
+⚠️ **这个代价不随流动性下降**：按日成交额分三档（中位 $56M / $11M / $3M），
+空头 33% 上行的频率分别是 **0.671% / 0.597% / 0.675%** —— 几乎一样。
+所以它**不是**微盘币造成的，**换宇宙解决不了**。
+
+⇒ **模式与杠杆必须一起动**：`isolated` 只有在**低杠杆**下才是「近乎免费的保险」；
+3× 下等于每年买 30 次强制平仓。
 
 ⚠️ **口径提醒**：OKX 用**标记价**判爆仓，纯 last-price 插针未必传导到 `liqPx`；
 这一点**两种模式一样**，不改变上面的比较。
@@ -2204,7 +2221,7 @@ API 守卫拿字面量比）。**漏掉的第 5 条是「把常量翻回 `cross`
 | 插针 / 闪崩压力测试 | `artifacts/wick_stress/tables/40_wick_blindness.csv`、`40b_channel_signal.csv`、`40c_channel_price.csv`、`40d_liquidation_distance.csv`、`40e_atr_filter.csv`、`40f_historical_extremes.csv` |
 | 保证金模式 / 逐仓 vs 全仓（Q36–Q38） | `artifacts/margin_mode/tables/41_position_margin.csv`、`41b_mode_summary.csv`、`41c_liq_distance_by_mode.csv`、`41d_market_move_liquidation.csv`、`41e_leverage_config.csv`、`41f_config_vs_actual.csv` |
 | 跨模式 `cur_sz` 求和（Q44，**只诊断**） | 同上 `41_position_margin.csv`（按 `instId` 分组即可复现）+ `execution/engine.py:472` |
-| 单标的插针容忍度（Q45，逐仓 vs 全仓） | `artifacts/margin_mode/tables/42_wick_tolerance.csv`、`42b_single_name_wick.csv`；复现 `python scripts/wick_margin_modes.py demo` |
+| 单标的插针容忍度 / 逐仓的频率代价（Q45） | `artifacts/margin_mode/tables/42_wick_tolerance.csv`、`42b_single_name_wick.csv`、`42c_liquidation_frequency.csv`；复现 `python scripts/wick_margin_modes.py demo --freq` |
 | 容量、退市压测、偏差审计 | `artifacts/v3/tables/23_*.csv`、`24_*.csv`、`25_bias_audit.csv` |
 | 标的池 scope | `artifacts/v3/tables/00b_universe_scope.json` |
 | 默认配置对照 | `artifacts/main/tables/19_period_stability.csv`、`03_concentration.json`、`03_coin_attribution.csv` |

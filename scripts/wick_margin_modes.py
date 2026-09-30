@@ -32,6 +32,7 @@ import os
 import sys
 from typing import Optional
 
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -88,6 +89,66 @@ def build(mode: str = "demo") -> tuple[dict, pd.DataFrame]:
             "bucket_margin": (abs(float(notional)) / lev if lev else None),
         })
     return {"nav": nav, "gross": float(sum(r["abs_notional"] for r in rows))}, pd.DataFrame(rows)
+
+
+def freq_table() -> pd.DataFrame:
+    """How often a leg actually reaches a given liquidation distance.
+
+    This is the *cost* side of `isolated`: the mode caps the loss per leg but
+    puts every leg `1/L - mmr` from liquidation, so a low-leverage book and a
+    high-leverage one buy the same protection at wildly different prices.
+    Measured over the cached 1h panel; intraday extremes, so it is an UPPER
+    bound on the forced-liquidation rate.
+    """
+    import glob
+
+    from crypto_ls_research.config.settings import CACHE_DIR
+    files = sorted(glob.glob(os.path.join(CACHE_DIR, "candles/1h/*.parquet")))
+    rows = []
+    for f in files:
+        d = pd.read_parquet(f)[["open", "high", "low"]]
+        if len(d) < 240:
+            continue
+        g = d.groupby(d.index.tz_convert("UTC").normalize())
+        dd = pd.DataFrame({"open": g["open"].first(), "high": g["high"].max(),
+                           "low": g["low"].min()}).dropna()
+        if len(dd) < 30:
+            continue
+        o = dd["open"].to_numpy()
+        for h in (1, 7):
+            rmax = dd["high"].rolling(h).max().shift(-(h - 1)).to_numpy()
+            rmin = dd["low"].rolling(h).min().shift(-(h - 1)).to_numpy()
+            m = np.isfinite(o) & np.isfinite(rmax) & np.isfinite(rmin) & (o > 0)
+            rows.append(pd.DataFrame({
+                "hold": h,
+                "short_adv": (rmax[m] - o[m]) / o[m],
+                "long_adv": (o[m] - rmin[m]) / o[m],
+            }))
+    return pd.concat(rows, ignore_index=True)
+
+
+def print_freq(df: pd.DataFrame) -> None:
+    print("\n--- 逐仓的**频率代价**：腿真的会走到爆仓距离吗 ---")
+    print("（用日内极值 ⇒ **上界**；K=10 的账本，按 1 天持有期折算）")
+    print(f"  {'距离':>8}{'对应杠杆':>10}{'1d 空头':>10}{'1d 多头':>10}"
+          f"{'7d 空头':>10}{'7d 多头':>10}{'K=10/年':>10}")
+    out = []
+    for thr in (0.328, 0.49, 0.66, 0.995):
+        r = {}
+        for h in (1, 7):
+            for side in ("short", "long"):
+                a = df.loc[df["hold"] == h, f"{side}_adv"].to_numpy()
+                r[(h, side)] = float((a >= thr).mean())
+        est = (r[(1, "short")] + r[(1, "long")]) * 10 * 365
+        lev = 1.0 / (thr + MMR) if thr < 0.99 else 1.0
+        out.append({"dist": thr, "lever": lev, "p_1d_short": r[(1, "short")],
+                    "p_1d_long": r[(1, "long")], "p_7d_short": r[(7, "short")],
+                    "p_7d_long": r[(7, "long")], "liquidations_per_year_k10": est})
+        print(f"  {thr * 100:>7.1f}%{lev:>9.1f}x{r[(1, 'short')] * 100:>9.3f}%"
+              f"{r[(1, 'long')] * 100:>9.3f}%{r[(7, 'short')] * 100:>9.3f}%"
+              f"{r[(7, 'long')] * 100:>9.3f}%{est:>9.1f} 次")
+    pd.DataFrame(out).to_csv(f"{OUT}/42c_liquidation_frequency.csv", index=False)
+    print(f"产物 -> {OUT}/42c_liquidation_frequency.csv")
 
 
 def main() -> None:
@@ -156,6 +217,9 @@ def main() -> None:
     print(f"  对照：逐仓每条腿 `1/L - mmr`，L=3 → {isolated_liq_distance(3) * 100:.2f}%")
 
     print(f"\n产物 -> {OUT}/42_wick_tolerance.csv, 42b_single_name_wick.csv")
+
+    if "--freq" in sys.argv:
+        print_freq(freq_table())
 
 
 if __name__ == "__main__":
