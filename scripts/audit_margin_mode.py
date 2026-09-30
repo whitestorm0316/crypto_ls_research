@@ -22,24 +22,30 @@
 2. **同一个合约同时存在两种模式**（混合账本）—— 这是最危险的状态，因为
    同一个方向、同一个合约的两条腿风险完全不同。
 3. 实测距离 vs **风控闸门假设的距离**（`liquidation_ok` 用的是
-   `1/rcfg.max_leverage - mmr`，即**逐仓**口径，且用的是**配置里的**杠杆，
+   `1/rcfg.leverage_in_force - mmr`，即**逐仓**口径，且用的是**声明出来的**杠杆假设，
    不是交易所上**实际生效**的杠杆）。
 4. 假设市场整体移动 X%，**每种模式下会先死几条腿**。
 
-## ⚠️ 三个"看不见"
+## ⚠️ 三个"看不见"（2026-09-30 已修，这里保留说明为什么当初会看不见）
 
 * `td_mode` **不落盘**（不在 `LiveLimits`、不在 `store`）：它只是
   `LiveEngine` 的内存属性，`/api/live/execute` 每次请求现传。所以
   **控制台一重启就静默回到 `cross`**，而**成交记录里也没有 `tdMode`**
   —— 事后无法判断某一笔成交用的是哪种模式。
+  ⇒ **已修**：模式现在是常量 `settings.MARGIN_MODE`，`LiveEngine.td_mode` 是
+  只读属性，API 对冲突值回 **400**，控制台不再提供选择器，运行记录带 `td_mode`。
 * `liquidation_ok` 对 `td_mode` **完全不敏感**，且读的是 `rcfg.max_leverage`
   而不是交易所上实际生效的 `lever`。所以它可以一边认为"19.5% 很安全"，
   一边账户上躺着一个 100× 的逐仓仓。
+  ⇒ **已修**：闸门读 `rcfg.leverage_in_force`（一个**声明出来的假设**，不再是
+  上限被当成事实），且新增 `limits.margin_headroom_violations()` 拿每条腿
+  `liqPx` 反推的真实杠杆与它对账，结果进 `LiveEngine.status()["margin_headroom"]`。
 * **`lever` 字段是"配置"的镜像，不是持仓的杠杆。** 改 `set-leverage` 会改
   `(instId, mgnMode, posSide)` 的格子，也会让 `lever` 跟着变，但**在场那条腿的
   `margin`/`liqPx` 不会跟着走**（2026-09-30 实测 NEAR 3→5：`margin` 116.906、
   `liqPx` 3.317332 逐位不变，>65s 仍不变）。判断一条腿真正在几倍上，只能用
-  `implied_leverage()` 从 `liqPx` 反推。
+  `implied_leverage()` 从 `liqPx` 反推 —— 该函数已下沉到
+  `crypto_ls_research/risk/engine.py`，本脚本直接引用（避免两份实现漂移）。
 
 ## 写 `set-leverage` 的四个坑（都是实测）
 
@@ -91,7 +97,7 @@ def liq_distance(pos: dict) -> Optional[float]:
 
 def isolated_theory(lever: float) -> float:
     """`1/L - mmr`: the move that eats a leg's own isolated margin."""
-    return 1.0 / max(float(lever or 0.0), 1e-9) - MMR
+    return isolated_liq_distance(float(lever or 0.0), MMR)
 
 
 def cross_theory(gross_over_nav: float) -> float:
@@ -101,38 +107,16 @@ def cross_theory(gross_over_nav: float) -> float:
 
 
 def gate_theory(rcfg: RiskConfig) -> float:
-    """What `liquidation_ok` *assumes*: `1/max_leverage - mmr` (isolated口径)."""
-    return 1.0 / max(rcfg.max_leverage, 1e-9) - MMR
+    """What `liquidation_ok` *assumes*: `1/L_in_force - mmr` (逐仓口径)."""
+    return 1.0 / max(rcfg.leverage_in_force, 1e-9) - MMR
 
 
-def implied_leverage(mark_px: float, liq_px: float, mmr: float = MMR) -> float:
-    """The leverage a position is **actually margined at**, inverted from `liqPx`.
+# `implied_leverage` now lives in the library, next to the formula it inverts, so
+# the audit, the pre-trade guardrail (`limits.margin_headroom_violations`) and the
+# tests all read one implementation instead of three that can drift apart.
+from crypto_ls_research.risk.engine import (  # noqa: E402,F401
+    implied_leverage, isolated_liq_distance)
 
-    Inverting `isolated_theory`:
-
-        dist = 1/L - mmr   =>   L = 1 / (dist + mmr),  dist = |liqPx - markPx| / markPx
-
-    Why this function has to exist: the venue's `lever` field (on both
-    `/account/positions` and `/account/leverage-info`) mirrors the *account
-    configuration* for `(instId, mgnMode, posSide)` -- **not** the leverage the
-    open position is margined at.  Measured 2026-09-30 on the demo venue: setting
-    NEAR `isolated` long from 3 to 5 moved `lever` to "5" but left the position's
-    `margin` (116.906) and `liqPx` (3.317332) **bit-identical** for >65s.  So a
-    reader who trusts `lever` will believe a leg was re-margined when it was not.
-
-    `liqPx` is the only field that tells the truth, and this is how you read it.
-
-    ⚠️ It is an **estimate**, because the venue's own liquidation formula uses a
-    per-instrument maintenance-margin rate (and fees) while we assume a flat
-    `mmr = 0.005`.  Measured on 9 legs on 2026-09-30: `config=3` came back as
-    2.98–3.30 (±10 %), `config=100` came back as 93.6 (−6 %).  So treat this as a
-    detector for *gross* divergence (the 20 % flag), not as a precise readout.
-    """
-    mark = float(mark_px)
-    if mark <= 0:
-        raise ValueError("mark_px must be positive")
-    dist = abs(float(liq_px) - mark) / mark
-    return 1.0 / (dist + mmr)
 
 
 # ---------------------------------------------------------------------------
@@ -270,7 +254,7 @@ def main(mode: str = "demo") -> int:
     print(f"  逐仓理论 `1/L - mmr`   L=3 → {isolated_theory(3) * 100:.2f}%   "
           f"L=5 → {isolated_theory(5) * 100:.2f}%   L=100 → {isolated_theory(100) * 100:.2f}%")
     print(f"  全仓理论 `(1-mmr*G)/G` G={G:.4f} → {cross_theory(G) * 100:.2f}%")
-    print(f"  风控闸门 `liquidation_ok` 假设的（= 逐仓口径 @ rcfg.max_leverage={rcfg.max_leverage:.0f}）"
+    print(f"  风控闸门 `liquidation_ok` 假设的（= 逐仓口径 @ rcfg.leverage_in_force={rcfg.leverage_in_force:.0f}）"
           f" → {gate_theory(rcfg) * 100:.2f}%")
 
     # ---- the two "invisible" defects -------------------------------------
@@ -289,6 +273,12 @@ def main(mode: str = "demo") -> int:
               f"（闸门假设 {gate_theory(rcfg) * 100:.2f}%）")
 
     # ---- what a market-wide move does ------------------------------------
+    # NOTE: this is a *uniform* adverse move on every leg at once -- i.e. the
+    # hedge failing as a whole.  It is NOT a wick.  A wick is an idiosyncratic
+    # move in ONE instrument, and the two questions rank the modes very
+    # differently (measured 2026-09-30: isolated legs die at 26%, cross legs at
+    # 385%+).  That case lives in `scripts/wick_margin_modes.py` -> `42_*`.  Do
+    # not read this table as covering it.
     print("\n--- 假设市场整体同向移动（对冲腿盈利救不了另一条腿）---")
     print(f"  {'移动':>7}{'逐仓先死':>12}{'全仓先死':>12}   说明")
     iso = df[df["mgnMode"] == "isolated"]["dist_liq"].dropna()
@@ -304,6 +294,8 @@ def main(mode: str = "demo") -> int:
         print(f"  {x * 100:>6.0f}%{ni:>9} / {len(iso):<3}{nc:>9} / {len(crs):<3}"
               f"   账户净盈亏 ≈ {abs(net) * x / nav * 100:.2f}% of NAV（仍很小）")
     pd.DataFrame(mkt).to_csv(f"{OUT}/41d_market_move_liquidation.csv", index=False)
+    print("  ⚠️ 上表是**所有腿同时逆行**（对冲整体失效），**不是插针**。"
+          "单标的插针见 `scripts/wick_margin_modes.py` → `42_*`。")
 
     # ---- account-level leverage configuration ----------------------------
     print("\n--- 账户级杠杆配置（**与订单无关**，订单里根本没有杠杆字段）---")

@@ -862,8 +862,35 @@ const LOADING = ['正在读取…', '正在读取账户…'];
         (T.LIVE_LIMIT_FIELDS || []).some((f) => f[0] === 'max_leverage')
         && h.includes('data-limit="max_leverage"'));
       const lvh = T.liveLeverageHtml({ max_leverage: 5.0, max_gross_frac: 1.0 });
-      check('杠杆面板渲染出保证金模式与杠杆输入',
+      check('杠杆面板显示保证金模式（只读）与杠杆输入',
         lvh.includes('id="lvTdMode"') && lvh.includes('id="lvLever"'));
+      /* 模式是服务端常量，页面只显示。这里断言「不是一个可改的控件」，
+       * 否则页面会提供一个服务端必然拒绝（400）的选择器。 */
+      check('保证金模式不再是页面上可改的控件',
+        !lvh.includes('<select id="lvTdMode"') && lvh.includes('data-td-mode='));
+      /* 标签必须**跟着服务端的值走**。它曾经是写死的「全仓 cross」；常量改成
+       * `isolated` 之后，页面会显示一个和实际相反的模式 —— 而且属于「看着很正常」
+       * 的那种错，肉眼扫过去不会发现。所以断言的是**两个值给出两个不同的标签**，
+       * 而不是某个字面：同一条纪律见页头横幅那段（查来源，不查字面值）。 */
+      const realTd = (S.live.status || {}).td_mode;
+      S.live.status.td_mode = 'isolated';
+      const lvIso = T.liveLeverageHtml({ max_leverage: 5.0, max_gross_frac: 1.0 });
+      S.live.status.td_mode = 'cross';
+      const lvCrs = T.liveLeverageHtml({ max_leverage: 5.0, max_gross_frac: 1.0 });
+      S.live.status.td_mode = realTd;
+      /* 只取 `#lvTdMode` 那个元素里的文字，**不扫整段 html**：说明文字里本来就
+       * 同时出现「全仓」和「逐仓」，扫全文的断言会永远通过（第一版就是这么写的，
+       * 当场被这条测试自己抓出来）。同一条纪律：断言相邻对，不要断言「包含某词」。 */
+      const tdLabelOf = (html) => {
+        const m = html.match(/id="lvTdMode"[^>]*>([^<]*)</);
+        return m ? m[1] : '';
+      };
+      const labIso = tdLabelOf(lvIso);
+      const labCrs = tdLabelOf(lvCrs);
+      check('保证金模式的显示标签跟着服务端的值走（不是写死的）',
+        labIso.includes('逐仓') && !labIso.includes('全仓')
+        && labCrs.includes('全仓') && !labCrs.includes('逐仓'),
+        `isolated 标签=${JSON.stringify(labIso)} cross 标签=${JSON.stringify(labCrs)}`);
       check('杠杆面板写明「提高杠杆不放大收益」',
         lvh.includes('不放大收益') && lvh.includes('爆仓风险'));
       check('杠杆面板给出回撤放大的具体数字（报告 §16）',

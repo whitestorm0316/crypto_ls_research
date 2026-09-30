@@ -26,6 +26,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from ..config.settings import MARGIN_MODE
 from .specs import InstSpec, load_specs
 
 EPS = 1e-12
@@ -96,7 +97,7 @@ class Plan:
     turnover_frac: float = 0.0       # order_notional / nav
     min_viable_capital: float = 0.0
     pos_mode: str = "net_mode"
-    td_mode: str = "cross"
+    td_mode: str = MARGIN_MODE
     # --- turnover budget bookkeeping -------------------------------------
     # The strategy's realised book is NOT its target book: with the 20%-per-day
     # turnover budget the backtested position averages 0.47 gross while the raw
@@ -226,7 +227,7 @@ def build_plan(target_weights: Dict[str, float], nav: float,
                prices: Optional[Dict[str, float]] = None,
                adv: Optional[Dict[str, float]] = None,
                specs: Optional[Dict[str, InstSpec]] = None,
-               pos_mode: str = "net_mode", td_mode: str = "cross",
+               pos_mode: str = "net_mode", td_mode: str = MARGIN_MODE,
                ord_type: str = "market", limit_buffer_bps: float = 15.0,
                dust_ratio: float = 0.5,
                min_order_notional: float = 0.0,

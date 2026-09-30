@@ -243,7 +243,7 @@ drawdown    : <10% ×1.0 | 10-15% ×0.75 | 15-20% ×0.5 | >20% ×0.25
               并置 stop_new_entries 标志（flatten 会永久锁死，故下限 > 0）
 
 单币约束：
-  liquidation: 3·ATR% <= 1/max_leverage - mmr     （默认 5x -> 阈值 ATR% = 6.5%）
+  liquidation: 3·ATR% <= 1/L_in_force - mmr     （默认 5x -> 阈值 ATR% = 6.5%）
   ADV 参与率 : |Δw_i|·equity <= 5% · ADV_i ，按名字逐项截断
   换手预算   : Σ|Δw| 受 max_daily_turnover · gross 约束，比例式部分调仓
 ```

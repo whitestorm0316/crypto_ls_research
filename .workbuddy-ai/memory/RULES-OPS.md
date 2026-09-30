@@ -238,12 +238,92 @@ vs `−0.008691644`（朴素式），**差 0.03%**；**单名臂朴素式连符�
 出厂 `max_daily_turnover = 0.20` 下，从 0 爬到 0.96 毛敞口要 **~5 次调仓**；
 中间态「实际只到目标 30%」是**正常**的，**不是**拒腿 / 方向 / 杠杆问题。
 
+## 保证金模式：已落地为单源常量 + 闸门假设显式化（2026-09-30）
+
+> 下面两节（Q36 / Q38）是**当时测得的事实与推导**，保留不动。这一节记**改法**。
+
+**改了哪些文件（都在这一个改动里）**
+
+| 文件 | 改动 |
+|---|---|
+| `config/settings.py` | 新增 `MARGIN_MODE = "cross"`（**唯一来源**）；`RiskConfig.max_leverage` **改名** `leverage_in_force`（它是**建模假设**，不是上限）；新增 `__post_init__` 校验 `≥ 1` |
+| `execution/engine.py` | `td_mode` 变成**只读 property**（赋值抛 `AttributeError`）；构造传冲突值抛 `ValueError`；运行记录（rebalance + flatten）带 `td_mode`；新增 `margin_headroom()`，`status()["margin_headroom"]` 暴露 |
+| `execution/limits.py` | 新增 `margin_headroom_violations(positions, assumed_leverage, flag_ratio=1.2)`：用 `liqPx` 反推**真实杠杆**与假设对账，**warn 不 block** |
+| `execution/planner.py` / `okx_private.py` | `td_mode` 默认值从字面量 `"cross"` 改为 `MARGIN_MODE` |
+| `risk/engine.py` | `liquidation_ok` 读 `leverage_in_force` + 新增 `leverage=` 覆盖；新增 `isolated_liq_distance` / `implied_leverage`（**从审计脚本下沉**） |
+| `webapp/live_api.py` | `route_post` 对冲突的 `td_mode` 回 **400**（不是静默忽略，也不是 500） |
+| `webapp/static/app.js` | 保证金模式从 `<select>` 改为**只读展示**；`liveTradeSettings()` **不再发** `td_mode` |
+| `webapp/spec.py` | `risk.max_leverage` → `risk.leverage_in_force`，标签改「清算闸门假设杠杆」 |
+
+**⚠️ 三个必须记住的判断**
+
+1. **`warn` 不是 `block`**（对账）：挡住调仓会**冻住**一个「最好的补救恰恰就是这次调仓」的账本。
+2. **「算不出来」要显式说**：账户有逐仓腿但一条都没读到 `liqPx` ⇒ 输出
+   `margin_headroom_unavailable`（「没有评估」，不是「通过」）。
+3. **公式**仍是逐仓口径 ⇒ 这个闸门本质是**波动率筛选**，不是账户偿付约束。
+   改成按模式选公式（`cross` 用 `(1−mmr·G)/G` ≈ 156%）会让它**基本失效** ⇒
+   **宇宙变宽 ⇒ 验收 Sharpe 变**（Q40 已证宇宙宽度极端敏感）。**本次刻意没做。**
+
+**验证**：全量 `568 passed / 1 skipped / 2 xfailed`（+14）；`tests/test_margin_mode.py`
+**28 条 + 2 `xfail(strict)`**；变异 **7/7 全抓**（丢 `leverage=` 覆盖 / 属性改成可写类属性 /
+API 判据取反 / 删「未评估」分支 / 记录丢 `td_mode` / 控制台恢复选择器 / 阈值调到不触发）；
+`node scripts/smoke_live.js` 全部通过。
+
+**重启后线上复核**（裸 socket）：`/api/spec` 200（`optimal_headline` 与产物逐字段一致，
+`risk.max_leverage` 旋钮已消失）；`POST /api/live/execute td_mode=isolated` → **400**；
+两模式 `td_mode='cross'`。⚠️ 注意 `positions` 在 `status["account"]["positions"]`，
+**不在顶层** —— 读错路径会得到「0 个仓位」的假象。
+
+### 🔴 Q44：钉死 `cross` 后暴露的**第三条** —— `cur_sz` 跨保证金模式求和（**只诊断，未修**）
+
+`execution/engine.py:472`：
+
+```python
+cur_sz[inst] = cur_sz.get(inst, 0.0) + sz      # 不区分 r["mgnMode"]
+```
+
+`Plan.td_mode` 是**整个 plan 的单一值**（`planner.py:100`，恒 `MARGIN_MODE`），逐单无差异；
+而 `cur_sz` 是**两条腿之和** ⇒ `d = tgt_sz - cur_sz`（`planner.py:217`）**系统性偏大**。
+
+**实测（demo 2026-09-30 18:36，8 个合约并存、全部同向）**：
+
+| 合约 | posSide | 全仓 sz | 逐仓 sz | `cur_sz` 报告 | 虚高 |
+|---|---:|---:|---:|---:|---:|
+| FIL-USDT-SWAP | long | 15,230 | 7,054 | 22,284 | +46.3% |
+| SUI-USDT-SWAP | long | 2,213 | 818 | 3,031 | +37.0% |
+| ENA-USDT-SWAP | long | 915 | 394 | 1,309 | +43.1% |
+| NEAR-USDT-SWAP | long | 28.9 | 7.1 | 36.0 | +24.6% |
+| LIT-USDT-SWAP | short | −312 | −461 | −773 | +147.8% |
+| ARB-USDT-SWAP | short | −679.2 | −171.7 | −850.9 | +25.3% |
+| PEPE-USDT-SWAP | short | −19.1 | −13.4 | −32.5 | +70.2% |
+| ETH-USDT-SWAP | short | −1.35 | −4.4 | −5.75 | +326% |
+
+**后果（两条，均已按代码路径核实）**
+
+1. **逐仓腿永久冻结**：订单恒 `tdMode=cross`，只动全仓腿；而这 8 条恰是**爆仓距离最差**的
+   （逐仓中位 **32.8%** vs 全仓中位 **4341%**）。**钉死 `cross` 挡住了新增，没挡住存量。**
+2. **两条分歧**：`tgt ≥ iso` → 收敛到 `全仓 = tgt − iso`（净敞口对，但留在高风险桶）；
+   `tgt < iso`（含掉出宇宙、`tgt=0`）→ 需减的量 `cross+iso−tgt > cross`，
+   `long_short_mode` 下 `sell/long` **结构上不能开空** ⇒ **被拒单**，永不收敛、每调仓点重试。
+   ⚠️ **不会反向翻腿**（初稿猜错）：`posSide` 由**目标符号**决定（`planner.py:204`），不是 `cur_sz`。
+   （`planner.py:199-203` 的 close 分支 `reduce_only=False`，挡不住。）
+
+**未修原因**：修它 = 改**下单量** = 改执行路径；Q36/Q37 的授权**不覆盖这一条**。
+候选 **A**（`cur_sz` 只聚合 `cross`）/ **B**（`td_mode` 逐单派生，但等于把「逐仓」重新变成可选项）
+均已记档。**共同前提：先把 8 条逐仓腿平掉**，否则是在带病账户上选算法。
+
+**账户状态**：`BTC-USDT-SWAP isolated` 的 **100× 配置仍在**（`41e` `at_max=True`，
+若被使用爆仓距离仅 **0.50%**），但**当前无 BTC 逐仓持仓**（BTC 在全仓 3×、距离 43.4%）
+⇒ 当日那条距爆仓 0.57% 的腿**已不在场**，风险由「在场」转为「潜在」。
+
+---
+
 ## 保证金模式（Q36）的细节与审计
 
 审计脚本 `scripts/audit_margin_mode.py [mode]`（默认 `demo`），产物
 `artifacts/margin_mode/tables/41_position_margin.csv`、`41b_mode_summary.csv`、
 `41c_liq_distance_by_mode.csv`、`41d_market_move_liquidation.csv`；
-守卫 `crypto_ls_research/tests/test_margin_mode.py`（10 条，**11 变异全抓**）。
+守卫 `crypto_ls_research/tests/test_margin_mode.py`（**28 条 + 2 xfail，7 变异全抓**）。
 脚本**直接用 `LiveEngine(mode).account()`**（不需要控制台在跑，也不需要裸 socket）。
 
 ### 两条公式（`mmr = risk.DEFAULT_MMR = 0.005`）
@@ -532,15 +612,284 @@ python scripts/binance_backtest.py --selectivity
 同时持有两个场所的 panel（131×50k×7×float32 ≈ **190 MB/个**）+ 多次回测的残留
 ⇒ **exit 137（OOM）**。每个场所用完即 `del panels, adv, pooled` + `gc.collect()`。
 
+## 自动交易 / 设置持久化 / 三个「倍数」（从 `MEMORY.md` 下沉，2026-09-30）
+
+> 以下三节原本整段在 `MEMORY.md`；因注入预算紧张下沉到本文件。**规则本身不变**，`MEMORY.md` 只留指针。
+
+### 自动交易（无人值守调仓）
+- 入口 `... execution.auto_trader --mode demo --interval 30 --rebalance-days 1.0 --bar 1h
+  --refresh-after-hours 1.0`；策略 `engine.DEFAULT_SIGNAL`。实盘需 `--allow-live`。
+- **`not_due` 是 `warn` 不是 `block`** ⇒ 引擎**不拦**非调仓日，到期判定必须写在调度器里，断言「**`execute`
+  根本没被调用**」。**绝不传 `force`**。闸门顺序：熔断 → 数据新鲜度 → 到期 → 风控上限。
+- **到期闸门是「边沿」不是「水平」**：`rebalance_window_open(since) == (since == 1)`；旧规则 `since >= R`
+  会**恒定落后回测一个周期**。实盘补一根「执行 bar」⇒ 窗口 **2 根宽**；**「还差几根」= `R − since`**。
+  **`next_decision_ts` 不是「未来的下一个决策时刻」**（= 最后一笔已记账网格点 + R，常已过去）；后端
+  `explain_not_due` 与前端 `dueHint` 是两个渲染点，测试必须**从 fixture 派生**。
+- **`refresh_after_hours` 只决定抗漏 tick 余量，不决定窗口打开时刻**：刷新间隔必须**小于一根 bar**，否则漏
+  一个 tick ⇒ `since` 0→2 ⇒ **整天不成交而日志全是 `not_due`**。**只看 `bars_since_decision`。**
+- **限额闸门比 `plan.realised_gross`**（被节流后），不是 `target.gross`。**跨进程调仓锁**
+  `store.rebalance_lock(mode)`（`O_EXCL`，TTL 900s）：并发 `execute()` 会各发**完整**订单 ⇒ 仓位翻倍。
+  `os.kill(pid,0)` 的 `EPERM` = **存在但无权发信号** ⇒ **存活**。`gross_realised` 必须是**实际成交后的账**
+  （被拒的腿保持原仓位），不是目标值。
+
+### 设置持久化（「保存了重启不生效」）
+- 保存必须以**落盘**收尾并回**落盘路径**（限额在 `artifacts/live/<mode>/limits.json`，**故意不在
+  `LEDGER_FILES`**）。只赋内存再回 `{"ok":True}`，与「按钮没接线」无法区分。
+- `load_limits()` 的 `None`（从未配置）**≠** `{}`（用户清空 → 全零上限，拒掉每笔）→ 没值必须传 `None`。
+- 同名不同义必须标注：账户区「换手预算」= `execution.max_daily_turnover`；限额表 `max_turnover_frac`
+  = **硬闸门**（超即整批拒绝）；两个调用点同源（`_turnover_from()`）。`onclick = liveSaveLimits` 会把
+  MouseEvent 当 `requireDue`（恒真）→ 必须包 `() => ...`；无显式传参时**读屏幕勾选框**。
+
+### 三个「倍数」只有一个改订单
+- **`set_leverage` 不改任何一笔订单**（只压维持保证金）；**放大目标敞口也无效**（换手预算是净值的比例）。
+  **硬不变量，别「修」它** —— `build_plan()` **没有 leverage 参数**（`tests/test_size_invariance.py` 钉签名）。
+- **唯一有效旋钮 = `execution.max_daily_turnover`**（$70 上 0.2 → **6 笔/39.6%**，1.0 → **14 笔/93.1%**），
+  ⚠️ 但当**回测参数**扫 Sharpe **1.82→1.10→0.46** —— **放开节流就打坏策略**。不变量是「净值 × 节流」。
+- **杠杆唯一作用是保证金**：$70 在 5× 下最多持 $350 = **正好用光、缓冲 $0**（**18.4% 反向波动即亏光**）。
+  ⚠️ `§16.5`「$70 加 L 倍 ≡ 有效资金 $70L」**与实现不符**（已加 §16.5.1），但 MDD 列仍有效。
+- **测量纪律**：比杠杆必须用**同一个引擎**（价格缓存 15s TTL）；**仓位小先查换手爬坡、拒腿、订单方向。**
+- **本金门槛**（别抄报告旧数）：出厂节流 0.2 下 $70 → **39.4%** 覆盖率、$500 → 96.8%、$2,000 → 100%；
+  `min_viable_capital` ≈ **$1,048**。$70 的权重误差中位 **0.0663** ≈ 单腿平均目标权重 **0.0640**
+  ⇒ **误差与信号同量级**。`min_nav_usd` 默认 **$50** ⇒ $70 **不会被风控拦住**。
+  产物 `scripts/plan_report.py --mode demo`。
+
+## 失效归因（Q41 细节）——5 段最大回撤，**只诊断不优化**
+
+**跑法**：`python scripts/drawdown_attribution.py`（约 26 s + 5 次单因子回测；`--no-ablations` 跳过后者）。
+产物 `artifacts/drawdown_attribution/`；报告 `artifacts/FAILURE_ATTRIBUTION.md`；
+结论摘要 `artifacts/FINDINGS.md` Q41。守卫 `tests/test_failure_attribution.py`（29 条）。
+
+### 基线复现（做任何统计之前先钉死这一步）
+
+`load_panels(bar, start, end, insts=res.insts)` 会把网格**延伸到缓存里最新的一根** ⇒ 直接重跑不可复现。
+必须把 8 个字段全部 `reindex(res.bars.index)` 截回存档网格，再用 `ACCEPTED_OVERRIDES` 跑。
+**实测 9 个损益列 `max|Δ| = 0`、equity 6.65719182 两条路一致、2,068 个调仓点。**
+`ACCEPTED_OVERRIDES` 从 `config.settings.ACCEPTED_*` 读，**不写字面量**。
+
+### 窗口几何：用户给的 5 个窗口**不是同一套边界约定**
+
+| 窗口 | 用户给 | 深度（实测） | 真实 cummax 峰 | 真实谷底 | 真实恢复 | 边界约定 |
+|---|---|---|---|---|---|---|
+| W1 | 2024-07-05 → 2024-11-01 | −13.3149% | 2024-07-05 | 2024-11-01 | 2024-11-20 | 峰→谷 ✓ |
+| W2 | 2023-11-09 → 2024-03-03 | −10.8184% | 2023-11-09 | **2023-12-18** | 2024-03-03 | 峰→**恢复** |
+| W3 | **2023-02-22** → 2023-05-03 | −9.9832% | **2023-01-25** | 2023-05-03 | 2023-06-30 | **局部高点**→谷 |
+| W4 | 2021-02-01 → 2021-04-10 | −9.5922% | 2021-02-01 | 2021-04-10 | 2021-06-21 | 峰→谷 ✓ |
+| W5 | 2022-08-04 → 2022-09-21 | −9.4229% | 2022-08-04 | 2022-09-21 | 2022-10-29 | 峰→谷 ✓ |
+
+5 个深度**逐位吻合**（`max|Δdepth| < 1e-4`）⇒ 同一批事件，但 **W2 的第二数是恢复日、
+W3 的第一数是回撤内部的局部高点**。⇒ **两种切片都报**：
+
+* `stated` = 用户原样（**日历日，双端含**，`window_mask` 加 1 天做开区间上界）。
+* `episode` = 真实 cummax 峰→谷，**bar 级**（`res.bars.index >= peak & <= trough`），
+  与 `leg_attribution(mode="episode")` 的 P&L **同一段**（有测试钉住）。
+
+⚠️ **`episode` 的时间戳对由 `fa.episode_windows(bars)` 唯一给出**（落盘在 `69b_episode_windows.csv`）。
+**不要再造第三套边界**（例如给 episode 用日历日）—— 那会让「空腿亏了多少」和「当期 IC 是多少」
+落在两段不同的 bar 上，放同一行不可比。
+
+⚠️ **W2 的 `stated` 净收益是 +0.0188（正的）**，`episode` 才是 −0.1087。**−10.82% 是峰→谷深度，
+不是那 116 天的损益。**
+
+### 报告 §二 那张表的数据源
+
+`tables/69_window_table.csv` = 11 行（5 窗口 × 2 切片 + 正常期）× 11 列
+（`dd/net_pnl/gross_pnl/long_pnl/short_pnl/momentum_ic/dispersion/rank_turnover/universe/funding/cost`），
+**由脚本一步生成，报告逐字抄它**，并已用脚本逐格核对（0 处不符）。
+正常期 = 不落在任何**用户窗口**内的 1,643 个调仓点 / 40,136 根 bar。
+
+* P&L / funding / cost ← `61/61b_leg_attribution_*.csv`
+* Momentum IC（stated）← `63_factor_ic_by_window.csv`；episode 由 `episode_windows` 掩码同一份逐点 IC
+* Dispersion / Rank Turnover / Universe（stated）← `65b_rotation_table.csv`；
+  episode = 把 `65` 的**逐点**表按 `retag_episode` 重新打标再汇总（**不重算指标**）
+* 正常期 P&L ← `summary.json.normal_period`；正常期 IC ← `63` 的 `NORMAL` 行；
+  正常期 dispersion/turnover/universe ← `65b` 的 `NORMAL` 行
+
+### 结论表（数字全在 `FINDINGS.md` Q41）
+
+| 候选 | 判定 |
+|---|---|
+| A 动量反转 | 支持（**同期描述，无预测力**）：回撤期 IC −0.0378 vs +0.0088，块置换 p = 0.0095 |
+| B `flow` 失效 | 支持且更稳健：p = 0.0080（最显著）；单因子 Sharpe 0.50 / MDD −23.73%（都是最差） |
+| C 空腿崩跌式反弹 | 部分支持；**机制证据不足 / 无法确认** |
+| D 流动性压缩 | 伴随现象 / 放大器：4/5 窗口宇宙更窄（W4 仅 7.4 名），但 `binding_adv` 恒为 0 |
+| E 交易成本 | **排除**：5/5 窗口毛收益本身为负，成本只占毛亏损 6.7%–23.0% |
+
+分腿（`episode`）：**3/5 空腿驱动**（W1/W2/W4）、1/5 多腿（W5）、1/5 两腿同亏（W3）。
+⇒ **存在两类不同失效模式，不能用一个根因解释。**
+
+### regime 与动量标签（最容易做错的一处）
+
+`regime_frame` **签名里没有 `windows`** ⇒ 结构上不可能按窗口调阈值（阈值取全样本分位）。
+默认动量标签是 **`mom_ic_5d_trailing` = `ic_mom.rolling(5).mean().shift(1)`**。
+`ic_mom[t]` 由第 t 期未来收益算出 ⇒ **同期**；用同期标签分类 = 「拿结果解释结果」：
+**同一批 386 天**，同期 Sharpe **−4.97** / 滞后 **+3.01**（年化 −69.3% → +41.1%），**符号翻转**。
+同期口径只能作为**显式对照**产出（`ic_col="mom_ic_5d_contemp"` 会**整条优先级链重算**；
+早期版本只覆盖 `regime` 列 ⇒ 得到的是两者**并集**，把对照稀释掉了）。
+
+窗口构成：W1/W3/W5 是 MomentumReversal 超配（26.7% / 35.2% / 44.9% vs 正常 17.2%）；
+**W4 是 HighVol 事件（79.7%）**、**W2 是 StrongTrend 事件（53.4%）**。
+⚠️ 但 HighVol 长期 Sharpe 是 **+1.00**（正）⇒ **W4 的成因「证据不足 / 无法确认」**。
+
+### 本轮修掉的三个既有缺陷
+
+1. `analysis/ic.py::ic_series` 把「第 i 个**非 NaN** 值」贴到「第 i 个时刻」⇒ 中段 NaN（实测 152 个）
+   使其后全部错位（最大误差 1.66）。已记 `series_pos` 按位置重索引。该函数**此前无调用点**（已核实）。
+2. `momentum_reversal` 要求池 ≥20 名 ⇒ 5 个回撤窗口（宇宙 7.4–21.1）**全被丢掉** ⇒ 假结论。
+   已改为 Rank IC ≥8 名即可 + 尺度无关三分位价差，并同时报 `n`/`n_top10`/`mean_pool`。
+3. **`rotation_table` / `liquidity_table` 的 `windows` 参数被接受但完全不生效**（写死遍历
+   `WINDOW_LABELS`）⇒ 传 episode 窗口**静默返回空表**。已由 `_window_labels(windows)` 派生。
+   ⚠️ **「签名里有、实现里不用」是本项目反复出现的一类缺陷**（另见 `risk.atr_days`、
+   `_apply_leverage` 被 `set_leverage=None` 门控、`td_mode` 无主人）——**新函数收参数就要有断言钉住它生效。**
+
+### 变异测试记录（本轮 5 个，全被抓）
+
+`_window_labels` 退回常量 / `episode_windows` 改成日历日 / `retag_episode` 的 `REST` 改成 `NORMAL` /
+尾部价差 `top−bot` 反过来 / `tail_spread_table` 默认不出 `FULL` 行。
+脚本一次性（`finally` 还原 + 首尾 sha 核对），**跑完移出仓库**。
+
+---
+
+## 事前宽度检验（Q42 细节）——「宇宙变窄」到底有没有用
+
+**跑法**：`python scripts/exante_width.py`（约 20 s，纯只读，**不需要重建面板**）。
+产物 `artifacts/exante_width/{config.json, summary.json, tables/70*}`；
+结论 `artifacts/FINDINGS.md` Q42；报告 `artifacts/FAILURE_ATTRIBUTION.md` 第十一节。
+守卫 `tests/test_exante_width.py`（11 条）。
+
+### 为什么要做
+
+Q41 把「宇宙变窄」写成「伴随现象 / 放大器」就停手了 —— 那是**没检验就下结论**。
+它是 Q41 里**唯一**同时满足三点的候选：① 4/5 窗口成立；② **事前可见**；③ 能挂上具体机制
+（`cap × n ≤ 1` ⇒ `inverse_vol_weights` 静默退化成等权）。
+
+### 三个必须处理的坑
+
+1. **宽度有长期趋势**：与调仓点序号 Spearman **+0.398**；年均 2021 **11.7** → 2024 **23.1** → 2026 **13.1**。
+   ⇒ 必须用**滚动百分位**（只用 t 之前 180 期）。原始口径会骗你。
+2. **未来损益也有趋势** ⇒ 除原始损益外还要看**滚动去均值**版本。
+3. **宽度 0 的调仓点**（实测 **13** 个）无仓位、损益恒为 0 ⇒ 剔除并报数。
+
+### 结论（两个假设都被否定）
+
+* **宽度 → 下一期损益：没有预测力。** 8 个组合（原始/去趋势 × 净/毛 × 原始宽度/滚动百分位）
+  的 |t| **全部 < 1**。按滚动百分位分 5 组：Q1（最窄，11.8 名）净 **+0.0013**、
+  Q3 **+0.0017**、Q5（最宽，21.6 名）+0.0011；最窄−最宽 = +0.0002，
+  Welch p = 0.763、**块置换 p = 0.776**。**最窄那组是正的。**
+* **`cap × n ≤ 1` 的静默等权真的发生了，但不造成损失。** 先在真实账本上确认机制：
+  绑定组权重离散系数 **1.24e-17**（精确等权）、不绑定组 0.391。
+  但绑定组下一期损益**略好**：原始 +0.0014 vs +0.0009（块置换 p = 0.413）；
+  去趋势 +0.0012 vs −0.0001（Welch p = 0.094，块置换 p = 0.060）。
+  ⚠️ **不要**因此去调大 `max_weight_per_instrument`：那是无证据的参数改动，且抬高集中度。
+
+### 两个对 Q41 的更正
+
+* **「4/5 窗口宇宙更窄」被趋势污染。** 滚动百分位下：W1 0.189（窄）、W2 0.878（宽）、
+  **W3 0.746（宽，与原始口径翻转）**、W5 0.261（窄）、W4 **不适用**。
+  ⇒ Q41 的 D 从「伴随现象」降级为「**没有证据**」。
+* **W4 是样本第一个月（index = 1），且按每单位敞口是最严重的窗口。**
+  W4 −0.0934 / 敞口 0.365 = **−0.2558**，W1 −0.2110、W5 −0.1822、W2 −0.1392、W3 −0.1377。
+  名义 DD 最小只是因为**换手节流让账本只投了 36.5%**。W4 的「宇宙 7.4 名」主要是
+  **数据可用性**（2021 年池子里只有 11.7 个合格名字），cap 绑定占比 **88.4%**（正常 13.0%）。
+  冷启动（前 180 期）vs 成熟期：净损益 +0.0004 vs +0.0010（Welch p = 0.311、块置换 p = 0.375）
+  ⇒ 不显著更差，但**敞口只有一半**（0.524 vs 1.028）。
+
+### 第三次踩到同一个坑
+
+⚠️ **W4 差点又被静默丢掉**（滚动百分位需要 180 期历史，而 W4 在第一个调仓点），
+第一版直接把它从表里删了。**这已是第三次**：
+1. `momentum_reversal` 要求池 ≥20 名 ⇒ 5 个回撤窗口全 0 样本；
+2. `rotation_table` / `liquidity_table` 的 `windows` 参数被接受却不生效；
+3. Q42 的 W4 滚动百分位无定义。
+⇒ **纪律：「样本不足 / 参数不生效 / 算不出来」必须显式输出一行 + 一个可用性布尔列，
+绝不许 `continue` 掉。** 否则最该看的那个样本恰好消失，而且**看不出来**。
+
+### 变异测试记录（5 个，全被抓）
+
+`width_pct` 把当前点算进历史 / 改用**未来**窗口 / 前向损益差一根 bar /
+`cap_binding` 判据 `<=` 改 `<` / 静默丢掉 `width_pct` 算不出的窗口。
+其中一条是**真正的无未来函数检验**：把回测截断到前 k 期后，前 k−1 期的 `width_pct`
+必须**逐位不变**（`types.SimpleNamespace` 造截断结果，不需要复制大对象）。
+
+---
+
+## 空腿挤压检验（Q43 细节）——「被崩跌式反弹挤压」是**已否定**的
+
+**跑法**：`python scripts/short_squeeze.py`（约 30 s，**纯只读**，用已有产物，不重建面板）。
+产物 `artifacts/short_squeeze/{config.json, summary.json, tables/71*}`（`config.json` 里
+`"optimization_performed": false`）；结论 `artifacts/FINDINGS.md` Q43；报告 `artifacts/FAILURE_ATTRIBUTION.md`
+第十二节；模块 `crypto_ls_research/analysis/failure_attribution.py` 的
+`label_stated / _bar_simple_returns / _period_sum / short_book_frame / short_book_table /
+short_contributors / squeeze_verdict`。守卫 `tests/test_short_squeeze.py`（13 条）。
+
+### 为什么要做
+
+Q41 把「空腿被崩跌式反弹挤压」列为头号「证据不足 / 无法确认」——因为当时只测了空腿的
+**加权损益**，从没测过**被做空那些名字同期的收益分布**。「空腿亏钱」本身不是证据：做空一个
+上涨的市场必然亏钱。
+
+### 核心：空腿亏损必须**三分**（逐点恒等式）
+
+对每个调仓点 i，把空腿加权名字收益 `mw_ret_names`（= `−short_pnl / short_gross`）分解：
+
+```
+mw_ret_names = pool_mean + excess_select + excess_weight
+    pool_mean      = 池子（全部合格名字）等权收益        ← 市场
+    excess_select  = ew_mean − pool_mean               ← 选股（等权口径）
+    excess_weight  = mw_ret_names − ew_mean            ← 加权（仓位集中度）
+```
+
+**只有 `excess_select` 能判「挤压」** —— 它与 `pool_mean` **同为等权口径**，剔除了「做空一个
+上涨的市场」这个必然项。`short_book_table` 另给一条 NAV 三分解
+（`short_pnl_market / _select / _weight`），三项相加 = `short_pnl`（残差 4.4e-16）。
+
+### ⚠️ 最贵的坑：`excess_mw` 是**错的判据**
+
+`excess_mw = mw_ret_names − pool_mean` 拿**市值加权**减**等权**池子 —— 两个口径不同。牛市里它
+**恒为负**，于是把「空得最多的那几笔恰好涨得最多」误记成「被挤压」。**第一版就是这么报的**，
+必须换成 `excess_select`。符号陷阱：`mw_ret = short_pnl/short_gross` 是**损益**（正 = 空腿亏），
+`mw_ret_names = −mw_ret` 才是名字**收益**；拿损益去比等权收益在结构上就是错的。
+
+### 结论
+
+* **选股效应 5/5 窗口不显著**：Welch p **0.14–0.73**、块置换 p **0.08–0.73**（在 `excess_select` 上跑）。
+* **大涨占比 4/5 窗口低于池子**（`frac_big` 用 `> +5%` 计数）。
+* 亏损主要是**做空了一个上涨的市场**：W2 市场项占 **100%**、W4 占 **66%**；
+  W1 的例外来自**仓位集中度**（加权项），不是选股。
+* ⇒ **「空腿被崩跌式反弹挤压」已否定**（`squeeze_verdict`：W1/W2/REST = 已否定，
+  W3/W4/W5 = 证据不足 —— 因为那几个窗口样本少）。
+
+### 对账与「假守卫」
+
+* **区间分组**：`short_pnl` 对 `bars['short_ret']` 逐点求和，`max|Δ| = 1.3e-09`（float32 精度）。
+  分片口径：决策 `d = dec[i]`、执行 `t = d+1`，第 i 期收益是 bar 区间 `[dec[i]+1, dec[i+1]+1)`。
+* ⚠️ **这条对账是假守卫**：`short_pnl` 本身就来自引擎 `name_gross`，两边同源 ⇒ **把前向起点挪一根
+  bar 它不会红**，只钉住「区间怎么分组」。**变异测试当场抓出**。
+* 修法：加**由价格独立算出**的列 `short_pnl_px / long_pnl_px`
+  （`R_k = Σ_{t∈[a,b)} (px[t+1]/px[t] − 1)`，再 `Σ held·R`）与 `name_gross` 对账
+  （`max|Δ| = 2.9e-09`），**这才钉住价格口径**。⇒ 纪律：**对账要用「独立算一遍」的量。**
+
+### 变异测试记录（5 个，全被抓）
+
+前向起点 ±1 bar / `excess_select` 误用 `excess_mw` / `mw_ret_names` 漏负号 /
+`frac_big` 阈值改向 / 声明过的窗口被 `continue` 掉。**第 2 条在第 1 轮暴露了上面那条假守卫**
+（4/5），补上价格列后重跑 **5/5**。
+
+---
+
 ## 记忆文件本身的预算
 
-⚠️ **2026-09-30 更正：之前记的"~16.5 KB 注入预算"没有复现出来。**
+⚠️ **2026-09-30（第二次）更正：真的存在注入上限，位置在 17.2 KB 与 20.8 KB 之间。**
 
-实测：会话开始时 `MEMORY.md` = **17,160 B**，而系统提示里注入的 `working_memory_content`
-**逐字包含到文件最后一行**（`## 通知 / OKX` 的 `notional` 那条，结尾"外部 payload 先打一个
-样本的全部字段再写聚合"）—— **尾部完整，没有截断**。所以那个 16.5 KB 的数字**至少不是硬上限**。
+数据点：
+- 会话开始时 `MEMORY.md` = **17,160 B** → 注入的 `working_memory_content` **逐字包含到文件最后一行**，没截断。
+- 同日晚些时候 `MEMORY.md` = **20,844 B** → 系统在注入时**截断**，并在提示里要求先压缩。
+⇒ 上限 ∈ **(17,160, 20,844)**。**保守目标 ≤ 16.5 KB**，留余量。
 
-⇒ **不要为了一个复现不出来的数字删掉真规则**（这正是"判据坏了不许靠改判据变绿"的反面：
-判据没坏就别说它坏）。仍然值得做的：往 `MEMORY.md` 加东西时**顺手压掉等量内容**，保持它
-可读、不膨胀；长推导放本文件（`RULES-OPS.md` 不自动注入，所以它的体积不是问题，但它也因此
-**不会**进入上下文——真正的规则要留在 `MEMORY.md`）。
+处置（本次已做）：`MEMORY.md` 压到 **15,135 B / 12 节**（原 20,844 B / 19 节，**−27%**）。
+手法 = ① 合并同类节（`自动交易`+`设置持久化`+`三个「倍数」`→ 一节）；② **整段下沉**：把细则原文搬到
+本文件（`## 自动交易 / 设置持久化 / 三个「倍数」`），`MEMORY.md` 只留**指针 + 铁律**；③ 已完成检验的
+结论（Q32–Q35）只留**会再踩的规则**，数字指向 `FINDINGS.md`。
+
+⇒ **规则**：往 `MEMORY.md` 加东西时**顺手压掉等量内容**；**细则一律写本文件**（它不自动注入，体积不是
+问题，但它也因此**不进上下文**）——**真正的铁律必须留在 `MEMORY.md`**。加完用
+`wc -c .workbuddy-ai/memory/MEMORY.md` 复核，**超过 16.5 KB 就再压**。

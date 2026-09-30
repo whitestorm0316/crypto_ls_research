@@ -49,6 +49,7 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
+from ..config.settings import MARGIN_MODE
 from ..data.okx_client import RateLimiter
 
 DEFAULT_BASE = os.environ.get("OKX_BASE_URL", "https://www.okx.com")
@@ -500,7 +501,7 @@ class OKXPrivate:
     # -- orders ------------------------------------------------------------
     def place_order(self, inst_id: str, side: str, sz: str, *, pos_side: str = "net",
                     ord_type: str = "market", px: Optional[str] = None,
-                    td_mode: str = "cross", cl_ord_id: Optional[str] = None,
+                    td_mode: str = MARGIN_MODE, cl_ord_id: Optional[str] = None,
                     reduce_only: bool = False, tgt_ccy: Optional[str] = None) -> dict:
         body: Dict[str, Any] = {
             "instId": inst_id, "tdMode": td_mode, "side": side,

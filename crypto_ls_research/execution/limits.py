@@ -28,6 +28,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Set
 
 from .credentials import kill_switch_on, kill_switch_path
 from .planner import Plan
+from ..risk.engine import DEFAULT_MMR, implied_leverage, isolated_liq_distance
 
 
 @dataclass
@@ -255,3 +256,63 @@ def check_plan(plan: Plan, limits: LiveLimits, *, mode: str, nav: float,
 
 def blocking(vs: Sequence[Violation]) -> List[Violation]:
     return [x for x in vs if x.sev == "block"]
+
+
+# ---------------------------------------------------------------------------
+# margin headroom: reconcile the gate's *assumption* with the venue's reality
+# ---------------------------------------------------------------------------
+def margin_headroom_violations(positions: Sequence[dict],
+                               assumed_leverage: float, *,
+                               mmr: float = DEFAULT_MMR,
+                               flag_ratio: float = 1.2) -> List[Violation]:
+    """Flag held legs margined far above the leverage the backtest gate assumes.
+
+    This is the live counterpart of `risk.engine.liquidation_ok`.  The gate is a
+    *backtest* filter: it screens instruments against `RiskConfig.leverage_in_force`
+    and has no access to a venue.  So on its own it can only ever say "under my
+    assumption this is safe" -- and on 2026-09-30 that assumption was 5x (19.50%)
+    while a real leg sat at 100x, 0.57% from liquidation.  Nothing compared the
+    two, so the divergence was invisible.
+
+    `positions` are the parsed rows from `LiveEngine.account()["positions"]`
+    (`instId`, `pos`, `markPx`, `liqPx`, `mgnMode`).  The per-leg truth is read
+    from `liqPx`, never from `lever` -- `lever` mirrors the account *configuration*
+    and does not move when a position is re-margined (see `implied_leverage`).
+
+    Severity is **warn, never block**, and that is deliberate: blocking the
+    rebalance would freeze a book whose best remedy *is* the rebalance that
+    shrinks the offending leg.  The caller decides what to do; the point here is
+    that the divergence stops being silent.
+    """
+    v: List[Violation] = []
+    isolated = [p for p in positions if str(p.get("mgnMode")) == "isolated"]
+    priced = 0
+    for p in positions:
+        inst = p.get("instId")
+        mark, liq = p.get("markPx"), p.get("liqPx")
+        if not inst or not mark or not liq or float(mark) <= 0 or float(liq) <= 0:
+            continue
+        priced += 1
+        impl = implied_leverage(float(mark), float(liq), mmr)
+        if impl <= float(assumed_leverage) * flag_ratio:
+            continue
+        dist = abs(float(liq) - float(mark)) / float(mark)
+        v.append(Violation(
+            "warn", f"margin_headroom:{inst}",
+            f"{inst} 实际按 {impl:.0f}× 计价，距爆仓仅 {dist:.2%}",
+            f"风控假设的杠杆是 <b>{assumed_leverage:g}×</b>"
+            f"（距离 {isolated_liq_distance(float(assumed_leverage), mmr):.2%}），"
+            f"这条腿比它差 <b>{impl / max(float(assumed_leverage), 1e-9):.0f} 倍</b>。"
+            f"读的是 <span class='mono'>liqPx</span> 反推的真实杠杆，不是 "
+            f"<span class='mono'>lever</span>（后者只是配置的镜像，改配置不会重算在场持仓）。"
+            f"要真正改小只能<b>平掉重开</b>或<b>给该仓加保证金</b>。"))
+
+    # "could not evaluate" must not look like "passed": if the account holds
+    # isolated legs and *none* of them published a `liqPx`, the check did not run.
+    if isolated and priced == 0:
+        v.append(Violation(
+            "warn", "margin_headroom_unavailable",
+            f"{len(isolated)} 条逐仓腿都没有爆仓价，无法核对保证金余量",
+            "账户里存在逐仓持仓，但一条都没读到 <span class='mono'>liqPx</span>，"
+            "所以这次<b>没有评估</b>（不是通过）。等持仓端点能读到爆仓价后再看。"))
+    return v

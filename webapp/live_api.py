@@ -22,6 +22,7 @@ import time
 import traceback
 from typing import Callable, Dict, List, Optional, Tuple
 
+from crypto_ls_research.config.settings import MARGIN_MODE
 from crypto_ls_research.execution.credentials import (
     creds_status, delete_creds, kill_switch_on, kill_switch_path, save_creds,
     set_kill_switch,
@@ -119,6 +120,13 @@ def engine(mode: str, limits: Optional[dict] = None,
     distinction between "not supplied" (`None`) and "supplied as empty/0"
     ("do not touch leverage") matters, and collapsing them would make an
     explicit "turn it off" indistinguishable from "never mentioned".
+
+    `td_mode` is the opposite: it is accepted only so that an explicit
+    *conflict* is rejected loudly.  The margin mode is a pinned constant
+    (`settings.MARGIN_MODE`), not a per-request setting -- see `route_post`,
+    which turns a conflicting value into a 400.  Silently ignoring the field
+    would be worse than honouring it: a console that posts a mode the server
+    does not use is the "UI says one thing, the request does another" defect.
     """
     if mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}")
@@ -134,8 +142,8 @@ def engine(mode: str, limits: Optional[dict] = None,
             _ENGINES[mode] = eng
         elif limits:
             eng.limits = LiveLimits.from_dict(limits)
-        if td_mode in ("cross", "isolated"):
-            eng.td_mode = td_mode
+        # `td_mode` is deliberately *not* applied here: `LiveEngine` derives it
+        # from the constant, and a conflicting value has already been rejected.
         if set_leverage is not None:
             eng.set_leverage = _clean_leverage(set_leverage)
         return eng
@@ -261,6 +269,15 @@ _MODE_NOTE = {
 # ---------------------------------------------------------------------------
 def route_post(path: str, body: dict) -> Optional[Tuple[dict, int]]:
     body = body or {}
+
+    # The margin mode is a pinned constant, so a client that posts a *different*
+    # one is rejected rather than silently ignored.  A 400 (not a 500) because
+    # this is a client mistake, and the message has to say what to do about it.
+    _td = body.get("td_mode")
+    if _td is not None and str(_td) != MARGIN_MODE:
+        return ({"error": f"保证金模式已钉死为 {MARGIN_MODE}（settings.MARGIN_MODE），"
+                          f"不接受 td_mode={_td!r}。"},
+                400)
 
     if path == "/api/live/plan":
         mode = body.get("mode", "paper")

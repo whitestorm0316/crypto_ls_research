@@ -37,12 +37,12 @@ import numpy as np
 import pandas as pd
 
 from ..config.settings import (ACCEPTED_FACTORS, ACCEPTED_REBALANCE_DAYS,
-                               BARS_PER_DAY, CostConfig, SECONDS_PER_BAR)
+                               BARS_PER_DAY, MARGIN_MODE, CostConfig, SECONDS_PER_BAR)
 from ..data.okx_client import OKXClient
 from ..data.store import CACHE
 from .credentials import kill_switch_on, load_creds
 from .limits import (LiveLimits, Violation, blocking, check_plan,  # noqa: F401
-                     live_confirm_phrase)
+                     live_confirm_phrase, margin_headroom_violations)
 from .okx_private import (MAX_LEVERAGE_BATCH, MAX_ORDER_BATCH, AmbiguousError,
                           OKXError, OKXPrivate, make_clordid)
 from .planner import Order, Plan, build_plan, prices_from_cache
@@ -262,9 +262,21 @@ class LiveEngine:
                  signal_kwargs: Optional[dict] = None,
                  costs: Optional[CostConfig] = None,
                  ord_type: str = "market", limit_buffer_bps: float = 15.0,
-                 td_mode: str = "cross", set_leverage: Optional[float] = None):
+                 td_mode: Optional[str] = None, set_leverage: Optional[float] = None):
         if mode not in ("paper", "demo", "live"):
             raise ValueError(f"unknown mode {mode!r}")
+        # The margin mode is a pinned constant, not a setting: see
+        # `settings.MARGIN_MODE`.  `td_mode=` survives only so an explicit
+        # *conflict* can be rejected loudly.  It used to be assigned straight
+        # onto the engine, and that is exactly how the console and the daemon
+        # ended up on different modes against the same account.
+        if td_mode is not None and str(td_mode) != MARGIN_MODE:
+            raise ValueError(
+                f"td_mode={td_mode!r} conflicts with the pinned margin mode "
+                f"{MARGIN_MODE!r}.  The book is hedged, so isolated turns it into "
+                "N independent directional bets and a liquidation breaks the "
+                "hedge; the mode is a constant (settings.MARGIN_MODE) precisely "
+                "so no request can move it.  See FINDINGS Q36.")
         self.mode = mode
         self.store = Store(mode)
         # The saved caps beat the factory defaults.  They used to live only in
@@ -278,7 +290,6 @@ class LiveEngine:
         self.costs = costs or CostConfig()
         self.ord_type = ord_type
         self.limit_buffer_bps = limit_buffer_bps
-        self.td_mode = td_mode
         self.set_leverage = set_leverage
         self._last_leverage_notes: List[dict] = []
         self._prices: Dict[str, float] = {}
@@ -290,6 +301,15 @@ class LiveEngine:
         self._venue: tuple = (0.0, None)
         #: Set by whoever runs the job; slow/retry notices are streamed here.
         self._net_notice: Optional[Any] = None
+
+    #: Read-only on purpose.  Every process reads the same constant, so the
+    #: daemon and the console cannot disagree, and an assignment raises instead
+    #: of silently re-margining the account.  It is written into each run record
+    #: so the audit trail says which mode a fill was sent under.
+    @property
+    def td_mode(self) -> str:
+        """The pinned margin mode (`settings.MARGIN_MODE`).  Not settable."""
+        return MARGIN_MODE
 
     #: The tradable-instrument list is stable; the endpoint's failure mode is
     #: not, so a failure is cached far more briefly than a success.
@@ -664,6 +684,11 @@ class LiveEngine:
             "violations": [v.to_dict() for v in violations],
             "results": [], "errors": [], "elapsed": None,
             "forced": bool(force),
+            # Which margin mode this run's orders were sent under.  It is a
+            # constant today, but the record is what makes that checkable after
+            # the fact -- the fills used to carry no `tdMode` at all, so a
+            # post-mortem could not tell which mode a leg had been opened in.
+            "td_mode": self.td_mode,
         }
 
         if blocked:
@@ -1165,6 +1190,7 @@ class LiveEngine:
         blocked = blocking(violations)
         record = {"run_id": run_id, "mode": self.mode, "ts": time.time(),
                   "action": "flatten", "dry_run": bool(dry_run) or bool(blocked),
+                  "td_mode": self.td_mode,
                   "nav": nav, "n_orders": plan.n_orders, "n_ok": 0, "n_fail": 0,
                   "coverage": 0.0, "weight_err": 0.0,
                   "order_notional": plan.order_notional,
@@ -1229,6 +1255,7 @@ class LiveEngine:
             acct = self._paper_account()
             out["connected"] = True
             out["account"] = acct
+            out["margin_headroom"] = self.margin_headroom(acct)
             return out
         c = load_creds(self.mode)
         out["connected"] = False
@@ -1249,6 +1276,7 @@ class LiveEngine:
             out["equity_usdt"] = acct.get("nav")
             out["account"] = acct
             out["pos_mode"] = acct.get("pos_mode")
+            out["margin_headroom"] = self.margin_headroom(acct)
         except Exception as e:                                    # noqa: BLE001
             out["ok"] = False
             out["account_error"] = f"{type(e).__name__}: {e}"
@@ -1262,6 +1290,28 @@ class LiveEngine:
                 pass
         out["net"] = self.net_latency()
         return out
+
+    def margin_headroom(self, acct: Optional[dict] = None) -> List[dict]:
+        """Reconcile the assumed leverage with the leverage legs are *actually* on.
+
+        The backtest gate (`risk.engine.liquidation_ok`) screens instruments
+        against a modelling assumption and never sees a venue, so on its own it
+        can only say "safe under my assumption".  On 2026-09-30 that assumption
+        was 5x while a real leg sat at 100x, 0.57% from liquidation, and nothing
+        compared the two.  This is that comparison, and it reads `liqPx` rather
+        than `lever` (which only mirrors account *configuration*).
+
+        Returns `[]` when the account cannot be read -- the caller already has
+        `account_error` for that; inventing a verdict here would make "unknown"
+        look like "clean".
+        """
+        if acct is None:
+            try:
+                acct = self.account()
+            except Exception:                                     # noqa: BLE001
+                return []
+        return [x.to_dict() for x in margin_headroom_violations(
+            acct.get("positions") or [], float(self.limits.max_leverage))]
 
     def data_staleness(self) -> dict:
         """See `staleness()` for what the two ages mean and why both are reported."""

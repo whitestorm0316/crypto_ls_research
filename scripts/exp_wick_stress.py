@@ -417,7 +417,7 @@ def main() -> None:
     p = _p
     cfg = apply_overrides(default_config(bar=BAR, rebalance_bars=REBAL),
                           ACCEPTED_OVERRIDES)
-    liq_dist = 1.0 / max(cfg.risk.max_leverage, 1e-9) - mmr
+    liq_dist = 1.0 / max(cfg.risk.leverage_in_force, 1e-9) - mmr
     thr = liq_dist / cfg.risk.min_liquidation_atr_multiple
     atr = ((p.high - p.low) / p.close).rolling(24, min_periods=2).mean()
     rows = []
@@ -434,7 +434,7 @@ def main() -> None:
                      "atr_max": float(np.nanmax(a))})
     atrt = pd.DataFrame(rows)
     save(atrt, "40e_atr_filter")
-    print(f"  门槛 3·ATR% <= 1/{cfg.risk.max_leverage:g} - {mmr} = {liq_dist:.4f} "
+    print(f"  门槛 3·ATR% <= 1/{cfg.risk.leverage_in_force:g} - {mmr} = {liq_dist:.4f} "
           f"⇒ ATR% <= {thr:.4f} ({thr:.2%})", flush=True)
     print(atrt.to_string(index=False, float_format=lambda v: f"{v:,.4f}"), flush=True)
 

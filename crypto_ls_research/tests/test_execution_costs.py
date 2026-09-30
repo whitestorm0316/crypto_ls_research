@@ -242,7 +242,7 @@ def test_drawdown_ladder_steps_and_never_locks_out():
 
 
 def test_liquidation_filter_excludes_high_atr_names():
-    rc = RiskConfig(max_leverage=5.0, min_liquidation_atr_multiple=3.0)
+    rc = RiskConfig(leverage_in_force=5.0, min_liquidation_atr_multiple=3.0)
     assert 1 / 5.0 - 0.005 == pytest.approx(0.195)
     atr = np.array([0.01, 0.05, 0.065, 0.20, np.nan])
     ok = liquidation_ok(atr, rc)

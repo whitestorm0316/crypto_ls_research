@@ -28,6 +28,38 @@ CACHE_DIR: str = os.environ.get("CRYPTO_CACHE_DIR") or os.path.abspath(
 )
 
 # ----------------------------------------------------------------------------
+# margin mode -- THE single source of truth
+# ----------------------------------------------------------------------------
+# This is a *constant*, not a setting, and it is deliberately the only place the
+# live book's margin mode is written.  It used to be an in-memory attribute of
+# one `LiveEngine`: `/api/live/execute` took `td_mode` from the request body, so
+# the console could flip the account to `isolated` while `AutoTrader` (which
+# never passed the field) kept sending `cross` -- and a restart silently reverted
+# the console.  Measured 2026-09-30: the same demo account held the *same*
+# instrument in both modes, and which mode the next order used depended on which
+# process submitted it.  Nothing reconciled the two.
+#
+# `isolated` (chosen 2026-09-30) because a SHORT's loss is **unbounded**: in
+# `cross`, one contract gapping up takes the whole account, not just its own
+# leg.  Measured on the live demo book (NAV 55,348, gross 0.43x NAV) the most
+# fragile short needed only **30.7x** to take the account to zero -- so the
+# "100x" case that prompted this change is 3x more than necessary.  Under
+# `isolated` the same move costs only that leg's margin, and nothing else.
+#
+# THE COST, and it is not small: `isolated` puts each leg `1/L - mmr` from
+# liquidation, so the protection only pays off at LOW leverage.  Measured over
+# 154 instruments x 5.7y (intraday extremes -- an upper bound) for a 10-name book:
+#     3x -> 32.8% distance -> ~30 forced liquidations/yr
+#     2x -> 49.0%          -> ~10
+#     1x -> 99.5%          -> ~1
+# A forced liquidation realises the loss at the worst point AND removes the
+# hedge, so **run isolated at 1x**.  3x is what the account happened to be
+# configured with; lowering leverage does NOT re-margin legs already open (see
+# FINDINGS Q36), so existing positions must be closed and reopened.
+# See FINDINGS Q45 for both sides of the cross-vs-isolated trade-off.
+MARGIN_MODE: str = "isolated"
+
+# ----------------------------------------------------------------------------
 # frequency table
 # ----------------------------------------------------------------------------
 BARS_PER_DAY: Dict[str, int] = {
@@ -253,9 +285,25 @@ class RiskConfig:
     dd_stop_new_entries_above: float = 0.20
 
     max_adv_participation: float = 0.05       # per rebalance, per instrument
-    max_leverage: float = 5.0                 # account leverage -> liquidation distance
+    # The leverage the *liquidation gate* assumes the book is margined at -- NOT
+    # a ceiling on what we are willing to set.  Those were the same object until
+    # 2026-09-30, which is why the gate could insist "19.50% is safe" while a
+    # live leg sat at 100x, 0.57% from liquidation: it was reading a policy cap
+    # as if it were a fact about the venue.  The live ceiling lives on
+    # `LiveLimits.max_leverage`; this field is a modelling assumption and is
+    # named so.  `liquidation_ok` also takes an explicit `leverage=` override.
+    leverage_in_force: float = 5.0
     min_liquidation_atr_multiple: float = 3.0
     atr_days: float = 1.0
+
+    def __post_init__(self) -> None:
+        # A leverage below 1x is not a conservative assumption, it is a typo:
+        # `1/L - mmr` would go non-positive and the gate would silently reject
+        # every instrument (or, with mmr > 1/L, behave like a sign error).
+        if not (float(self.leverage_in_force) >= 1.0):
+            raise ValueError(
+                f"RiskConfig.leverage_in_force={self.leverage_in_force!r} must be >= 1; "
+                "it is the leverage the liquidation gate assumes, not a cap.")
 
 
 # ----------------------------------------------------------------------------

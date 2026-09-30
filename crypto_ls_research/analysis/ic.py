@@ -101,6 +101,7 @@ def rank_ic_over_horizons(result: BacktestResult, panels: Panels,
 
     rows = []
     series: Dict[int, pd.Series] = {}
+    positions: Dict[int, List[int]] = {}
     for h in horizons_bars:
         ics = np.full(len(dec_idx), np.nan)
         for i, d in enumerate(dec_idx):
@@ -113,6 +114,12 @@ def rank_ic_over_horizons(result: BacktestResult, panels: Panels,
             ics[i] = _spearman(score[i], fwd)
         s = pd.Series(ics, index=result.reb_ts).dropna()
         series[int(h)] = s
+        # Where the surviving points sit in `result.reb_ts`.  `ic_series` needs this to
+        # put them back on the right timestamps: NaN arises both at the END (no room for
+        # the horizon) and in the MIDDLE (early universes with fewer than 8 eligible
+        # names), so "the i-th surviving value belongs to the i-th timestamp" is wrong.
+        # Measured on v5_1d_all5: 152 mid-sample NaNs; the shift reached 1.66 in IC.
+        positions[int(h)] = [int(i) for i in np.flatnonzero(np.isfinite(ics))]
         mu, sd = (float(s.mean()), float(s.std(ddof=1))) if len(s) > 2 else (np.nan, np.nan)
         icir = mu / sd if sd and np.isfinite(sd) and sd > 0 else np.nan
         t = icir * np.sqrt(len(s)) if np.isfinite(icir) else np.nan
@@ -127,15 +134,24 @@ def rank_ic_over_horizons(result: BacktestResult, panels: Panels,
     # keep the IC time series for plotting, but as JSON-safe lists: pandas compares
     # `attrs` on concat and Series values raise "truth value is ambiguous".
     out.attrs["series"] = {int(h): [float(x) for x in s.to_numpy()] for h, s in series.items()}
+    out.attrs["series_pos"] = {int(h): list(p) for h, p in positions.items()}
     out.attrs["series_index"] = [str(t) for t in result.reb_ts]
     return out
 
 
 def ic_series(ic_tab: pd.DataFrame, horizon_bars: int) -> pd.Series:
+    """The per-rebalance IC series, on its own timestamps.
+
+    Uses the recorded positions when present so that mid-sample NaNs (early universes
+    too thin to rank) do not shift every later value onto the wrong date.
+    """
     s = ic_tab.attrs.get("series", {}).get(int(horizon_bars))
     if not s:
         return pd.Series(dtype="float64")
     idx = pd.to_datetime(ic_tab.attrs.get("series_index", []), utc=True)
+    pos = ic_tab.attrs.get("series_pos", {}).get(int(horizon_bars))
+    if pos is not None and len(pos) == len(s) and len(idx):
+        return pd.Series(s, index=idx[np.asarray(pos, dtype=int)])
     return pd.Series(s, index=idx[: len(s)])
 
 

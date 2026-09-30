@@ -2823,19 +2823,30 @@ function liveLeverageHtml(lim) {
   const st = L.status || {};
   const cur = st.leverage;                     // 将要请求的杠杆（null = 不改）
   const cap = (lim.max_leverage != null) ? lim.max_leverage : (st.leverage_cap);
-  const td = st.td_mode || 'cross';
+  const td = st.td_mode || 'isolated';
+  /* Label only -- the *value* is whatever the server reports, never a front-end
+   * copy of the setting.  Same rule as the optimal-parameter set. */
+  const tdLabel = td === 'isolated' ? '逐仓 isolated'
+                : td === 'cross'    ? '全仓 cross' : td;
   /* 这两个数字以前是写死的「0.47× / 20%」，数据一重建就会自相矛盾（和页头横幅
    * 那次是同一个缺陷）。毛敞口取 baseline 的实算均值，换手取当前生效的预算。 */
   const gAvg = (S.baseline || {}).gross_avg;
   const gAvgTxt = (gAvg != null && isFinite(gAvg)) ? `${fmt.n(gAvg, 2)}×` : '—';
   const turnTxt = (st.turnover_budget != null) ? fmt.pct(st.turnover_budget, 0) : '不限制';
   let h = `<div class="split" style="margin-top:12px;border-top:1px solid var(--border);padding-top:11px">
-      <div><b style="font-size:12.5px">保证金模式</b></div>
-      <select id="lvTdMode" class="liveinput" style="width:150px">
-        <option value="cross"${td === 'cross' ? ' selected' : ''}>全仓 cross</option>
-        <option value="isolated"${td === 'isolated' ? ' selected' : ''}>逐仓 isolated</option>
-      </select>
+      <div><b style="font-size:12.5px">保证金模式</b>
+        <div class="muted" style="font-size:11px">已钉死，页面上改不了</div></div>
+      <div class="mono" id="lvTdMode" data-td-mode="${esc(td)}"
+           style="width:150px;text-align:right">${esc(tdLabel)}</div>
     </div>
+    <p class="desc" style="margin:8px 0 0">
+      <b>空头的亏损没有上限</b>：全仓下单个合约暴涨会把<b>整个账户</b>打爆 ——
+      实测账本里最脆弱的空头只要 <b>30.7 倍</b>就够（你说的 100 倍是 3 倍有余）。
+      逐仓只亏掉<b>那一条腿</b>的保证金。所以模式是<b>常量</b>
+      （<span class="mono">settings.MARGIN_MODE</span>），不是每次请求可以改的设置 ——
+      守护进程与控制台必须读同一个值。这里只显示、不提供控件；服务端也会拒绝任何试图改它的请求。
+      <b>代价</b>：逐仓把每条腿放在 <span class="mono">1/L − mmr</span> 处爆仓，所以<b>杠杆必须低</b> ——
+      3× 下 10 名账本每年约 <b>30 次</b>强制平仓，1× 下约 <b>1 次</b>。</p>
     <div class="split" style="margin-top:8px">
       <div><b style="font-size:12.5px">账户杠杆</b>
         <div class="muted" style="font-size:11px">留空 = 不改交易所现有设置</div></div>
@@ -3018,11 +3029,10 @@ function liveBind() {
   const lrd = $('#lvRequireDue');
   if (lrd) lrd.onchange = () => liveSaveLimits(lrd.checked);
   const ltm = $('#lvTdMode');
-  if (ltm) ltm.onchange = () => {
-    S.live.status = Object.assign({}, S.live.status || {}, { td_mode: ltm.value });
-    S.live.note = `保证金模式改为 ${ltm.value === 'cross' ? '全仓' : '逐仓'}，下次生成计划/执行时随请求发出`;
-    livePaintAll();
-  };
+  /* 保证金模式不再是控件：它由服务端常量决定，页面只显示。这里留着是为了让
+   * 「页面上有个模式选择器」这件事一旦被加回来，测试能立刻发现（见
+   * tests/test_margin_mode.py 的页面守卫）。 */
+  if (ltm) ltm.dataset.tdMode = (S.live.status || {}).td_mode || 'isolated';
   const llv = $('#lvLever');
   if (llv) llv.onchange = () => {
     const v = String(llv.value || '').trim();
@@ -3198,15 +3208,16 @@ function pollLiveJob(id) {
   }, 1200);
 }
 
-/* 保证金模式与杠杆必须随每一次下单请求一起发出去，不能只在「保存限额」时发。
+/* 账户杠杆必须随每一次下单请求一起发出去，不能只在「保存限额」时发。
  * 否则你在页面上把杠杆设成 5×、点了执行，请求里却根本没带这个字段 ——
- * 引擎按「不改杠杆」下单，页面却显示 5×。这是「UI 说一套、请求发另一套」。 */
+ * 引擎按「不改杠杆」下单，页面却显示 5×。这是「UI 说一套、请求发另一套」。
+ *
+ * 保证金模式**不在这里发**：它是服务端常量，不是每次请求的设置。以前发它，
+ * 正是「控制台一次请求就能把全仓改成逐仓、重启又静默回 cross」的成因。 */
 function liveTradeSettings() {
   const L = S.live;
-  const td = $('#lvTdMode');
   const lv = $('#lvLever');
   const out = {};
-  if (td && td.value) out.td_mode = td.value;
   if (lv) {
     const v = String(lv.value || '').trim();
     if (v !== '') { const f = Number(v); if (isFinite(f) && f >= 1) out.leverage = f; }

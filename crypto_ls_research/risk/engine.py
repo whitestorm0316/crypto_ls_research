@@ -8,13 +8,17 @@ base book, in this order:
 plus two per-instrument constraints applied after sizing:
 
     * ADV participation cap       |delta notional| <= max_adv_participation * ADV_t
-    * liquidation-distance filter  requiring  3*ATR% <= 1/max_leverage - mmr
+    * liquidation-distance filter  requiring  3*ATR% <= 1/L_in_force - mmr
+
+`L_in_force` is `RiskConfig.leverage_in_force` -- the leverage the gate *assumes*,
+which is a modelling assumption and is deliberately **not** the same field as any
+policy ceiling.  See `liquidation_ok` for why that distinction is load-bearing.
 
 Everything consumes only information available at the decision bar.
 """
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -93,9 +97,70 @@ def dd_scale(drawdown: float, rcfg: RiskConfig, stop_new_entries_above: float = 
 # ---------------------------------------------------------------------------
 # per-instrument constraints
 # ---------------------------------------------------------------------------
-def liquidation_ok(atr_pct: np.ndarray, rcfg: RiskConfig, mmr: float = DEFAULT_MMR) -> np.ndarray:
-    """True where the instrument can be held at `max_leverage` with >= k*ATR of headroom."""
-    liq_dist = 1.0 / max(rcfg.max_leverage, 1e-9) - mmr
+def isolated_liq_distance(lever: float, mmr: float = DEFAULT_MMR) -> float:
+    """`1/L - mmr`: the adverse move that eats a leg's own isolated margin."""
+    return 1.0 / max(float(lever), 1e-9) - mmr
+
+
+def implied_leverage(mark_px: float, liq_px: float,
+                     mmr: float = DEFAULT_MMR) -> float:
+    """The leverage a position is **actually margined at**, inverted from `liqPx`.
+
+    Inverting `isolated_liq_distance`:
+
+        dist = 1/L - mmr   =>   L = 1 / (dist + mmr),  dist = |liqPx - markPx| / markPx
+
+    Why this has to exist: the venue's `lever` field (on both `/account/positions`
+    and `/account/leverage-info`) mirrors the *account configuration* for
+    `(instId, mgnMode, posSide)` -- **not** the leverage the open position is
+    margined at.  Measured 2026-09-30 on the demo venue: setting NEAR `isolated`
+    long from 3 to 5 moved `lever` to "5" but left the position's `margin`
+    (116.906) and `liqPx` (3.317332) **bit-identical** for >65s.  A reader who
+    trusts `lever` will believe a leg was re-margined when it was not; `liqPx` is
+    the only field that tells the truth.
+
+    ⚠️ It is an **estimate**: the venue's own liquidation formula uses a
+    per-instrument maintenance-margin rate (and fees) while we assume a flat
+    `mmr = 0.005`.  Measured on 9 legs on 2026-09-30: `config=3` came back as
+    2.98-3.30 (+/-10%), `config=100` came back as 93.6 (-6%).  Treat it as a
+    detector for *gross* divergence (the 20% flag), not a precise readout.
+    """
+    mark = float(mark_px)
+    if mark <= 0:
+        raise ValueError("mark_px must be positive")
+    dist = abs(float(liq_px) - mark) / mark
+    return 1.0 / (dist + mmr)
+
+
+def liquidation_ok(atr_pct: np.ndarray, rcfg: RiskConfig, mmr: float = DEFAULT_MMR,
+                   *, leverage: Optional[float] = None) -> np.ndarray:
+    """Instrument volatility screen against a **stated** margin buffer.
+
+    True where `k * ATR% <= 1/L - mmr`, i.e. where a name's typical bar move
+    leaves at least `k` multiples of headroom before the assumed liquidation
+    distance.  Two things about it used to be silently wrong:
+
+    1. **`L` was `rcfg.max_leverage`, i.e. a policy *cap* read as a fact.**  The
+       gate therefore always assumed the ceiling was in force.  Measured on the
+       live demo account, the gate assumed 5x -> 19.50% while `BTC-USDT-SWAP
+       short isolated` sat at **100x**, 0.57% from liquidation -- off by ~33x,
+       and it reported "safe".  `L` is now `rcfg.leverage_in_force` (a modelling
+       assumption, named as such) and callers that know the real leverage pass
+       `leverage=` explicitly.  Nothing here falls back to a ceiling.
+
+    2. **The formula is the *isolated* one, whatever the margin mode.**  That is
+       a conservative per-leg proxy: in `cross` mode there is no per-position
+       liquidation price at all (the whole account equity backs every leg), so
+       the honest account-level distance `(1 - mmr*G)/G` is far larger and this
+       screen is *not* what keeps the book solvent.  It is kept as a
+       volatility screen so that changing it does not silently move the accepted
+       backtest; making it mode-aware is a separate, headline-moving change.
+
+    The live counterpart -- comparing this assumption against each held leg's
+    `implied_leverage` -- is `execution.limits.margin_headroom_violations`.
+    """
+    lev = float(rcfg.leverage_in_force if leverage is None else leverage)
+    liq_dist = isolated_liq_distance(lev, mmr)
     need = rcfg.min_liquidation_atr_multiple * np.nan_to_num(atr_pct, nan=np.inf)
     return np.isfinite(atr_pct) & (need <= liq_dist)
 

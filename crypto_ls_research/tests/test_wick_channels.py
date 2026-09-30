@@ -334,7 +334,7 @@ def test_the_open_shock_cost_is_linear_in_the_shock_size():
 # 5. the liquidation filter's calibration
 # ---------------------------------------------------------------------------
 def test_liquidation_filter_threshold_is_three_atr_at_five_x():
-    """`3 * ATR% <= 1/max_leverage - mmr` -> ATR% <= 6.5% at 5x.
+    """`3 * ATR% <= 1/L_in_force - mmr` -> ATR% <= 6.5% at 5x.
 
     This is the only wick-specific *pre-trade* defence in the system, so its
     calibration is pinned -- including the direction, which is easy to state
@@ -342,8 +342,8 @@ def test_liquidation_filter_threshold_is_three_atr_at_five_x():
     shrinks the liquidation distance `1/L - mmr`.
     """
     rc5 = synth_cfg().risk
-    rc5.max_leverage, rc5.min_liquidation_atr_multiple = 5.0, 3.0
-    thr5 = (1.0 / rc5.max_leverage - DEFAULT_MMR) / rc5.min_liquidation_atr_multiple
+    rc5.leverage_in_force, rc5.min_liquidation_atr_multiple = 5.0, 3.0
+    thr5 = (1.0 / rc5.leverage_in_force - DEFAULT_MMR) / rc5.min_liquidation_atr_multiple
     assert abs(thr5 - 0.065) < 1e-12, f"threshold moved: {thr5}"
 
     atr = np.array([0.03, thr5 - 1e-9, thr5, thr5 + 1e-9, 0.12, np.nan])
@@ -352,15 +352,15 @@ def test_liquidation_filter_threshold_is_three_atr_at_five_x():
         "longer treats an unknown ATR as untradeable")
 
     rc20 = synth_cfg().risk
-    rc20.max_leverage, rc20.min_liquidation_atr_multiple = 20.0, 3.0
-    thr20 = (1.0 / rc20.max_leverage - DEFAULT_MMR) / rc20.min_liquidation_atr_multiple
+    rc20.leverage_in_force, rc20.min_liquidation_atr_multiple = 20.0, 3.0
+    thr20 = (1.0 / rc20.leverage_in_force - DEFAULT_MMR) / rc20.min_liquidation_atr_multiple
     assert thr20 < thr5, "raising the leverage ceiling must tighten the filter"
     assert bool(liquidation_ok(np.array([0.07]), rc20)[0]) is False, (
         "a 7% ATR name passed at 20x, where the liquidation distance is only 4.5%")
 
     rc3 = synth_cfg().risk
-    rc3.max_leverage, rc3.min_liquidation_atr_multiple = 3.0, 3.0
-    thr3 = (1.0 / rc3.max_leverage - DEFAULT_MMR) / rc3.min_liquidation_atr_multiple
+    rc3.leverage_in_force, rc3.min_liquidation_atr_multiple = 3.0, 3.0
+    thr3 = (1.0 / rc3.leverage_in_force - DEFAULT_MMR) / rc3.min_liquidation_atr_multiple
     assert thr3 > thr5, "lowering the leverage ceiling must loosen the filter"
     assert bool(liquidation_ok(np.array([0.07]), rc3)[0]) is True, (
         "a 7% ATR name was rejected at 3x, where the liquidation distance is 32.8%")

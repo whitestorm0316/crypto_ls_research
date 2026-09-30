@@ -308,9 +308,12 @@ SPEC: dict = {
                  "type": "number", "default": 0.05, "min": 0.001, "max": 0.5,
                  "step": 0.005, "level": "adv",
                  "help": "容量上限的硬约束所在。"},
-                {"key": "risk.max_leverage", "label": "账户最大杠杆",
+                {"key": "risk.leverage_in_force", "label": "清算闸门假设杠杆",
                  "type": "number", "default": 5.0, "min": 1.0, "max": 20.0,
-                 "step": 0.5, "level": "adv"},
+                 "step": 0.5, "level": "adv",
+                 "help": "闸门按 `3·ATR% ≤ 1/L − mmr` 筛标的时**假设**的杠杆，"
+                         "不是账户上限（上限在实盘限额表里）。实盘用 liqPx 反推的真实"
+                         "杠杆与它对账。"},
             ],
         },
         {
