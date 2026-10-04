@@ -43,7 +43,7 @@ from ..data.store import CACHE
 from .credentials import kill_switch_on, load_creds
 from .limits import (LiveLimits, Violation, blocking, check_plan,  # noqa: F401
                      live_confirm_phrase, margin_headroom_violations)
-from .okx_private import (MAX_LEVERAGE_BATCH, MAX_ORDER_BATCH, AmbiguousError,
+from .okx_private import (MAX_ORDER_BATCH, AmbiguousError,
                           OKXError, OKXPrivate, make_clordid)
 from .planner import Order, Plan, build_plan, prices_from_cache
 from .signal import LiveTarget, compute_live_target
@@ -290,7 +290,13 @@ class LiveEngine:
         self.costs = costs or CostConfig()
         self.ord_type = ord_type
         self.limit_buffer_bps = limit_buffer_bps
+        #: 想设的账户杠杆。`None`(默认) = **下单时不动杠杆**：不发任何
+        #: `set-leverage` 请求，每条腿沿用交易所当前的配置。它不是订单属性，
+        #: 是账户级配置 —— 见 `effective_leverage`。
         self.set_leverage = set_leverage
+        #: 最近一次下单**有没有**去改杠杆。它和"改了但失败"是两件事，账本里必须分得开：
+        #: 前者是配置，后者是事故。
+        self._leverage_applied = False
         self._last_leverage_notes: List[dict] = []
         self._prices: Dict[str, float] = {}
         self._prices_ts = 0.0
@@ -310,6 +316,24 @@ class LiveEngine:
     def td_mode(self) -> str:
         """The pinned margin mode (`settings.MARGIN_MODE`).  Not settable."""
         return MARGIN_MODE
+
+    @property
+    def effective_leverage(self) -> Optional[float]:
+        """The leverage we will actually ask the exchange for -- or `None`.
+
+        `None`(默认) 表示 **下单时不发杠杆请求**：每条腿沿用交易所当前的配置。
+
+        这里曾经把「未指定」回退成 `limits.max_leverage`，理由是"绝不让交易所替
+        我们决定"（BTC/ETH 默认 100×、离强平 0.57%）。理由本身没错，但代价是
+        **每一笔下单都先打 2×N 次 `set-leverage`**：19 个合约约 27 秒、会撞限流
+        （50011），一旦失败还会把一笔本来能成交的调仓堵在门口。
+
+        账户杠杆是**账户级配置，不是订单属性**。想让它等于某个值，是单独设一次
+        （页面上的杠杆输入框 / 请求里带一次 `leverage`），而不是塞进每一次下单。
+        """
+        if self.set_leverage is None:
+            return None
+        return float(self.set_leverage)
 
     #: The tradable-instrument list is stable; the endpoint's failure mode is
     #: not, so a failure is cached far more briefly than a success.
@@ -603,7 +627,7 @@ class LiveEngine:
           f"覆盖率 {plan.coverage:.1%}")
         violations = check_plan(plan, self.limits, mode=self.mode, nav=acct["nav"],
                                 rebalance_due=target.rebalance_due,
-                                leverage=self.set_leverage,
+                                leverage=self.effective_leverage,
                                 venue_insts=self.venue_instruments(),
                                 rebalance_days=grid_days(
                                     target, self.signal_kwargs.get("bar")))
@@ -666,7 +690,7 @@ class LiveEngine:
         p(f"④ 计划 {plan.n_orders} 笔订单 · 名义额 {plan.order_notional:,.0f} USDT")
         violations = check_plan(plan, self.limits, mode=self.mode, nav=nav,
                                 rebalance_due=target.rebalance_due, force=force,
-                                leverage=self.set_leverage,
+                                leverage=self.effective_leverage,
                                 venue_insts=self.venue_instruments(),
                                 rebalance_days=grid_days(
                                     target, self.signal_kwargs.get("bar")))
@@ -732,25 +756,32 @@ class LiveEngine:
         # dropped on the floor.
         lev_notes = getattr(self, "_last_leverage_notes", [])
         self._last_leverage_notes = []
-        if lev_notes:
-            record["leverage"] = lev_notes
-            failed = [n for n in lev_notes if not n["ok"]]
-            capped = [n for n in lev_notes if n["capped"]]
-            if failed:
-                record["violations"] = record["violations"] + [{
-                    "sev": "warn", "key": "leverage_failed",
-                    "title": f"{len(failed)} 个合约未能设置杠杆",
-                    "body": "实际杠杆可能不是你以为的值，保证金占用与预期不符："
-                            + "、".join(f"{n['instId']}（{n['error']}）" for n in failed[:5])
-                            + ("…" if len(failed) > 5 else "") + "。请到交易所确认后再加仓。"}]
-            if capped:
-                record["violations"] = record["violations"] + [{
-                    "sev": "warn", "key": "leverage_capped",
-                    "title": f"{len(capped)} 个合约被交易所上限压低",
-                    "body": "交易所对该合约的杠杆上限低于你的设置，已按较低值设置："
-                            + "、".join(f"{n['instId']} → {n['leverage']}×（上限 {n['max_lever']}×）"
-                                        for n in capped[:5])
-                            + ("…" if len(capped) > 5 else "") + "。"}]
+        record["leverage"] = lev_notes
+        if not getattr(self, "_leverage_applied", False):
+            # 「按配置没去设」和「设了但失败」必须分得开：一个是意图，一个是事故。
+            # 只有后者才是违规；前者是账本要如实记下的事实。
+            record["leverage_note"] = (
+                "本次未修改交易所杠杆（下单路径不发杠杆请求），"
+                "每条腿沿用交易所当前的杠杆配置。")
+        failed = [n for n in lev_notes if not n["ok"]]
+        capped = [n for n in lev_notes if n["capped"]]
+        if failed:
+            record["violations"] = record["violations"] + [{
+                "sev": "warn", "key": "leverage_failed",
+                "title": f"{len(failed)} 个合约未能设置杠杆",
+                "body": "实际杠杆可能不是你以为的值，保证金占用与预期不符："
+                        + "、".join(
+                            f"{n['instId']}{'/' + n['posSide'] if n.get('posSide') else ''}"
+                            f"（{n['error']}）" for n in failed[:5])
+                        + ("…" if len(failed) > 5 else "") + "。请到交易所确认后再加仓。"}]
+        if capped:
+            record["violations"] = record["violations"] + [{
+                "sev": "warn", "key": "leverage_capped",
+                "title": f"{len(capped)} 个合约被交易所上限压低",
+                "body": "交易所对该合约的杠杆上限低于你的设置，已按较低值设置："
+                        + "、".join(f"{n['instId']} → {n['leverage']}×（上限 {n['max_lever']}×）"
+                                    for n in capped[:5])
+                        + ("…" if len(capped) > 5 else "") + "。"}]
         record["results"] = results
         record["n_ok"] = sum(1 for r in results if r.get("ok"))
         record["n_fail"] = len(results) - record["n_ok"]
@@ -831,81 +862,101 @@ class LiveEngine:
 
     # ---- real orders -----------------------------------------------------
     def _apply_leverage(self, plan: Plan) -> List[dict]:
-        """Set the account leverage on every name about to be traded.
+        """Set the account leverage on every `(instId, posSide)` about to be traded.
 
-        Why every name rather than once per account: OKX keeps leverage *per
-        instrument per margin mode*, so "the account is 5x" is not a thing you
-        can set.  A name we never set stays at whatever it was -- which is
-        exactly the failure that must not be silent: you think you are 5x,
-        you are actually 20x (or 1x), and the margin that backs the book is not
-        the margin you sized against.
+        Why every cell rather than once per account: OKX keeps leverage
+        *per instrument, per margin mode, **per position side***, so "the account
+        is 5x" is not a thing you can set.  A cell we never set stays at whatever
+        it was -- which is exactly the failure that must not be silent: you think
+        you are 5x, you are actually 20x (or 100x), and the margin that backs the
+        book is not the margin you sized against.  Measured on this account
+        (2026-09-30): `BTC-USDT-SWAP` isolated sat at **100x** -- its ceiling --
+        while every other instrument, including three we had never traded, read
+        3x.  Orders inherit that silently, because `place_order` carries no
+        leverage field at all.
+
+        Two things this used to get wrong, both verified against the venue:
+
+        * `set_leverage` sent no `posSide`.  In long/short position mode with
+          isolated margin OKX **requires** it and answers
+          `51000 Parameter posSide error` -- so isolated leverage could never be
+          set, on any instrument, ever.
+        * it called `/api/v5/account/batch-set-leverage`, which does not exist
+          (**HTTP 404**), so every rebalance paid three retries and a fallback
+          before failing anyway.
+
+        So now: one call per cell, both sides when the mode is long/short +
+        isolated, concurrently -- there is no batch endpoint to lean on and 2×19
+        round trips in series is ~27s of silence.
 
         So every failure is returned as a note and surfaced, never swallowed.
 
-        It is however per instrument *within one request*: OKX has
-        `/account/batch-set-leverage` (≤20 rows), and going one-request-per-name
-        made a 19-name rebalance pay ~19 round trips before a single order went
-        out.  The batch response is positionally aligned; if anything about it
-        doesn't line up we fall back to per-name calls rather than guess.
+        It is however **off unless a leverage was explicitly asked for**: the gate
+        below returns before even reading `account_config()`, so the default order
+        path makes no leverage request at all.  See `effective_leverage`.
         """
-        if not self.set_leverage:
+        # 默认不设。为 None 时这一步整个跳过 —— 连 `account_config()` 都不去读，
+        # 下单路径上不允许再出现第二个外部请求。
+        want_src = self.effective_leverage
+        if not want_src:
             return []
         cli = self._private()
-        notes: List[dict] = []
-        want = float(self.set_leverage)
-        items = []
+        want = float(want_src)
+        td_mode = self.td_mode
+
+        # 杠杆的键是 `(instId, mgnMode, posSide)`，所以"要设几格"取决于持仓模式：
+        # 逐仓 + 多空持仓模式下 long / short 是**两个独立格子**，OKX 文档明确
+        # 说设了 long 不会动 short ⇒ 一个合约要两次调用，只设一次等于有一半的
+        # 腿还坐在旧杠杆上。全仓、或单向持仓模式，一格就够。
+        try:
+            cfg = cli.account_config() or {}
+            pos_mode = cfg.get("posMode") or "net_mode"
+        except Exception:                                        # noqa: BLE001
+            # 读不到就按最保守的方式走：多设一次是无害的，漏设是有害的。
+            pos_mode = "long_short_mode" if td_mode == "isolated" else "net_mode"
+        per_side = (pos_mode == "long_short_mode" and td_mode == "isolated")
+
+        specs = self.specs()
+        items: List[dict] = []
+        seen = set()
         for o in plan.orders:
-            spec = self.specs().get(o.inst_id)
-            cap = spec.max_lever if (spec and spec.max_lever) else None
-            lev = min(want, cap) if cap else want
-            items.append({"instId": o.inst_id, "lever": lev,
-                          "capped": bool(cap and cap < want - 1e-9),
-                          "max_lever": cap})
-        truth = {it["instId"]: it for it in items}
+            for ps in (["long", "short"] if per_side else [None]):
+                if (o.inst_id, ps) in seen:
+                    continue
+                seen.add((o.inst_id, ps))
+                spec = specs.get(o.inst_id)
+                cap = spec.max_lever if (spec and spec.max_lever) else None
+                lev = min(want, cap) if cap else want
+                items.append({"instId": o.inst_id, "posSide": ps, "lever": lev,
+                              "capped": bool(cap and cap < want - 1e-9),
+                              "max_lever": cap})
 
         def one_note(it: dict, ok: bool, err: Optional[str]) -> dict:
-            return {"instId": it["instId"], "ok": ok,
+            return {"instId": it["instId"], "posSide": it["posSide"], "ok": ok,
                     "leverage": it["lever"] if ok else None,
                     "capped": it["capped"], "max_lever": it["max_lever"],
                     "error": err}
 
-        remaining: List[dict] = []
-        for i in range(0, len(items), MAX_LEVERAGE_BATCH):
-            chunk = items[i:i + MAX_LEVERAGE_BATCH]
-            rows = None
+        def apply_one(it: dict) -> dict:
             try:
-                rows = cli.set_leverage_batch(
-                    [{"instId": it["instId"], "lever": it["lever"]} for it in chunk],
-                    self.td_mode)
-            except Exception as e:                                # noqa: BLE001
-                rows = None
-                if self._net_notice:
-                    self._net_notice(f"批量设置杠杆请求失败，逐个重试：{type(e).__name__}")
-            if rows is None:
-                remaining.extend(chunk)
-                continue
-            done = set()
-            for r in rows:
-                inst = r.get("instId")
-                if inst in truth:
-                    done.add(inst)
-                    notes.append(one_note(truth[inst], bool(r.get("_ok")),
-                                          r.get("_error")))
-            for it in chunk:                        # rows the batch never reported
-                if it["instId"] not in done:
-                    remaining.append(it)
-
-        for it in remaining:                        # fallback: one call per name
-            try:
-                cli.set_leverage(it["instId"], it["lever"], self.td_mode)
-                notes.append(one_note(it, True, None))
+                cli.set_leverage(it["instId"], it["lever"], td_mode, it["posSide"])
+                return one_note(it, True, None)
             except OKXError as e:
                 # already set, or an open position blocks the change.  Not fatal
                 # to the order, but the *actual* leverage is then unknown -- so
                 # it is reported, not passed over.
-                notes.append(one_note(it, False, str(e)))
-        pos = {it["instId"]: k for k, it in enumerate(items)}
-        notes.sort(key=lambda n: pos.get(n["instId"], 1_000_000))
+                return one_note(it, False, str(e))
+
+        # 逐仓 + 多空 = 2×n 次调用；**没有批量端点**（`batch-set-leverage` 是
+        # 404），所以并发是唯一能把 38 次往返压回几秒的办法。客户端本来就是
+        # 为多线程写的（线程内 opener、加锁的限流器与统计），账户查询也一直这么用。
+        # 并发压到 4：`set-leverage` 在 OKX 侧限得很紧，6 路的瞬时突发实测会
+        # 换来 50011（24 格里错了 1 格），而少一路只是慢一点点。
+        notes: List[dict] = []
+        if items:
+            workers = min(4, len(items))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                notes = list(pool.map(apply_one, items))
         return notes
 
     def _send_okx(self, plan: Plan, run_id: str, log: Any = None) -> List[dict]:
@@ -924,6 +975,7 @@ class LiveEngine:
         cli = self._private()
         lev_notes = self._apply_leverage(plan)
         self._last_leverage_notes = lev_notes
+        self._leverage_applied = self.effective_leverage is not None
         results: List[dict] = []
         orders = list(plan.orders)
         bodies: Dict[str, dict] = {}
@@ -1186,7 +1238,7 @@ class LiveEngine:
                           limit_buffer_bps=self.limit_buffer_bps)
         violations = check_plan(plan, self.limits, mode=self.mode, nav=nav,
                                 rebalance_due=True, actions=("flatten",),
-                                leverage=self.set_leverage)
+                                leverage=self.effective_leverage)
         blocked = blocking(violations)
         record = {"run_id": run_id, "mode": self.mode, "ts": time.time(),
                   "action": "flatten", "dry_run": bool(dry_run) or bool(blocked),

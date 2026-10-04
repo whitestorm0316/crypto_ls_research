@@ -60,7 +60,7 @@ class FakeEl {
 
 const els = new Map();
 function makeEl(sel) {
-  if (sel === '#chart') return canvas;
+  if (sel === '#chart' || sel === '#navChart') return canvas;
   if (!els.has(sel)) els.set(sel, new FakeEl());
   return els.get(sel);
 }
@@ -92,7 +92,8 @@ if (!/\nboot\(\);\s*$/.test(src)) throw new Error('app.js 末尾的 boot() 调�
 src = src.replace(/\nboot\(\);\s*$/, '\n');
 src += `
 ;globalThis.__T = { S, drawChart, curveValues, tickLabel, chartCandidates, initChartOff, PALETTE,
-                    liveSkeleton, liveBarHtml, tradesHtml };
+                    liveSkeleton, liveBarHtml, liveNavHtml, navCandles, navSourceLabel, drawNavChart,
+                    tradesHtml };
 `;
 vm.createContext(sandbox);
 vm.runInContext(src, sandbox, { filename: 'app.js' });
@@ -198,8 +199,8 @@ function check(name, ok, extra) {
    * 只要深度 < 1 就说明解析到它时 liveRoot 已经被提前关掉了。
    * 名字匹配用 `>名字` 且后面跟空白或标签（summary 里是「模式与交易场所 <small>」，
    * h3 里是「>信号<」，两种写法都要覆盖）。 */
-  const LIVE_PANELS = ['账户与连接', '信号', '下单计划', '风控闸门', '模式与交易场所',
-    '自动任务', '执行日志'];
+  const LIVE_PANELS = ['账户与连接', '信号', '账户净值历史', '下单计划', '风控闸门',
+    '模式与交易场所', '自动任务', '执行日志'];
   {
     const depths = LIVE_PANELS.map((name) => {
       const m = wrapped.match(new RegExp('>' + name + '(?=[\\s<])'));
@@ -219,6 +220,78 @@ function check(name, ok, extra) {
   const balTrades = divBalance('<div class="tradesOnly">' + T.tradesHtml() + '</div>');
   check('tradesHtml div 配平', balTrades.depth === 0 && balTrades.minDepth >= 0,
     `end=${balTrades.depth} min=${balTrades.minDepth}`);
+
+  /* --- 6. 账户净值历史：两种视图都要画得出、且没有 NaN ---
+   * 坐标里一个 NaN 会让整条曲线消失，而画布本身"看起来没报错"——正是截图查不出的那类。 */
+  const navSample = {
+    mode: 'live', bar: '1h', source: 'cache', n: 0, n_fills: 4,
+    ts: [], nav: [], recorded: [], checks: [], warnings: [], missing_bars: [],
+    assumed_held: [], max_pct: 0.0004, partial: false,
+    anchor: null, coverage: {},
+  };
+  const NAV_T0 = 1_790_000_000;
+  for (let i = 0; i < 60; i++) {
+    navSample.ts.push(NAV_T0 + i * 3600);
+    navSample.nav.push(355 + Math.sin(i / 6) * 2.5 + i * 0.02);
+  }
+  navSample.n = navSample.ts.length;
+  navSample.recorded = [{ ts: navSample.ts[0], nav: navSample.nav[0], kind: 'equity' },
+    { ts: navSample.ts[30], nav: navSample.nav[30], kind: 'run' }];
+  navSample.checks = [{ ts: navSample.ts[30], kind: 'run', recorded: navSample.nav[30],
+    recon: navSample.nav[30] + 0.01, diff: 0.01, pct: 0.00003 }];
+  navSample.anchor = { ts: navSample.ts[navSample.n - 1], nav: navSample.nav[navSample.n - 1] };
+
+  S.live.nav = navSample;
+  S.live.navLoading = false;
+  S.live.navErr = null;
+
+  for (const v of ['line', 'candle']) {
+    drawn.length = 0; badPts.length = 0;
+    S.live.navView = v;
+    T.drawNavChart();
+    check(`净值历史视图 ${v}: 画了 ${drawn.length} 段线，坐标无 NaN`,
+      drawn.length >= 4 && badPts.length === 0,
+      badPts.length ? `首个坏点 ${JSON.stringify(badPts[0])}` : '');
+  }
+
+  const cand = T.navCandles(navSample);
+  /* 跨度 59 小时 → 用 4 小时桶（日K只有两根，那不是走势）；桶按 floor(ts/周期)
+   * 对齐，所以起点落在桶中间时会多出一个不完整的桶 —— 15~16 根都算对。 */
+  check('净值K线按 4h 聚合（跨度 59h < 7 天）',
+    cand.secs === 4 * 3600 && cand.rows.length >= 15 && cand.rows.length <= 16,
+    `secs=${cand.secs} rows=${cand.rows.length}`);
+
+  const longNav = Object.assign({}, navSample, { ts: [], nav: [], n: 0 });
+  for (let i = 0; i < 24 * 30; i++) {
+    longNav.ts.push(NAV_T0 + i * 3600);
+    longNav.nav.push(355 + i * 0.01);
+  }
+  longNav.n = longNav.ts.length;
+  const longCand = T.navCandles(longNav);
+  check('跨度 30 天时自动切到日K', longCand.secs === 86400 && longCand.rows.length >= 29
+    && longCand.rows.length <= 31, `secs=${longCand.secs} rows=${longCand.rows.length}`);
+
+  check('净值K线的 high/low 真的包住每一段的 close',
+    cand.rows.every((c) => c.h >= c.c - 1e-9 && c.l <= c.c + 1e-9 && c.n >= 1
+      && c.h >= c.o - 1e-9 && c.l <= c.o + 1e-9));
+  check('数据源标签说人话', T.navSourceLabel('okx') === 'OKX 实时K线'
+    && T.navSourceLabel('mixed') === 'OKX＋本地缓存'
+    && T.navSourceLabel('okx+cache') === 'OKX 实时尾＋本地历史'
+    && T.navSourceLabel('cache') === '本地K线缓存');
+
+  /* 证据不全时**不许**画一张空图，必须把原因写出来 */
+  const emptyNav = Object.assign({}, navSample, { ts: [], nav: [], n: 0,
+    warnings: ['本地账本没有成交流水，无法重建仓位历史'], anchor: null });
+  S.live.nav = emptyNav;
+  const eh = T.liveNavHtml();
+  check('样本不足时渲染「证据不全」而不是空图',
+    eh.includes('证据不全') && eh.includes('无法重建仓位历史') && !eh.includes('<canvas'));
+  S.live.navErr = 'HTTP 500';
+  const errh = T.liveNavHtml();
+  check('重建失败时渲染错误横幅（且说清账户不受影响）',
+    errh.includes('净值历史重建失败') && errh.includes('HTTP 500')
+    && errh.includes('账户与下单不受影响'));
+  S.live.navErr = null; S.live.nav = null;
 
   console.log(fails ? `\n${fails} 项未通过` : '\n全部通过');
   process.exit(fails ? 1 : 0);

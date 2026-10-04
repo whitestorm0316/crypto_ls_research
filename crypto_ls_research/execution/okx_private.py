@@ -63,7 +63,11 @@ SLOW_MS = 2000.0
 
 #: OKX hard limits: 20 rows per batch endpoint.
 MAX_ORDER_BATCH = 20
-MAX_LEVERAGE_BATCH = 20
+
+#: Codes that are worth another try: rate limiting and venue hiccups.  Everything
+#: else is a *verdict* -- the exchange understood the request and said no -- and
+#: retrying it just spends the user's time to learn the same answer.
+TRANSIENT_CODES = ("50011", "50013", "50026", "50040")
 
 #: OKX codes worth translating.  Anything missing is reported verbatim -- an
 #: unknown code is information, and paraphrasing it would destroy it.
@@ -145,7 +149,10 @@ class OKXError(RuntimeError):
         self.msg = msg
         self.path = path
         self.data = data
-        super().__init__(describe_code(self.code, msg))
+        text = describe_code(self.code, msg)
+        # 带上端点：`51000` 在不同接口上有完全不同的含义，而「哪个接口」正是
+        # 排查时第一个要问的问题。只在调用方给了 path 时追加。
+        super().__init__(f"{text} · {path}" if path else text)
 
     @property
     def is_auth(self) -> bool:
@@ -164,6 +171,27 @@ class AmbiguousError(RuntimeError):
         self.cause = cause
         super().__init__(f"{path}: 未收到确认响应（{type(cause).__name__}: {cause}）"
                          f"—— 结果未知，必须先对账，禁止直接重发")
+
+
+def okx_error_from_body(raw: str, path: str = "") -> Optional[OKXError]:
+    """An error *response body* read as an `OKXError`, or `None` if it isn't one.
+
+    Error responses arrive as HTTP 4xx, and urllib raises before the body ever
+    reaches `_unwrap` -- so without this, `51000 Parameter posSide error` shows
+    up as "HTTP Error 400: Bad Request" and the only actionable string is gone.
+    """
+    if not raw:
+        return None
+    try:
+        js = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(js, dict):
+        return None
+    code = str(js.get("code", "") or "")
+    if not code or code == "0":
+        return None
+    return OKXError(code, js.get("msg", ""), path, js.get("data"))
 
 
 # ---------------------------------------------------------------------------
@@ -345,13 +373,40 @@ class OKXPrivate:
                 except OKXError as e:
                     with self._lock:
                         self.stats["err"] += 1
-                    # 50011/50013/50026 are transient; everything else is a verdict.
-                    if e.code in ("50011", "50013", "50026", "50040") and attempt + 1 < attempts:
+                    # 50011/50013/50026/50040 are transient; everything else is a verdict.
+                    if e.code in TRANSIENT_CODES and attempt + 1 < attempts:
                         last = e
                     else:
                         raise
-                except (urllib.error.HTTPError, urllib.error.URLError, OSError,
-                        TimeoutError) as e:
+                except urllib.error.HTTPError as e:
+                    # OKX puts the **actual** reason in the body of a 4xx:
+                    # `{"code":"51000","msg":"Parameter posSide error"}`.
+                    # urllib only hands us the body on 2xx, so this used to
+                    # surface as nothing but "HTTP Error 400: Bad Request" --
+                    # the one piece of information that makes it fixable,
+                    # discarded.  Read it and run it through the same unwrap.
+                    with self._lock:
+                        self.stats["err"] += 1
+                    body_txt = ""
+                    try:
+                        body_txt = e.read().decode("utf-8", "replace")
+                    except Exception:                              # noqa: BLE001
+                        pass
+                    verdict = okx_error_from_body(body_txt, request_path)
+                    if verdict is not None:
+                        if verdict.code in TRANSIENT_CODES and attempt + 1 < attempts:
+                            last = verdict
+                        else:
+                            raise verdict from None
+                    elif 400 <= (e.code or 0) < 500:
+                        # Deterministic: a bad parameter or a path that does not
+                        # exist answers the same way every time.
+                        raise RuntimeError(
+                            f"{method} {request_path} failed: HTTP {e.code} "
+                            f"{e.reason}: {body_txt[:300] or '(空响应体)'}") from e
+                    else:
+                        last = e
+                except (urllib.error.URLError, OSError, TimeoutError) as e:
                     last = e
                     if not idempotent:
                         with self._lock:
@@ -371,9 +426,22 @@ class OKXPrivate:
             if attempt + 1 < attempts:
                 # Don't sleep after the last attempt: nothing follows it, so the
                 # delay is pure latency on top of a call that already failed.
-                time.sleep(min(6.0, 0.4 * (2 ** attempt)))
+                delay = min(6.0, 0.4 * (2 ** attempt))
+                if isinstance(last, OKXError) and last.code == "50011":
+                    # OKX's rate-limit window is ~2s.  A 0.4s backoff lands all
+                    # three attempts inside the *same* window, so "retried 3
+                    # times" is really one attempt reported three times --
+                    # measured: 1 of 24 leverage cells failed this way while 23
+                    # went through.
+                    delay = min(8.0, 2.0 * (2 ** attempt))
+                time.sleep(delay)
         with self._lock:
             self.stats["err"] += 1
+        if isinstance(last, OKXError):
+            # 交易所给了明确的判决（限流/系统繁忙）——原样抛出，别包一层。
+            # 包了之后 `except OKXError` 的调用方就抓不到它，`.code` 也没了，
+            # 「被限流」和「网络断了」就变成同一种东西。
+            raise last
         raise RuntimeError(f"{method} {request_path} failed: "
                            f"{type(last).__name__}: {last}")
 
@@ -448,46 +516,35 @@ class OKXPrivate:
             p["instId"] = inst_id
         return self.request("GET", "/api/v5/account/positions", p)
 
-    def set_leverage(self, inst_id: str, lever: float, mgn_mode: str = "cross") -> dict:
-        d = self.request("POST", "/api/v5/account/set-leverage",
-                         body={"instId": inst_id, "lever": str(lever),
-                               "mgnMode": mgn_mode},
+    def set_leverage(self, inst_id: str, lever: float, mgn_mode: str = "cross",
+                     pos_side: Optional[str] = None) -> dict:
+        """Set leverage for one `(instId, mgnMode, posSide)` cell.
+
+        There is **no batch version**: `/api/v5/account/batch-set-leverage`
+        returns HTTP 404 (measured 2026-09-30 and again 2026-10-03, on both
+        demo and live), and OKX's own docs only document this single endpoint.
+        So one call per cell it is.
+
+        `pos_side` is not decoration.  OKX requires it for **isolated** margin
+        when the account is in long/short position mode, and rejects the call
+        with `51000 Parameter posSide error` without it -- so omitting it made
+        isolated leverage impossible to set at all.  And because leverage is
+        keyed *per side* there, setting `long` explicitly does **not** touch
+        `short`: one instrument needs two calls.  Cross margin needs neither,
+        and sends no `posSide` (the response echoes it as `""`).
+        """
+        body: Dict[str, Any] = {"instId": inst_id, "lever": str(lever),
+                                "mgnMode": mgn_mode}
+        if pos_side and mgn_mode == "isolated":
+            body["posSide"] = pos_side
+        d = self.request("POST", "/api/v5/account/set-leverage", body=body,
                          idempotent=True)
         return d[0] if d else {}
 
-    def set_leverage_batch(self, items: Sequence[dict],
-                           mgn_mode: str = "cross") -> Optional[List[dict]]:
-        """One request for up to 20 instruments, instead of one per instrument.
-
-        Returns `None` when the batch can't be trusted and the caller should fall
-        back to `set_leverage` per instrument.  That happens when the response
-        row count differs from the request row count -- geometry that misaligns
-        is worse than round trips, because you'd end up recording leverage
-        against the wrong instrument.
-        """
-        items = list(items)
-        if not items:
-            return []
-        body = [{"instId": it["instId"], "lever": str(it["lever"]),
-                 "mgnMode": it.get("mgnMode") or mgn_mode} for it in items]
-        if len(body) > MAX_LEVERAGE_BATCH:
-            raise ValueError(f"at most {MAX_LEVERAGE_BATCH} per batch, got {len(body)}")
-        d = self.request("POST", "/api/v5/account/batch-set-leverage",
-                         body=body, idempotent=True)
-        if not isinstance(d, list) or len(d) != len(body):
-            return None
-        out = []
-        for row, it in zip(d, body):
-            r = dict(row)
-            if r.get("instId") and r["instId"] != it["instId"]:
-                return None                     # response was not aligned
-            r.setdefault("instId", it["instId"])
-            r["_ok"] = str(r.get("sCode", "0")) == "0"
-            if not r["_ok"]:
-                r["_error"] = describe_code(str(r.get("sCode")), r.get("sMsg", ""))
-            r["_lever"] = it["lever"]
-            out.append(r)
-        return out
+    def leverage_info(self, inst_id: str, mgn_mode: str) -> List[dict]:
+        """Read back the configured leverage for one `(instId, mgnMode)`."""
+        return self.request("GET", "/api/v5/account/leverage-info",
+                           {"instId": inst_id, "mgnMode": mgn_mode})
 
     def set_position_mode(self, pos_mode: str) -> dict:
         """`net_mode` | `long_short_mode`.  OKX refuses while positions exist."""

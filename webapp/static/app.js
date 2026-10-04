@@ -115,6 +115,11 @@ const S = {
     /* 磁盘上保存的那份限额（`null` = 从未保存过）与「表单被改过」的标记。
      * 两者一起决定限额面板要不要提示「有未保存的改动」。 */
     savedLimits: null, limitsTouched: false,
+    /* 账户净值历史（重建口径）。`navKey` = 已经取到的 mode+区间，用它去重：
+     * livePaintAll() 有三十来个调用点，几乎每次都跟这条曲线无关，不能每次都重建
+     * ——服务端要读 ~20 个 parquet 甚至走一趟 OKX。 */
+    nav: null, navErr: null, navLoading: false, navKey: null,
+    navView: 'line', navDays: 30,
   },
 };
 
@@ -1890,6 +1895,18 @@ $('#themeBtn').onclick = () => {
 const savedTheme = localStorage.getItem('ls-theme');
 if (savedTheme) document.documentElement.setAttribute('data-theme', savedTheme);
 
+/* ---- 「模式与交易场所」要记住选项 ----
+ * 模式（paper / demo / live）决定密钥槽与是否真实成交，通常设一次就不动。
+ * 但它以前只活在内存里：切到 demo、刷新页面就跳回 paper —— 于是账户面板显示的
+ * 是另一个账户，而用户以为还在 demo。把选择落到 localStorage，刷新后仍是同一个。
+ * 只认这三个已知值，别的（手改 / 旧版本残留）一律忽略，退回默认 paper。 */
+const LIVE_MODE_KEY = 'ls-live-mode';
+const LIVE_MODES = ['paper', 'demo', 'live'];
+try {
+  const m = localStorage.getItem(LIVE_MODE_KEY);
+  if (m && LIVE_MODES.includes(m)) S.live.mode = m;
+} catch (e) { /* localStorage 不可用（隐私模式）则保持默认，不阻断页面 */ }
+
 $('#runBtn').onclick = runNow;
 
 function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
@@ -1997,12 +2014,29 @@ function liveSkeleton() {
   <div class="livebar" id="liveBar">${liveBarHtml()}</div>
   <div class="grid2">
     <div class="panel"><div class="head"><h3>账户与连接</h3><span class="spacer"></span>
+      <button class="btn sm ghost" id="liveAcctRefresh" title="重新读取净值与持仓，并记一个净值点（不下单、也不对账）">↻ 刷新账户</button>
       <span class="muted" style="font-size:11.5px" id="liveConnPill"></span></div>
       <div class="body" id="liveAcct"><div class="empty">正在读取…</div></div></div>
     <div class="panel"><div class="head"><h3>信号</h3><span class="spacer"></span>
       <span class="muted" style="font-size:11.5px">与报告同一套引擎</span></div>
       <div class="body" id="liveSignal"><div class="empty">正在读取…</div></div></div>
   </div>
+
+  <div class="panel" style="margin-top:14px"><div class="head"><h3>账户净值历史</h3>
+    <span class="spacer"></span>
+    <div class="seg sm" id="navSeg">
+      <button class="segbtn" data-navview="line">曲线</button>
+      <button class="segbtn" data-navview="candle">K线</button>
+    </div>
+    <div class="seg sm" id="navRange" style="margin-left:6px">
+      <button class="segbtn" data-navdays="7">7天</button>
+      <button class="segbtn" data-navdays="30">30天</button>
+      <button class="segbtn" data-navdays="90">90天</button>
+      <button class="segbtn" data-navdays="">全部</button>
+    </div>
+    <span class="muted" style="font-size:11.5px" id="navMeta"></span>
+    <button class="btn sm ghost" id="navReload" title="按当前区间重新重建净值历史">↻ 重建</button></div>
+    <div class="body" id="liveNav"><div class="empty">正在重建…</div></div></div>
 
   <div class="panel" style="margin-top:14px"><div class="head"><h3>下单计划</h3>
     <span class="spacer"></span><span class="muted" style="font-size:11.5px" id="livePlanMeta"></span></div>
@@ -2056,6 +2090,13 @@ async function ensureLive() {
   if (L.statusErr) return;
   try {
     L.meta = await liveApi('/api/live/meta');
+    /* 记忆里的模式要和服务端实际支持的模式对一遍：万一某个模式被下线（或 localStorage
+     * 里是旧值），就退回默认 paper，而不是拿一个服务端不认识的值去发请求。 */
+    const known = ((L.meta && L.meta.modes) || []).map((m) => m.id);
+    if (known.length && !known.includes(L.mode)) {
+      L.mode = 'paper';
+      try { localStorage.setItem(LIVE_MODE_KEY, L.mode); } catch (e) { }
+    }
     /* 优先用**磁盘上保存的**限额；只有从未保存过时才退回出厂默认。
      * 以前这里无条件写 `limits_default`，而服务端的限额又只活在内存里，
      * 于是「保存了重启不生效」——两个半张的缺陷叠在一起。 */
@@ -2078,7 +2119,7 @@ async function ensureLive() {
   }
 }
 
-async function liveLoadStatus() {
+async function liveLoadStatus(record) {
   const L = S.live;
   /* 这一步是三次签名请求（config / positions / balance），实测约 1.4s。调用点包括
    * 进入交易台、切模式、以及**每一个动作之后**（保存限额、熔断、对账、重置…）。
@@ -2087,7 +2128,8 @@ async function liveLoadStatus() {
   L.statusLoading = true;
   livePaintAll();
   try {
-    const st = await liveApi('/api/live/status?mode=' + encodeURIComponent(L.mode));
+    const st = await liveApi('/api/live/status?mode=' + encodeURIComponent(L.mode)
+      + (record ? '&record=1' : ''));
     L.status = st;
     L.statusErr = null;
     if (st.limits && !L.limitsTouched) L.limits = Object.assign({}, st.limits);
@@ -2190,6 +2232,7 @@ function livePaintAll() {
     };
     put('liveMode', liveModeHtml());
     put('liveAcct', liveAcctHtml());
+    put('liveNav', liveNavHtml());
     put('liveSignal', liveSignalHtml());
     put('liveGates', liveGatesHtml());
     put('liveAuto', liveAutoHtml());
@@ -2209,6 +2252,25 @@ function livePaintAll() {
       : '';
     const jm = document.getElementById('liveJobMeta');
     if (jm) jm.textContent = L.job ? `${L.job.kind} · ${L.job.status}${L.job.elapsed ? ' · ' + L.job.elapsed + 's' : ''}` : '';
+    /* 净值历史头部：分段按钮的高亮与右侧摘要都不在被重绘的 body 里，
+     * 所以和子标签一样，必须在这里同步 —— 否则点了「K线」表格变了、按钮没亮。 */
+    const nseg = document.getElementById('navSeg');
+    if (nseg) $$('.segbtn', nseg).forEach((b) =>
+      b.classList.toggle('on', (b.dataset.navview || 'line') === L.navView));
+    const nrange = document.getElementById('navRange');
+    if (nrange) $$('.segbtn', nrange).forEach((b) => {
+      const v = b.dataset.navdays || '';
+      b.classList.toggle('on', String(L.navDays || '') === v);
+    });
+    const nm = document.getElementById('navMeta');
+    if (nm) {
+      nm.textContent = L.navLoading ? '重建中…'
+        : (L.nav && L.nav.n >= 2
+          ? `${fmt.dol(L.nav.nav[L.nav.n - 1])} · ${L.nav.n} 个点`
+          : (L.navErr ? '重建失败' : ''));
+    }
+    const nr = document.getElementById('navReload');
+    if (nr) { nr.disabled = !!L.navLoading; }
     const cp = document.getElementById('liveConnPill');
     if (cp) {
       const st = L.status;
@@ -2216,8 +2278,25 @@ function livePaintAll() {
         : (st.kill_switch ? '<b style="color:var(--danger)">交易已熔断</b>'
           : (st.connected ? '<b style="color:var(--ok)">已连接</b>' : '未连接'));
     }
+    /* 刷新按钮在 panel 头部（不在被重绘的 body 里），所以它的忙碌态必须在这里同步：
+     * 否则点下去后按钮一直可点，用户会连点，连点就是并发三次签名请求。 */
+    const ar = document.getElementById('liveAcctRefresh');
+    if (ar) {
+      ar.disabled = !!L.statusLoading;
+      ar.textContent = L.statusLoading ? '↻ 刷新中…' : '↻ 刷新账户';
+    }
     liveBind();
   });
+  /* 图表是 canvas：必须在 innerHTML 之后画（元素每次重建都是新对象，
+   * 而且此时尺寸才算得出来）。交易台不在当前 tab 时 `drawNavChart` 自己会退出。 */
+  drawNavChart();
+  /* 按需重建：`navKey` 是 mode+区间，所以切 tab / 切子标签触发的
+   * livePaintAll() 不会每次都去读 20 个 parquet；`navLoading` 阻断自递归。 */
+  const L2 = S.live;
+  if (document.getElementById('liveNav')
+    && L2.navKey !== `${L2.mode}|${L2.navDays || ''}` && !L2.navLoading) {
+    liveLoadNav();
+  }
 }
 
 /* 网络延迟徽标。交易所慢和「我们太啰嗦」是两种病，治法相反，所以必须分得清：
@@ -2343,6 +2422,32 @@ function liveAcctHtml() {
     <div class="cell"><div class="k">行情来源</div><div class="v" style="font-size:12.5px">${esc(st.prices_source || '—')}</div>
       <div class="s">持仓名义 ${fmt.dol(gross)}${gross > 0 && nav > 0 ? ` (${fmt.n(gross / nav, 3)}×)` : ''}</div></div>
   </div>`;
+
+  /* --- 多空占比汇总：基于账户快照的实时持仓，名义额服务端已算（含 ctVal） --- */
+  const lp = (a.positions || []).filter((p) => (p.pos > 0) && posNotional(p) != null);
+  const sp = (a.positions || []).filter((p) => (p.pos < 0) && posNotional(p) != null);
+  /* `notional` 服务端返回的是绝对值（|张数|×ctVal×价格），多空都取正值相加即可；
+   * 不要对空头取反——那是把正的名额额又减成负的。 */
+  const longN = lp.reduce((s, p) => s + posNotional(p), 0);
+  const shortN = sp.reduce((s, p) => s + posNotional(p), 0);
+  const bothN = longN + shortN;
+  if ((a.positions || []).length && bothN > 0) {
+    const longPct = bothN ? (longN / bothN) * 100 : 0;
+    const shortPct = bothN ? (shortN / bothN) * 100 : 0;
+    const net = longN - shortN;
+    const netDir = Math.abs(net) < 0.01 ? '中性' : (net > 0 ? '偏多' : '偏空');
+    h += `<div class="lskew">
+      <div class="lskew-bar" title="多头 ${longPct.toFixed(1)}% / 空头 ${shortPct.toFixed(1)}%">
+        <span class="lskew-long" style="width:${longPct.toFixed(2)}%"></span>
+        <span class="lskew-short" style="width:${shortPct.toFixed(2)}%"></span>
+      </div>
+      <div class="lskew-meta">
+        <span class="lskew-lbl"><i class="dot long"></i>多头 ${lp.length} 个 · ${fmt.dol(longN)} <em>${longPct.toFixed(1)}%</em></span>
+        <span class="lskew-lbl"><i class="dot short"></i>空头 ${sp.length} 个 · ${fmt.dol(shortN)} <em>${shortPct.toFixed(1)}%</em></span>
+        <span class="lskew-net ${Math.abs(net) < 0.01 ? '' : (net > 0 ? 'long' : 'short')}">净敞口 ${fmt.dol(net)}（${netDir}）</span>
+      </div>
+    </div>`;
+  }
   if (missing) {
     h += `<div class="banner warn" style="margin-top:11px"><div class="ico">!</div><div>
       <b>有 ${missing} 个持仓算不出名义额</b>
@@ -2394,6 +2499,291 @@ function signalAge(iso) {
   if (hr < 24) return { txt: `${hr} 小时 ${min % 60} 分前`, stale: hr >= 1 };
   const d = Math.floor(hr / 24);
   return { txt: `${d} 天前`, stale: true };
+}
+
+/* ======================== 账户净值历史（重建口径） ======================== */
+/* 净值历史**不是查出来的**：交易所只给当前余额，本地账本只存当前持仓。
+ * 服务端（`execution/navhist.py`）从最新一次净值快照出发，按成交流水倒退仓位、
+ * 用K线逐 bar 反推回历史净值；每一条记录点（对账/调仓/dry-run 写下的真实净值）
+ * 都用来校验反推结果，偏差在面板上明说。
+ *
+ * 这里只负责画：曲线 = 反推序列 + 真实记录点；K线 = 按周期聚合的净值OHLC。
+ * 金额一律用 `fmt.dol`（两位小数），时间一律 `fmtCN`（北京时间）。 */
+
+/* 净值序列里的一个 OHLC 桶。周期不写死：跨度短的时候日K只有两根，
+ * 那不是走势、是两个点，所以 7 天以内自动降到 4 小时。 */
+function navBucketSecs(span) {
+  return span < 7 * 86400 ? 4 * 3600 : 86400;
+}
+
+function navCandles(d) {
+  const span = d.ts.length >= 2 ? d.ts[d.ts.length - 1] - d.ts[0] : 0;
+  const w = navBucketSecs(span);
+  const out = [];
+  for (let i = 0; i < d.ts.length; i++) {
+    const k = Math.floor(d.ts[i] / w);
+    const v = d.nav[i];
+    if (!out.length || out[out.length - 1].k !== k) {
+      out.push({ k, t: k * w, o: v, h: v, l: v, c: v, n: 1 });
+    } else {
+      const b = out[out.length - 1];
+      b.h = Math.max(b.h, v); b.l = Math.min(b.l, v); b.c = v; b.n++;
+    }
+  }
+  return { rows: out, secs: w };
+}
+
+function navSourceLabel(src) {
+  return ({ okx: 'OKX 实时K线', 'okx+cache': 'OKX 实时尾＋本地历史',
+    cache: '本地K线缓存', mixed: 'OKX＋本地缓存', none: '无' })[src] || (src || '未知');
+}
+
+function liveNavHtml() {
+  const L = S.live;
+  if (L.navErr) {
+    return `<div class="banner danger"><div class="ico">!</div><div>
+      <b>净值历史重建失败</b><p>${esc(L.navErr)}</p>
+      <p class="muted">这不是账户出问题——账户与下单不受影响。点右上角「重建」重试。</p>
+      </div></div>`;
+  }
+  if (L.navLoading && !L.nav) {
+    return `<div class="empty">正在重建净值历史…（读本地流水＋K线，必要时走一趟 OKX）</div>`;
+  }
+  const d = L.nav;
+  if (!d) return `<div class="empty">正在读取…</div>`;
+
+  const warns = (d.warnings || []).filter(Boolean);
+  const warnHtml = warns.length
+    ? `<details class="livefold navwarn"><summary>${warns.length} 条口径说明
+        <small>重建是推导值，不是交易所账单</small></summary>
+        <div class="body"><ul class="navlist">${warns.map((w) => `<li>${esc(w)}</li>`).join('')}</ul></div>
+      </details>` : '';
+
+  /* 「证据不全」不许渲染成一张空图：没有点位、或只有一个点位时，把原因写出来。 */
+  if (!d.n || d.n < 2) {
+    const why = d.warnings && d.warnings.length
+      ? d.warnings : ['本地还没有足够的流水与净值记录'];
+    return `<div class="banner"><div class="ico">i</div><div>
+      <b>证据不全：还画不出净值历史</b>
+      <p>${esc(why[0])}</p>
+      ${d.anchor ? `<p class="muted">最新净值快照：<b>${esc(fmt.dol(d.anchor.nav))}</b>
+        · ${esc(fmtCN(d.anchor.ts, 'sec'))}（北京）</p>` : ''}
+      <p class="muted">净值历史从<b>本地账本的第一笔成交</b>开始累积。每次调仓、对账、
+        点「刷新账户」都会记一个净值点；之后每天的曲线都会更长。</p></div></div>
+      ${warnHtml}`;
+  }
+
+  const span = d.ts[d.ts.length - 1] - d.ts[0];
+  const chk = (d.checks || []).length;
+  const dev = (d.max_pct == null) ? null : d.max_pct;
+  const devTxt = dev == null ? '未校验'
+    : `${(dev * 100).toFixed(3)}%${dev > 0.005 ? '（偏大）' : ''}`;
+  const rows = [
+    ['数据源', navSourceLabel(d.source)],
+    ['重建区间', `${fmtCN(d.ts[0], 'date')} → ${fmtCN(d.ts[d.ts.length - 1], 'date')}（${(span / 3600).toFixed(0)} 小时）`],
+    ['样本', `${d.n} 个点 · ${d.bar} 粒度 · ${d.n_fills || 0} 笔成交`],
+    ['回推校验', chk ? `${chk} 个记录点，最大偏差 ${devTxt}` : '无可比对记录点'],
+  ];
+  return `<div style="position:relative">
+      <canvas class="chart navchart" id="navChart"></canvas>
+      ${L.navLoading ? '<div class="navbusy">重建中…</div>' : ''}
+    </div>
+    <div class="split navmeta">
+      ${rows.map(([k, v]) => `<div class="nm"><div class="k">${esc(k)}</div>
+        <div class="v">${esc(v)}</div></div>`).join('')}
+    </div>
+    ${warnHtml}`;
+}
+
+/* hover 读数：十字线 + 该点净值/时间。`on*` 直接赋值，重画后覆盖旧监听。 */
+function bindNavHover(cv, o) {
+  const { X, P, W, H, series } = o;
+  cv.onmousemove = (e) => {
+    const rect = cv.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    if (x < P.l || x > W - P.r) { drawNavChart(); return; }
+    drawNavChart();
+    const ctx = cv.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    let best = null;
+    for (const s of series) {
+      const px = X(s.ts);
+      if (!best || Math.abs(px - x) < Math.abs(best.px - x)) best = { px, s };
+    }
+    if (!best) return;
+    const css = getComputedStyle(document.body);
+    const cMuted = css.getPropertyValue('--muted').trim();
+    const cText = css.getPropertyValue('--text-2').trim();
+    ctx.strokeStyle = cMuted; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+    ctx.beginPath(); ctx.moveTo(best.px + .5, P.t); ctx.lineTo(best.px + .5, H - P.b);
+    ctx.stroke(); ctx.setLineDash([]);
+    const txt = `${fmtCN(best.s.ts, 'min')} · ${fmt.dol(best.s.v)}`;
+    ctx.font = '11.5px system-ui'; ctx.textAlign = 'right';
+    const w = ctx.measureText(txt).width + 10;
+    ctx.fillStyle = cText;
+    ctx.fillText(txt, W - P.r - 4, P.t + 12);
+    ctx.strokeStyle = cMuted;
+    ctx.beginPath(); ctx.arc(best.px, o.Y(best.s.v), 2.6, 0, Math.PI * 2);
+    ctx.fill(); ctx.stroke();
+    void w;
+  };
+  cv.onmouseleave = () => drawNavChart();
+  cv.ondblclick = () => { drawNavChart(); };
+}
+
+/* 净值曲线。画两条东西：重建序列（线/蜡烛）+ 真实记录点（圆点）。
+ * 记录点是**实测值**，所以单独画——曲线准不准，这一眼就能对。 */
+function drawNavChart() {
+  const cv = $('#navChart');
+  const L = S.live;
+  const d = L.nav;
+  if (!cv || !d || !d.n || d.n < 2) return;
+  /* 交易台不在当前 tab 时画布 clientWidth 为 0，任何坐标都是 NaN。 */
+  if (!cv.clientWidth || !cv.clientHeight) return;
+  const ctx = cv.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.clientWidth, H = cv.clientHeight;
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  const css = getComputedStyle(document.body);
+  const cMuted = css.getPropertyValue('--muted').trim();
+  const cBorder = css.getPropertyValue('--border').trim();
+  const cText = css.getPropertyValue('--text-2').trim();
+  const cUp = css.getPropertyValue('--up').trim();         // 涨=红（A股口径）
+  const cDown = css.getPropertyValue('--down').trim();     // 跌=绿
+  const P = { l: 62, r: 14, t: 16, b: 24 };
+
+  const t0 = d.ts[0], t1 = d.ts[d.ts.length - 1];
+  const candles = L.navView === 'candle' ? navCandles(d) : null;
+  let lo = Infinity, hi = -Infinity;
+  const scan = (v) => { if (v < lo) lo = v; if (v > hi) hi = v; };
+  if (candles) {
+    for (const c of candles.rows) { scan(c.l); scan(c.h); }
+  } else {
+    for (const v of d.nav) scan(v);
+  }
+  for (const r of (d.recorded || [])) {
+    if (r.ts >= t0 && r.ts <= t1) scan(r.nav);
+  }
+  if (!isFinite(lo) || !isFinite(hi)) return;
+  const pad = (hi - lo) * 0.12 || Math.max(0.01 * Math.abs(hi), 0.01);
+  lo -= pad; hi += pad;
+  const X = (t) => P.l + (t - t0) / ((t1 - t0) || 1) * (W - P.l - P.r);
+  const Y = (v) => P.t + (hi - v) / ((hi - lo) || 1) * (H - P.t - P.b);
+
+  ctx.strokeStyle = cBorder; ctx.lineWidth = 1; ctx.font = '10.5px system-ui';
+  ctx.fillStyle = cMuted; ctx.textAlign = 'right';
+  for (let i = 0; i <= 4; i++) {
+    const v = lo + (hi - lo) * i / 4;
+    const y = Math.round(Y(v)) + .5;
+    ctx.beginPath(); ctx.moveTo(P.l, y); ctx.lineTo(W - P.r, y); ctx.stroke();
+    ctx.fillText(fmt.dol(v), P.l - 6, y + 3.5);
+  }
+  // 起点基准线：一眼看出净值是在起点之上还是之下
+  ctx.strokeStyle = cMuted; ctx.setLineDash([3, 3]); ctx.beginPath();
+  ctx.moveTo(P.l, Y(d.nav[0])); ctx.lineTo(W - P.r, Y(d.nav[0]));
+  ctx.stroke(); ctx.setLineDash([]);
+
+  if (candles) {
+    const cw = Math.max(1.5, Math.min(11,
+      (W - P.l - P.r) / candles.rows.length * 0.62));
+    for (const c of candles.rows) {
+      const x = X(c.t + candles.secs / 2);
+      const up = c.c >= c.o;
+      const col = up ? cUp : cDown;
+      // 影线
+      ctx.strokeStyle = col; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(x + .5, Y(c.h)); ctx.lineTo(x + .5, Y(c.l));
+      ctx.stroke();
+      // 实体：涨红跌绿（空心=涨，实心=跌，国内习惯）
+      const y1 = Y(Math.max(c.o, c.c)), y2 = Y(Math.min(c.o, c.c));
+      const h = Math.max(1, y2 - y1);
+      const box = css.getPropertyValue('--panel').trim() || '#fff';
+      ctx.fillStyle = up ? box : col;
+      ctx.fillRect(x - cw / 2, y1, cw, h);
+      if (up) { ctx.strokeRect(x - cw / 2 + .5, y1 + .5, cw - 1, h - 1); }
+    }
+  } else {
+    ctx.beginPath();
+    for (let i = 0; i < d.n; i++) {
+      const x = X(d.ts[i]), y = Y(d.nav[i]);
+      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
+    }
+    const cLine = css.getPropertyValue('--accent').trim() || '#2f6feb';
+    ctx.strokeStyle = cLine; ctx.lineWidth = 2; ctx.stroke();
+  }
+
+  // 真实记录点（对账/调仓/dry-run 写下的净值）
+  for (const r of (d.recorded || [])) {
+    if (r.ts < t0 || r.ts > t1) continue;
+    ctx.beginPath();
+    ctx.arc(X(r.ts), Y(r.nav), 3, 0, Math.PI * 2);
+    ctx.fillStyle = cText; ctx.fill();
+  }
+  if (d.anchor) {
+    ctx.beginPath();
+    ctx.arc(X(d.anchor.ts), Y(d.anchor.nav), 3.6, 0, Math.PI * 2);
+    ctx.fillStyle = cUp; ctx.fill();
+  }
+
+  ctx.fillStyle = cMuted; ctx.textAlign = 'left'; ctx.font = '10.5px system-ui';
+  ctx.fillText(fmtCN(t0, 'min'), P.l, H - 7);
+  ctx.textAlign = 'right';
+  ctx.fillText(fmtCN(t1, 'min'), W - P.r, H - 7);
+
+  ctx.textAlign = 'left'; ctx.fillStyle = cText; ctx.font = '11.5px system-ui';
+  const head = `${navSourceLabel(d.source)} · 末值 ${fmt.dol(d.nav[d.n - 1])}`
+    + ` · 区间 ${(((d.nav[d.n - 1] / d.nav[0]) - 1) * 100).toFixed(2)}%`
+    + (candles ? ` · ${candles.rows.length} 根${candles.secs === 86400 ? '日' : '4h'}K` : '');
+  ctx.fillText(head, P.l, P.t + 11);
+  ctx.textAlign = 'right';
+  const legend = candles ? '红=收涨 绿=收跌' : '●真实记录点';
+  ctx.fillText(legend, W - P.r, P.t + 11);
+
+  const series = [];
+  if (candles) {
+    for (const c of candles.rows) series.push({ ts: c.t + candles.secs / 2, v: c.c });
+  } else {
+    for (let i = 0; i < d.n; i++) series.push({ ts: d.ts[i], v: d.nav[i] });
+  }
+  bindNavHover(cv, { X, Y, P, W, H, series });
+}
+
+/* 取一次净值历史。`key` 去重：同一个 mode+区间只重建一次，切 tab / 切子标签
+ * 触发的 livePaintAll() 不会每次都去读 20 个 parquet。 */
+async function liveLoadNav(force) {
+  const L = S.live;
+  const key = `${L.mode}|${L.navDays || ''}`;
+  if (!force && L.navKey === key) return;
+  L.navLoading = true;
+  /* 「重建」时**留住旧曲线**，只用 .navbusy 覆盖条说「重建中…」。
+   * 之前这里把 L.nav 清成 null，面板会从一张图塌成一行文字；冷探测（OKX 不通）
+   * 要走满 6 秒超时，用户看到的就是「点一下，图没了，好几秒后才回来」。
+   * 清 key 已经足够保证一定重取。切模式那条路径是**另一个账户**，
+   * 它自己在别处清 L.nav，不受这里影响。 */
+  if (force) { L.navErr = null; L.navKey = null; }
+  livePaintAll();
+  try {
+    const q = `/api/live/navhist?mode=${encodeURIComponent(L.mode)}`
+      + `&bar=1h&rt=1`
+      + (L.navDays ? `&days=${encodeURIComponent(L.navDays)}` : '');
+    const d = await liveApi(q);
+    // `fetch` 不因 4xx reject，形状必须自己校验：`{error: ...}` 或数组
+    // 都不能当成一条曲线塞进绘图代码。
+    if (d.error) throw new Error(d.error);
+    if (!Array.isArray(d.ts) || !Array.isArray(d.nav) || d.ts.length !== d.nav.length) {
+      throw new Error('/api/live/navhist 返回的形状不对');
+    }
+    L.nav = d; L.navErr = null; L.navKey = key;
+  } catch (e) {
+    L.nav = null; L.navErr = String((e && e.message) || e); L.navKey = null;
+  } finally {
+    L.navLoading = false;
+  }
+  livePaintAll();
 }
 
 function liveSignalHtml() {
@@ -2821,7 +3211,7 @@ function liveHistHtml() {
 function liveLeverageHtml(lim) {
   const L = S.live;
   const st = L.status || {};
-  const cur = st.leverage;                     // 将要请求的杠杆（null = 不改）
+  const cur = st.leverage;   // 要设的杠杆；null = 不设置（下单时不动交易所杠杆）
   const cap = (lim.max_leverage != null) ? lim.max_leverage : (st.leverage_cap);
   const td = st.td_mode || 'isolated';
   /* Label only -- the *value* is whatever the server reports, never a front-end
@@ -2849,13 +3239,15 @@ function liveLeverageHtml(lim) {
       3× 下 10 名账本每年约 <b>30 次</b>强制平仓，1× 下约 <b>1 次</b>。</p>
     <div class="split" style="margin-top:8px">
       <div><b style="font-size:12.5px">账户杠杆</b>
-        <div class="muted" style="font-size:11px">留空 = 不改交易所现有设置</div></div>
-      <input class="liveinput" id="lvLever" placeholder="如 5" value="${cur == null ? '' : esc(String(cur))}" style="width:110px;text-align:right">
+        <div class="muted" style="font-size:11px">留空 = 下单时不动杠杆（沿用交易所现值）</div></div>
+      <input class="liveinput" id="lvLever" placeholder="不设置" value="${cur == null ? '' : esc(String(cur))}" style="width:110px;text-align:right">
     </div>
     <p class="desc" style="margin:8px 0 0">
-      上限 <b>${esc(cap == null ? '—' : String(cap))}×</b>（可在上表「账户杠杆上限」调整）。
-      杠杆按<b>逐个合约</b>设置，且会被交易所对该合约的上限压低——
-      每次下单的结果会写进运行记录，设置失败会明确提示，不会静默跳过。</p>
+      杠杆上限 <b>${esc(cap == null ? '—' : String(cap))}×</b>（可在上表「账户杠杆上限」调整）。
+      <b>留空 = 不设置</b>：下单时不会发任何杠杆请求，每条腿沿用交易所当前的杠杆。
+      填了数字才会在下一次下单时按 <b>逐个合约、逐个方向</b> 设置一次——
+      账户杠杆是账户级配置，不该塞进每一笔订单里（那会让每次调仓先付 2×N 次往返，
+      还会撞交易所限流）。</p>
     <div class="banner warn" style="margin-top:9px"><div class="ico">!</div><div>
       <b>提高杠杆不放大收益</b>
       <p>敞口由目标权重与换手预算决定（毛敞口约 ${esc(gAvgTxt)} 净值、每期换手 ${esc(turnTxt)}），
@@ -2947,14 +3339,38 @@ function liveLimitsHtml() {
 /* ---- 事件绑定 ---- */
 function liveBind() {
   const L = S.live;
+  /* 「刷新账户」只重读一次账户快照（净值/持仓/凭据状态），不下单、也不对账。
+   * 它和对账是两码事，所以按钮分开放（见 liveRefreshAcct 的注释）。 */
+  const ar = $('#liveAcctRefresh');
+  if (ar) ar.onclick = liveRefreshAcct;
+  /* 净值历史：视图 / 区间 / 重建。切换都只是本地状态 + 一次重取，
+   * 不动任何账本 —— 这条曲线是只读推导，点了不会影响账户。 */
+  $$('[data-navview]').forEach((b) => b.onclick = () => {
+    if (L.navView === b.dataset.navview) return;
+    L.navView = b.dataset.navview;
+    livePaintAll();
+  });
+  $$('[data-navdays]').forEach((b) => b.onclick = () => {
+    const v = b.dataset.navdays === '' ? null : Number(b.dataset.navdays);
+    if (L.navDays === v) return;
+    L.navDays = v;
+    livePaintAll();          // 先立刻反映按钮状态，再重取
+  });
+  const nr = $('#navReload');
+  if (nr) nr.onclick = () => liveLoadNav(true);
   $$('[data-lmode]').forEach((b) => b.onclick = async () => {
     if (L.mode === b.dataset.lmode) return;
     L.mode = b.dataset.lmode;
+    /* 记住这次选择：刷新页面不该跳回 paper（那会让账户面板显示另一个账户）。 */
+    try { localStorage.setItem(LIVE_MODE_KEY, L.mode); } catch (e) { }
     L.plan = null; L.sel = {}; L.job = null; L.orders = null; L.fills = null; L.runs = null;
     L.limits = null; L.credsOpen = false;
     /* 限额是**按模式**存的（绝对金额上限与账户规模有关），所以切模式时
      * 「被编辑过」的标记也要复位，否则新模式的限额读不进来。 */
     L.limitsTouched = false; L.savedLimits = null;
+    /* 净值历史是**按账户**重建的：paper 的 $1,000 和 demo 的 $54,000 放在同一条
+     * 曲线上毫无意义。清掉 key，下一次绘制会为新模式重取。 */
+    L.nav = null; L.navErr = null; L.navKey = null;
     /* 上一个模式的账户快照必须丢掉：liveLoadStatus() 要 ~1.4s，这期间若还留着它，
      * 账户面板就会拿 paper 的净值（$1,000）去顶 demo 的位置（$54,000）——
      * 一个看得见、却完全属于另一个账户的数字。凭据状态与 mode 无关，保留。 */
@@ -3039,10 +3455,10 @@ function liveBind() {
     const f = v === '' ? null : Number(v);
     S.live.status = Object.assign({}, S.live.status || {}, { leverage: f });
     const cap = (S.live.limits || (S.live.status && S.live.status.limits) || {}).max_leverage;
-    S.live.note = (f == null) ? '已清空杠杆设置：不动交易所现有杠杆'
+    S.live.note = (f == null) ? '已清空：下单时不再发杠杆请求，每条腿沿用交易所当前的杠杆'
       : (!isFinite(f) || f < 1) ? '杠杆必须 ≥ 1，已忽略'
       : (cap != null && f > cap) ? `杠杆 ${f}× 超过上限 ${cap}×，下单时会被闸门拦截`
-      : `杠杆设为 ${f}×，下次生成计划/执行时随请求发出（注意：这不放大收益，见下方说明）`;
+      : `杠杆设为 ${f}×：下一次生成计划/执行时按 (合约 × 方向) 设置一次（注意：这不放大收益）`;
     livePaintAll();
   };
   const rs = $('#liveReset');
@@ -3208,9 +3624,17 @@ function pollLiveJob(id) {
   }, 1200);
 }
 
-/* 账户杠杆必须随每一次下单请求一起发出去，不能只在「保存限额」时发。
- * 否则你在页面上把杠杆设成 5×、点了执行，请求里却根本没带这个字段 ——
- * 引擎按「不改杠杆」下单，页面却显示 5×。这是「UI 说一套、请求发另一套」。
+/* 账户杠杆**默认不随下单请求发**：留空 = 别动杠杆，沿用交易所现值。
+ *
+ * 这里曾经把留空回退到 `limits.max_leverage` 显式下发，为的是不让账户静默坐在
+ * BTC/ETH 的 100×（离强平 0.57%）上。那条理由是对的，但代价是每笔调仓都先打
+ * 2×N 次 `set-leverage`：19 个合约约 27 秒、会撞 50011 限流、失败时把一笔本来
+ * 能成交的调仓堵在门口。
+ *
+ * 账户杠杆是**账户级配置，不是订单属性**。所以现在是：
+ *   输入框留空 —— 显式发 `leverage: 0`（服务端 `_clean_leverage` → 关掉）；
+ *   输入框有数字 —— 只在下一次带它的请求里设置一次。
+ *   显式发 0 而不是省略字段：省略等于"沿用服务端上一次的值"，那又是一次默认值陷阱。
  *
  * 保证金模式**不在这里发**：它是服务端常量，不是每次请求的设置。以前发它，
  * 正是「控制台一次请求就能把全仓改成逐仓、重启又静默回 cross」的成因。 */
@@ -3220,9 +3644,12 @@ function liveTradeSettings() {
   const out = {};
   if (lv) {
     const v = String(lv.value || '').trim();
-    if (v !== '') { const f = Number(v); if (isFinite(f) && f >= 1) out.leverage = f; }
+    const f = Number(v);
+    out.leverage = (v !== '' && isFinite(f) && f >= 1) ? f : 0;
   } else if (L.status && L.status.leverage != null) {
-    out.leverage = L.status.leverage;      // 控件不在 DOM 里时以服务端为准
+    out.leverage = L.status.leverage;   // 控件不在 DOM 里时以服务端为准
+  } else {
+    out.leverage = 0;                   // 控件不在 DOM 里且服务端也没设 → 不接管
   }
   return out;
 }
@@ -3333,6 +3760,23 @@ function liveFlatten(dry) {
 
 function liveReconcile() {
   liveSubmit('/api/live/reconcile', { mode: S.live.mode }, '对账');
+}
+
+/* 「刷新账户」= 重读一次账户快照，并**记一个净值点**。
+ * `liveLoadStatus()` 走的正是净值/持仓/凭据这三条签名请求（demo/live 各约 1.4s）。
+ * 它**不**碰交易所的订单与成交，所以不会像对账那样改写本地账本 ——
+ * 两颗按钮语义不同，混在一起会让人以为"刷新"就等于"同步账本"，那是不对的。
+ * 要说账本与交易所的差异，请点「对账」。
+ *
+ * `record=1` 是唯一会写盘的地方，而且服务端限了 5 分钟一个点：目的是让净值历史
+ * 真的在长，而不是让 `equity.jsonl` 变成一张请求日志。 */
+async function liveRefreshAcct() {
+  const L = S.live;
+  if (L.statusLoading) return;         // 已经在读就别叠加请求
+  await liveLoadStatus(true);
+  /* 刚记的那个点要出现在曲线上，所以强制重建一次（否则 navKey 没变、不会重取）。 */
+  await liveLoadNav(true);
+  livePaintAll();
 }
 
 function liveRefreshData() {

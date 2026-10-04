@@ -486,15 +486,26 @@ def test_orders_actually_carry_tdMode():
 #   mgnMode=isolated  posSide=long    -> 200 OK
 #   POST /api/v5/account/batch-set-leverage (with or without posSide) -> **404**
 #
-# So in isolated mode this project can never set leverage: the single call is
+# So in isolated mode this project could never set leverage: the single call was
 # missing a parameter OKX requires, and the batch endpoint it was written against
-# does not exist.  A leg therefore keeps whatever the account already had -- which
+# does not exist.  A leg therefore kept whatever the account already had -- which
 # for `BTC-USDT-SWAP` isolated was **100x** (every other instrument, including
 # three we have never traded, reads 3x in both modes).
 #
-# These are `xfail(strict=True)`: they pass while the defect is present and turn
-# into hard failures the moment somebody fixes it, so the fix cannot land without
-# updating this file and FINDINGS Q37.
+# **Fixed 2026-10-03** (re-measured on the same two venues first, identical
+# results): `set_leverage` now takes `posSide`, `set_leverage_batch` is gone, and
+# `_apply_leverage` emits one call per `(instId, posSide)`.  These two tests used
+# to be `xfail(strict=True)` -- deliberately red the moment the defect was fixed,
+# so the fix could not land without touching this file and FINDINGS Q37.  They
+# are now ordinary assertions of the fixed behaviour.
+#
+# **Same day, later**: the whole call is now **off by default**.  Sending 2×N
+# `set-leverage` requests on every rebalance made each one slow, rate-limit prone
+# (50011), and able to block an order that would otherwise have gone through.
+# Leverage is an *account-level* setting, not an order attribute, so the desk
+# stopped setting it on the order path (`set_leverage=None` == "don't touch").
+# The tests below still assert the call shape, because it is what runs whenever
+# somebody explicitly asks for a leverage.
 # ---------------------------------------------------------------------------
 def _captured_bodies(monkeypatch) -> list:
     """Build an `OKXPrivate` whose transport records bodies instead of sending."""
@@ -511,27 +522,32 @@ def _captured_bodies(monkeypatch) -> list:
     return cli, seen
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "OKX 400s on mgnMode=isolated without posSide (measured 2026-09-30); "
-    "set_leverage omits it, so isolated leverage can never be set. FINDINGS Q37."))
 def test_set_leverage_passes_the_posSide_okx_requires(monkeypatch):
+    """逐仓必须带 posSide，否则 OKX 直接 51000；全仓则不能带。"""
     cli, seen = _captured_bodies(monkeypatch)
-    cli.set_leverage("BTC-USDT-SWAP", 3, "isolated")
+
+    cli.set_leverage("BTC-USDT-SWAP", 3, "isolated", "long")
     path, body = seen[-1]
     assert path == "/api/v5/account/set-leverage"
-    assert "posSide" in (body or {}), (
-        f"body sent for isolated leverage has no posSide: {body}")
+    assert (body or {}).get("posSide") == "long"
+    assert body["mgnMode"] == "isolated" and body["lever"] == "3"
+
+    cli.set_leverage("BTC-USDT-SWAP", 3, "isolated", "short")
+    assert seen[-1][1]["posSide"] == "short"
+
+    # 全仓不吃 posSide（实测返回里是空串），多传反而是参数错误。
+    cli.set_leverage("BTC-USDT-SWAP", 3, "cross", "long")
+    assert "posSide" not in seen[-1][1]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "leverage in long/short + isolated is per posSide, so both sides must be set; "
-    "_apply_leverage emits one row per instrument. FINDINGS Q37."))
-def test_isolated_leverage_covers_both_sides(monkeypatch):
+def test_the_client_never_invents_a_posSide_it_was_not_given(monkeypatch):
+    """客户端不猜方向：没给就不传。「两个方向都要设」是调用方的责任，
+    由 `_apply_leverage` 显式展开 —— 猜错方向会把杠杆设到另一条腿上。
+    引擎那一侧的守卫见 `test_execution_live.py::
+    test_isolated_leverage_covers_both_sides`。"""
     cli, seen = _captured_bodies(monkeypatch)
     cli.set_leverage("BTC-USDT-SWAP", 3, "isolated")
-    cli.set_leverage("BTC-USDT-SWAP", 3, "isolated")
-    sides = {(b or {}).get("posSide") for _, b in seen}
-    assert sides == {"long", "short"}, f"both sides not covered: {sides}"
+    assert "posSide" not in seen[-1][1]
 
 
 def test_the_audit_flags_a_leg_sitting_at_the_instruments_max_leverage():

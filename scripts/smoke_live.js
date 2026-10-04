@@ -911,6 +911,33 @@ const LOADING = ['正在读取…', '正在读取账户…'];
     }
   }
 
+  /* --- 9-lim. 下单请求里的杠杆：留空 = 不设置，且必须**显式发 0** ---
+   * 账户杠杆是账户级配置，不是订单属性。这里曾经把「留空」回退成上限、随每一笔
+   * 下单请求发出去，于是每笔调仓先打 2×N 次 `set-leverage`：慢、撞限流（50011）、
+   * 失败时把一笔本来能成交的调仓堵在门口。现在留空要显式发 `0`（服务端据此关掉），
+   * 而不是省略字段 —— 省略等于「沿用服务端上一次的值」，是同一种默认值陷阱。 */
+  {
+    const lv = sandbox.document.getElementById('lvLever');   // 上一节停在 sub='limits'
+    check('限额子视图里有账户杠杆输入框', lv != null);
+    if (lv) {
+      lv.value = '';
+      check('留空 → 显式发 0（不设置杠杆），不是省略字段',
+        T.liveTradeSettings().leverage === 0, JSON.stringify(T.liveTradeSettings()));
+      lv.value = '5';
+      check('填 5 → 发 5（下一次下单时按 合约×方向 设置一次）',
+        T.liveTradeSettings().leverage === 5, JSON.stringify(T.liveTradeSettings()));
+      lv.value = '0';
+      check('填 0 → 同样是关掉（不会把 0 当倍数发出去）',
+        T.liveTradeSettings().leverage === 0, JSON.stringify(T.liveTradeSettings()));
+      lv.value = 'abc';
+      check('填了非数字 → 回落成 0，而不是把 NaN 发出去',
+        T.liveTradeSettings().leverage === 0, JSON.stringify(T.liveTradeSettings()));
+      lv.value = '';
+    }
+    check('杠杆输入框留空时提示「不设置」而不是让人以为会落到上限',
+      region('liveHist').includes('留空 = 不设置'));
+  }
+
   /* --- 9a. 子标签高亮必须跟着 S.live.sub 走 ---
    * 用户报的是「切换成交和运行记录 tab 老是切换不过去」：表格换了，高亮还停在
    * 上一个标签上，看起来就像没切过去。根因是 livePaintAll() 只重绘 #liveHist，

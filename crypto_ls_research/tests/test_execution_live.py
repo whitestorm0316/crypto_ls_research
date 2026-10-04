@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import io
 import hmac
 import json
 import os
@@ -144,6 +145,27 @@ def test_get_retries_on_transport_error(monkeypatch):
     with pytest.raises(RuntimeError):
         cli.request("GET", "/api/v5/account/config")
     assert calls["n"] == 3
+
+
+def test_a_rate_limit_backs_off_past_okxs_window_not_inside_it(monkeypatch):
+    """`50011` 的限流窗口约 2 秒。0.4s 的退避会让三次尝试全落在**同一个**窗口里
+    —— 日志上写着"重试 3 次"，实际只试了一次。实测：24 格逐仓杠杆里错 1 格。"""
+    cli = OKXPrivate(_Cred(), mode="demo", retries=3)
+    slept = []
+    from crypto_ls_research.execution import okx_private as okx_mod
+
+    class Boom:
+        def open(self, *a, **k):
+            raise urllib.error.HTTPError(
+                "u", 429, "Too Many Requests", {},
+                io.BytesIO(b'{"code":"50011","msg":"Too Many Requests"}'))
+
+    monkeypatch.setattr(cli, "_opener", lambda: Boom())
+    monkeypatch.setattr(okx_mod.time, "sleep", lambda s: slept.append(s))
+    with pytest.raises(OKXError) as ei:
+        cli.request("POST", "/api/v5/account/set-leverage", body={"a": 1})
+    assert ei.value.code == "50011"
+    assert slept and min(slept) >= 2.0, f"退避没跨过限流窗口: {slept}"
 
 
 def test_unwrap_turns_a_nonzero_code_into_okxerror():
@@ -397,7 +419,11 @@ def test_leverage_settings_are_applied_per_name_and_capped_by_the_exchange(tmp_l
     monkeypatch.setattr(engine_mod.LiveEngine, "specs", lambda self: specs)
 
     class Cli:
-        def set_leverage(self, inst, lever, mgn):
+        def account_config(self, ttl=120.0):
+            # 单向持仓：一格就够，测试只管上限逻辑。
+            return {"posMode": "net_mode"}
+
+        def set_leverage(self, inst, lever, mgn, pos_side=None):
             calls.append((inst, lever, mgn))
 
     monkeypatch.setattr(engine_mod.LiveEngine, "_private", lambda self: Cli())
@@ -425,7 +451,10 @@ def test_a_failed_leverage_setting_is_reported_not_swallowed(tmp_live, monkeypat
     monkeypatch.setattr(engine_mod.LiveEngine, "specs", _specs)
 
     class Cli:
-        def set_leverage(self, inst, lever, mgn):
+        def account_config(self, ttl=120.0):
+            return {"posMode": "net_mode"}
+
+        def set_leverage(self, inst, lever, mgn, pos_side=None):
             raise OKXError(59100, f"leverage change blocked for {inst}")
 
     monkeypatch.setattr(engine_mod.LiveEngine, "_private", lambda self: Cli())
@@ -467,6 +496,46 @@ def test_leverage_notes_reach_the_run_record(tmp_live, monkeypatch):
     assert rec["violations"] and rec["violations"][0]["key"] == "leverage_failed"
 
 
+def test_no_leverage_request_is_sent_unless_a_value_was_asked_for(tmp_live, monkeypatch):
+    """「没提杠杆」= 下单时不动杠杆：默认路径连 `account_config()` 都不读。
+
+    这里曾经把「未指定」回退成 `limits.max_leverage`，理由是"绝不让交易所替
+    我们决定"（BTC/ETH 默认 100×、离强平 0.57%）。理由没错，代价却是每笔调仓
+    先打 2×N 次 `set-leverage`：19 个合约约 27 秒、会撞 50011 限流、失败时把
+    一笔本来能成交的调仓堵在门口。账户杠杆是账户级配置，不是订单属性。
+    """
+    eng = LiveEngine(mode="demo")
+    assert eng.effective_leverage is None
+    touched = []
+
+    class Cli:
+        def account_config(self, ttl=120.0):
+            touched.append("account_config")
+            return {"posMode": "long_short_mode"}
+
+        def set_leverage(self, inst, lever, mgn, pos_side=None):
+            touched.append(("set_leverage", inst))
+            return {}
+
+    monkeypatch.setattr(engine_mod.LiveEngine, "_private", lambda self: Cli())
+    monkeypatch.setattr(engine_mod.LiveEngine, "specs",
+                        lambda self: _specs(*[o.inst_id
+                                              for o in _plan_for_limits().orders]))
+    assert eng._apply_leverage(_plan_for_limits()) == []
+    assert touched == [], f"默认不该碰交易所：{touched}"
+
+
+def test_an_explicit_value_is_still_honoured_and_can_be_cleared_again(tmp_live):
+    """显式给了倍数才设；清掉它（`None`）= 下一次下单不再发杠杆请求。
+
+    砍掉的只是"默认替用户决定"，不是"设杠杆"这个能力本身。
+    """
+    eng = LiveEngine(mode="demo", set_leverage=5.0)
+    assert eng.effective_leverage == pytest.approx(5.0)
+    eng.set_leverage = None
+    assert eng.effective_leverage is None
+
+
 # ---------------------------------------------------------------------------
 # round trips: the desk felt frozen because every order was its own request
 # ---------------------------------------------------------------------------
@@ -489,6 +558,9 @@ def test_orders_leave_in_one_request_per_twenty(tmp_live, monkeypatch):
     calls = []
 
     class Cli:
+        def set_leverage(self, inst, lever, mgn, pos_side=None):
+            return {}
+
         def place_batch(self, orders):
             calls.append(list(orders))
             return [{"ordId": f"o{i}", "sCode": "0", "sMsg": "", "_ok": True,
@@ -502,6 +574,10 @@ def test_orders_leave_in_one_request_per_twenty(tmp_live, monkeypatch):
     assert len(res) == len(plan.orders)
     assert [r["instId"] for r in res] == [o.inst_id for o in plan.orders]
     assert all(r["ok"] and r["ordId"] for r in res)
+    # 整条下单路径上不该有杠杆请求：这一条同时钉住 `_apply_leverage` 的默认关闭
+    # 和账本里"没去设"的标记（`_leverage_applied`）。
+    assert eng._leverage_applied is False
+    assert eng._last_leverage_notes == []
 
 
 def test_batches_split_at_twenty_and_keep_per_order_outcomes(tmp_live, monkeypatch):
@@ -512,6 +588,9 @@ def test_batches_split_at_twenty_and_keep_per_order_outcomes(tmp_live, monkeypat
     calls = []
 
     class Cli:
+        def set_leverage(self, inst, lever, mgn, pos_side=None):
+            return {}
+
         def place_batch(self, orders):
             calls.append(list(orders))
             out = []
@@ -541,6 +620,9 @@ def test_a_lost_batch_marks_every_order_in_it_ambiguous(tmp_live, monkeypatch):
     plan = _big_plan(6)
 
     class Cli:
+        def set_leverage(self, inst, lever, mgn, pos_side=None):
+            return {}
+
         def place_batch(self, orders):
             raise AmbiguousError("/api/v5/trade/orders", OSError("timeout"))
 
@@ -554,10 +636,15 @@ def test_a_lost_batch_marks_every_order_in_it_ambiguous(tmp_live, monkeypatch):
     assert rows and all(r["state"] == "unknown" for r in rows.values())
 
 
-def test_leverage_is_set_in_batches_not_one_call_per_name(tmp_live, monkeypatch):
-    """Same story as the orders: 25 names used to be 25 round trips."""
+def test_isolated_leverage_covers_both_sides(tmp_live, monkeypatch):
+    """逐仓 + 多空持仓模式：杠杆是**按 posSide 分开的两个格子**。
+
+    OKX 文档原话：设 `long` 的杠杆**不会**影响 `short`。账户实测 `posMode`
+    就是 `long_short_mode` + `MARGIN_MODE=isolated`，所以这是**常态路径**：
+    只设一次等于有一半的腿还坐在旧杠杆上（BTC 那条就是 100×）。
+    """
     eng = LiveEngine(mode="demo", set_leverage=5.0)
-    plan = _big_plan(25)
+    plan = _big_plan(3)
     insts = [o.inst_id for o in plan.orders]
 
     class Spec:
@@ -565,48 +652,132 @@ def test_leverage_is_set_in_batches_not_one_call_per_name(tmp_live, monkeypatch)
 
     monkeypatch.setattr(engine_mod.LiveEngine, "specs",
                         lambda self: {i: Spec() for i in insts})
-    calls = []
+    seen = []
 
     class Cli:
-        def set_leverage_batch(self, items, mgn):
-            calls.append(list(items))
-            return [{"instId": it["instId"], "sCode": "0", "sMsg": "", "_ok": True}
-                    for it in items]
+        def account_config(self, ttl=120.0):
+            return {"posMode": "long_short_mode"}
 
-        def set_leverage(self, inst, lever, mgn):
-            raise AssertionError("should not fall back when the batch works")
+        def set_leverage(self, inst, lever, mgn, pos_side=None):
+            seen.append((inst, lever, mgn, pos_side))
+            return {}
 
     monkeypatch.setattr(engine_mod.LiveEngine, "_private", lambda self: Cli())
     notes = eng._apply_leverage(plan)
 
-    assert len(calls) == 2 and [len(c) for c in calls] == [20, 5]
+    assert len(seen) == 2 * len(insts), f"每个合约要 long/short 各一次: {seen}"
+    for inst in insts:
+        assert {ps for i, _, _, ps in seen if i == inst} == {"long", "short"}, inst
+    assert all(lv == pytest.approx(5.0) for _, lv, _, _ in seen)
+    assert {n["posSide"] for n in notes} == {"long", "short"}
+    assert all(n["ok"] for n in notes)
+
+
+def test_the_posSide_is_omitted_when_the_account_is_in_net_mode(tmp_live, monkeypatch):
+    """单向持仓模式下同一个格子就够，多传 posSide 反而是参数错误。"""
+    eng = LiveEngine(mode="demo", set_leverage=5.0)
+    plan = _big_plan(3)
+    insts = [o.inst_id for o in plan.orders]
+
+    class Spec:
+        ct_val, max_lever = 0.01, 10.0
+
+    monkeypatch.setattr(engine_mod.LiveEngine, "specs",
+                        lambda self: {i: Spec() for i in insts})
+    seen = []
+
+    class Cli:
+        def account_config(self, ttl=120.0):
+            return {"posMode": "net_mode"}
+
+        def set_leverage(self, inst, lever, mgn, pos_side=None):
+            seen.append((inst, pos_side))
+            return {}
+
+    monkeypatch.setattr(engine_mod.LiveEngine, "_private", lambda self: Cli())
+    notes = eng._apply_leverage(plan)
+
+    assert [s for _, s in seen] == [None] * len(insts)
     assert len(notes) == len(insts)
-    assert [n["instId"] for n in notes] == insts          # order preserved
-    assert all(n["ok"] and n["leverage"] == pytest.approx(5.0) for n in notes)
 
 
-def test_a_leverage_batch_that_does_not_line_up_is_discarded():
-    """Positional alignment is an assumption.  Geometry that doesn't line up is
-    worse than round trips, because you'd record leverage against the wrong
-    instrument -- so refuse it and let the caller fall back.
-    """
+def test_a_broken_posMode_read_still_sets_both_sides(tmp_live, monkeypatch):
+    """读不到持仓模式时**宁可多设一格**：多设只是把同一个倍数再写一遍，
+    漏设会让一条腿留在 100× 上 —— 两种错的代价不对称。"""
+    eng = LiveEngine(mode="demo", set_leverage=5.0)
+    plan = _big_plan(2)
+
+    class Spec:
+        ct_val, max_lever = 0.01, 10.0
+
+    monkeypatch.setattr(engine_mod.LiveEngine, "specs",
+                        lambda self: {o.inst_id: Spec() for o in plan.orders})
+    seen = []
+
+    class Cli:
+        def account_config(self, ttl=120.0):
+            raise RuntimeError("network down")
+
+        def set_leverage(self, inst, lever, mgn, pos_side=None):
+            seen.append(pos_side)
+            return {}
+
+    monkeypatch.setattr(engine_mod.LiveEngine, "_private", lambda self: Cli())
+    notes = eng._apply_leverage(plan)
+
+    assert set(seen) == {"long", "short"}, seen
+    assert all(n["ok"] for n in notes)
+
+
+def test_a_4xx_body_becomes_the_okx_error_instead_of_http_400():
+    """OKX 把真正的原因写在 4xx 的 body 里，而 urllib 在非 2xx 时不会把 body
+    交出来 —— 所以以前用户只看到 "HTTP Error 400: Bad Request"，
+    唯一能拿去修的那句话被丢掉了。"""
+    import urllib.error
+
     class C:
         api_key, secret_key, passphrase = "k", "s", "p"
 
     cli = OKXPrivate(C(), mode="demo")
-    cli.request = lambda *a, **kw: [{"instId": "WRONG-USDT-SWAP", "sCode": "0"}]
-    assert cli.set_leverage_batch([{"instId": "A-USDT-SWAP", "lever": "5"}],
-                                  "cross") is None
+    cli.retries = 3
+    body = b'{"code":"51000","data":[],"msg":"Parameter posSide error"}'
+    calls = []
 
-    cli.request = lambda *a, **kw: [{"instId": "A-USDT-SWAP", "sCode": "0"},
-                                    {"instId": "B-USDT-SWAP", "sCode": "0"}]
-    assert cli.set_leverage_batch([{"instId": "A-USDT-SWAP", "lever": "5"}],
-                                  "cross") is None
+    def _open(req, timeout=None):
+        calls.append(req.full_url)
+        raise urllib.error.HTTPError(req.full_url, 400, "Bad Request", {}, io.BytesIO(body))
 
-    cli.request = lambda *a, **kw: [{"instId": "A-USDT-SWAP", "sCode": "1",
-                                     "sMsg": "blocked"}]
-    rows = cli.set_leverage_batch([{"instId": "A-USDT-SWAP", "lever": "5"}], "cross")
-    assert rows and rows[0]["_ok"] is False and rows[0]["_error"]
+    cli._opener = lambda: type("O", (), {"open": staticmethod(_open)})()
+    with pytest.raises(OKXError) as ei:
+        cli.set_leverage("BTC-USDT-SWAP", 5, "isolated")
+
+    assert ei.value.code == "51000"
+    assert "posSide" in str(ei.value)
+    assert len(calls) == 1, f"确定的 4xx 不该退避重试: {calls}"
+
+
+def test_a_404_is_not_retried():
+    """路径不存在是确定性的：重试三次只是把同一个 404 等三遍。"""
+    import urllib.error
+
+    class C:
+        api_key, secret_key, passphrase = "k", "s", "p"
+
+    cli = OKXPrivate(C(), mode="demo")
+    cli.retries = 3
+    calls = []
+
+    def _open(req, timeout=None):
+        calls.append(req.full_url)
+        raise urllib.error.HTTPError(req.full_url, 404, "Not Found", {},
+                                     io.BytesIO(b'{"code":404,"msg":"Not Found"}'))
+
+    cli._opener = lambda: type("O", (), {"open": staticmethod(_open)})()
+    with pytest.raises(Exception) as ei:
+        cli.request("POST", "/api/v5/account/batch-set-leverage", body=[{}])
+    assert len(calls) == 1, f"404 重试了 {len(calls)} 次"
+    # 保留路径，方便直接搜到是谁在打一个不存在的端点
+    assert "batch-set-leverage" in str(ei.value)
 
 
 def test_the_signed_client_is_reused_between_calls(tmp_live, monkeypatch):
@@ -780,7 +951,9 @@ def test_a_slow_run_tells_you_its_the_network(tmp_live, monkeypatch):
     monkeypatch.setattr(engine_mod.LiveEngine, "specs",
                         lambda self: _specs(*[o.inst_id for o in plan.orders]))
 
-    import types
+    # 杠杆那一步会先跑：这里只要它别把测试打断，重点是 place_batch 的耗时提示。
+    fake.account_config = lambda ttl=120.0: {"posMode": "net_mode"}
+    fake.set_leverage = lambda inst, lever, mgn, pos_side=None: {}
 
     def place_batch(orders):
         seen.append(list(orders))
@@ -2281,3 +2454,127 @@ def test_a_rejected_close_keeps_the_position_it_failed_to_shut(tmp_live, monkeyp
     assert LiveEngine._realised_book(plan, rejected, acct)[0] == pytest.approx(100.0)
     accepted = [{"instId": "A-USDT-SWAP", "ok": True}]
     assert LiveEngine._realised_book(plan, accepted, acct)[0] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# NAV history: the rebuild route and the throttled NAV mark
+# ---------------------------------------------------------------------------
+def test_refresh_records_a_nav_mark_at_most_once_per_gap(tmp_live, monkeypatch):
+    """「刷新账户」 grows the history, but one point per click is not history.
+
+    The gap also keeps `equity.jsonl` from becoming a request log: the console
+    fires `/status` on its own while a job runs, and only the explicit refresh
+    passes `record=1` at all.
+    """
+    api = _live_api(monkeypatch)
+    st = {"connected": True, "account": {"nav": 1234.5}}
+    assert api.record_nav_mark("paper", st, now=1000.0) == 1234.5
+    assert api.record_nav_mark("paper", st, now=1000.0 + api.NAV_MARK_MIN_GAP - 1) is None
+    assert api.record_nav_mark("paper", st, now=1000.0 + api.NAV_MARK_MIN_GAP + 1) == 1234.5
+    rows = store_mod.Store("paper").equity()
+    assert [r["nav"] for r in rows] == [1234.5, 1234.5]
+    assert rows[0]["ts"] == 1000.0
+    # an unreadable account marks nothing rather than writing a 0
+    assert api.record_nav_mark("paper", {"account": {}}, now=9e9) is None
+    assert api.record_nav_mark("paper", {"account": {"nav": "n/a"}}, now=9e9) is None
+
+
+def test_status_records_only_when_explicitly_asked(tmp_live, monkeypatch):
+    api = _live_api(monkeypatch)
+    monkeypatch.setattr(engine_mod.LiveEngine, "status",
+                        lambda self: {"connected": True,
+                                      "account": {"nav": 777.0}})
+    out, code = api.route_get("/api/live/status", {"mode": ["paper"]})
+    assert code == 200 and "nav_marked" not in out
+    assert store_mod.Store("paper").equity() == []
+
+    out, code = api.route_get("/api/live/status",
+                              {"mode": ["paper"], "record": ["1"]})
+    assert code == 200 and out["nav_marked"] is True
+    assert store_mod.Store("paper").equity()[-1]["nav"] == 777.0
+
+
+def test_clearing_the_leverage_field_turns_the_request_off_again(tmp_live, monkeypatch):
+    """「留空」必须是显式的**关**，不能退化成「沿用上一次的值」——那也是默认值陷阱。"""
+    api = _live_api(monkeypatch)
+    eng = api.engine("paper", set_leverage="5")
+    assert eng.effective_leverage == pytest.approx(5.0)
+    api.engine("paper", set_leverage="")          # 输入框被清空
+    assert eng.effective_leverage is None
+    api.engine("paper", set_leverage="0")
+    assert eng.effective_leverage is None
+    api.engine("paper", set_leverage="5")         # 再填回去仍然生效
+    assert eng.effective_leverage == pytest.approx(5.0)
+
+
+def test_status_says_when_leverage_is_not_managed(tmp_live, monkeypatch):
+    """默认不接管杠杆：`leverage` 为 null、`leverage_managed` 为 false。
+
+    页面据此把输入框留空，而不是显示一个服务端其实不会去设的数字 ——
+    「UI 说一套、请求发另一套」正是这一整类缺陷的成因。
+    """
+    api = _live_api(monkeypatch)
+    monkeypatch.setattr(engine_mod.LiveEngine, "status",
+                        lambda self: {"connected": False})
+    out, code = api.route_get("/api/live/status", {"mode": ["paper"]})
+    assert code == 200
+    assert out["leverage"] is None and out["leverage_managed"] is False
+    assert out["leverage_cap"] == LiveLimits().max_leverage
+
+
+def test_navhist_route_rejects_bad_parameters(tmp_live, monkeypatch):
+    api = _live_api(monkeypatch)
+    body, code = api.route_get("/api/live/navhist", {"mode": ["nope"]})
+    assert code == 400 and "unknown mode" in body["error"]
+    body, code = api.route_get("/api/live/navhist", {"mode": ["paper"], "bar": ["7m"]})
+    assert code == 400 and "bar" in body["error"]
+    body, code = api.route_get("/api/live/navhist", {"mode": ["paper"], "days": ["x"]})
+    assert code == 400 and "days" in body["error"]
+    body, code = api.route_get("/api/live/navhist", {"mode": ["paper"], "days": ["9999"]})
+    assert code == 400 and "days" in body["error"]
+
+
+def test_navhist_route_serves_a_rebuild_from_the_local_cache(tmp_live, monkeypatch):
+    """`rt=0` must never touch the network: the panel has to work offline."""
+    from crypto_ls_research.execution import navhist as nh
+
+    api = _live_api(monkeypatch)
+    monkeypatch.setattr(nh, "CACHE_DIR", str(tmp_live / "cache"))
+    d = tmp_live / "cache" / "candles" / "1h"
+    d.mkdir(parents=True, exist_ok=True)
+    idx = pd.to_datetime([int((1_790_000_000 + i * 3600) * 10 ** 9)
+                          for i in range(3)], utc=True).as_unit("ms")
+    pd.DataFrame({"close": [100.0, 110.0, 120.0]}, index=idx).to_parquet(
+        d / "X-USDT-SWAP.parquet")
+
+    st = store_mod.Store("paper")
+    st.patch_state(positions={"X-USDT-SWAP": {"sz": 2.0, "avg_px": 110.0}})
+    st.add_fills([{"instId": "X-USDT-SWAP", "side": "buy", "sz": "2",
+                   "px": 110.0, "fee": 0.0, "ts": 1_790_000_000 + 3600,
+                   "ct_val": 1.0}])
+    st.add_equity(1020.0, ts=1_790_000_000 + 7200)
+    st.add_equity(1000.0, ts=1_790_000_000)
+
+    body, code = api.route_get("/api/live/navhist",
+                              {"mode": ["paper"], "rt": ["0"]})
+    assert code == 200
+    assert body["source"] == "cache"
+    assert body["nav"][0] == pytest.approx(1000.0)
+    assert body["nav"][-1] == pytest.approx(1020.0)
+    assert body["max_pct"] == pytest.approx(0.0, abs=1e-12)
+    assert body["n_fills"] == 1
+
+    # and it is JSON on the wire, not a Python repr
+    assert json.loads(json.dumps(body))["mode"] == "paper"
+
+
+def test_navhist_route_survives_a_broken_ledger(tmp_live, monkeypatch):
+    """A rebuild failure must return JSON, not kill the desk's HTTP handler."""
+    from crypto_ls_research.execution import navhist as nh
+
+    api = _live_api(monkeypatch)
+    monkeypatch.setattr(nh, "build",
+                        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("boom")))
+    body, code = api.route_get("/api/live/navhist", {"mode": ["paper"], "rt": ["0"]})
+    assert code == 500
+    assert "boom" in body["error"] and "trace" in body

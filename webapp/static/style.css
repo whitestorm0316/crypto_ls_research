@@ -367,6 +367,21 @@ pre.log .stage { color: var(--accent); }
 .kv .cell .v { font-size: 15px; font-weight: 640; font-variant-numeric: tabular-nums; margin-top: 2px; }
 .kv .cell .s { font-size: 10.5px; color: var(--muted); margin-top: 2px; }
 
+/* 多空占比汇总条（交易台账户面板） */
+.lskew { margin-top: 11px; padding: 10px 12px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; }
+.lskew-bar { display: flex; height: 10px; border-radius: 5px; overflow: hidden; background: var(--border); }
+.lskew-long { display: block; height: 100%; background: var(--up); }
+.lskew-short { display: block; height: 100%; background: var(--down); }
+.lskew-meta { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; margin-top: 8px; font-size: 12px; }
+.lskew-lbl { display: inline-flex; align-items: center; gap: 5px; color: var(--text-2); }
+.lskew-lbl em { font-style: normal; font-weight: 640; color: var(--text); font-variant-numeric: tabular-nums; }
+.lskew-lbl .dot { width: 8px; height: 8px; border-radius: 2px; }
+.lskew-lbl .dot.long { background: var(--up); }
+.lskew-lbl .dot.short { background: var(--down); }
+.lskew-net { margin-left: auto; font-weight: 640; font-variant-numeric: tabular-nums; color: var(--text-2); }
+.lskew-net.long { color: var(--up); }
+.lskew-net.short { color: var(--down); }
+
 .gates { display: flex; flex-direction: column; gap: 7px; }
 .gate { display: flex; gap: 9px; align-items: flex-start; font-size: 12.5px; padding: 9px 11px; border-radius: 8px; }
 .gate.block { background: var(--danger-soft); color: var(--danger); }
@@ -502,3 +517,19 @@ table.hm td.hmc { color: var(--text-1); border: 1px solid var(--border); }
   .side { border-right: none; border-bottom: 1px solid var(--border); max-height: 46vh; }
   .grid2 { grid-template-columns: 1fr; }
 }
+
+/* ---------- 账户净值历史（重建口径） ---------- */
+/* 曲线本身是 canvas，这里只管容器、读数条与口径说明。
+ * 高度比回测曲线矮一点：它是交易台的旁证，不是主角。 */
+canvas.navchart { width: 100%; height: 236px; display: block; }
+.navbusy {
+  position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+  padding: 3px 10px; border-radius: 999px; font-size: 11.5px;
+  background: var(--panel); border: 1px solid var(--border); color: var(--muted);
+}
+.navmeta { margin-top: 10px; gap: 8px 20px; flex-wrap: wrap; }
+.navmeta .nm { min-width: 130px; }
+.navmeta .nm .k { font-size: 11px; color: var(--muted); }
+.navmeta .nm .v { font-size: 12.5px; color: var(--text); font-variant-numeric: tabular-nums; }
+details.navwarn { margin-top: 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel-2); }
+ul.navlist { margin: 0; padding-left: 18px; font-size: 12px; color: var(--text-2); line-height: 1.75; }

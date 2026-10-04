@@ -1390,8 +1390,71 @@ ATOM-USDT-SWAP           50      3         3   <- 同上
   （现在 xfail，**一旦有人补上 `posSide` 就变成硬失败**，强制同步更新本条与代码），
   一条测审计的 `at_max` 检出逻辑。已用**变异**验证严格性：给 `set_leverage` 补上 `posSide`
   后该测试立刻 `XPASS(strict)` 变红（sha256 校验注入与还原）。
-- ⚠️ **未修**：`okx_private.set_leverage` / `set_leverage_batch` 的调用形状，
-  以及 `set_leverage_batch` 指向的不存在端点。**这是执行路径上的改动，等确认。**
+
+#### ✅ 已修（2026-10-03）—— 由实盘日志再次暴露
+
+用户在交易台跑实盘时贴出日志：`批量设置杠杆请求失败，逐个重试：RuntimeError`、
+`第 1/3 次失败，退避重试 · POST /api/v5/account/set-leverage`。这正是上面③那条路。
+先**原样复测**（相同两个交易场所，结论与 09-30 完全一致），然后修：
+
+| 改动 | 位置 | 为什么 |
+|---|---|---|
+| `set_leverage(..., pos_side=None)`，逐仓时带 `posSide` | `okx_private.py` | 逐仓 + 多空持仓模式**必须有**，缺了就是 `51000 Parameter posSide error` |
+| 删掉 `set_leverage_batch` | `okx_private.py` | 打在一个**不存在**的端点上（404），每次白跑 3 次退避 + 降级 |
+| `_apply_leverage` 按 `(instId, posSide)` 逐格展开 | `engine.py` | 逐仓下 long/short 是**两个格子**，只设一次会漏掉一半的腿 |
+| 并发 4 路（原本串行） | `engine.py` | 没有批量端点 ⇒ 12 个合约 24 次往返，串行约 27s |
+| 4xx **响应体**解析成 `OKXError` | `okx_private.py` | urllib 在非 2xx 时不给 body，于是 `51000 Parameter posSide error` 只剩 "HTTP Error 400: Bad Request" —— 唯一能拿去修的那句话被丢掉了 |
+| 4xx 不再退避重试；`50011` 退避跨过 2s 限流窗口 | `okx_private.py` | 404/400 是确定性判决；限流窗口约 2s 而退避只有 0.4s，三次尝试其实落在同一个窗口里 |
+| 重试耗尽后若 `last` 是 `OKXError` 就**原样抛出** | `okx_private.py` | 包成 `RuntimeError` 后调用方的 `except OKXError` 抓不到、`.code` 也没了 |
+| `OKXError` 消息带上端点 | `okx_private.py` | `51000` 在不同接口上含义完全不同，"哪个接口"是第一个要问的 |
+
+**端到端验证**（真实引擎代码 → demo 交易所，只设杠杆不下单）：
+
+```
+posMode=long_short_mode  acctLv=2  MARGIN_MODE=isolated
+设置杠杆：24 格（12 合约 × posSide），成功 24，失败 0
+回读 leverage-info：BTC-USDT-SWAP {'long': '5', 'short': '5'}   <- 原本逐仓是 100×
+                    ARB-USDT-SWAP {'long': '5', 'short': '5'}
+```
+
+唯一一次失败出现在把并发开到 6 时（`50011` 限流，24 格里错 1 格），并发降到 4 +
+退避跨窗口后 **24/24**。测试侧：`test_margin_mode.py` 的两条 `xfail(strict=True)` 已按设计
+转成普通断言（这正是它们存在的意义），`test_execution_live.py` 新增 6 条
+（两侧覆盖、净持仓模式不传 posSide、读不到 posMode 时宁多设、4xx body 变 OKXError、
+404 不重试、限流退避跨窗口）。
+
+#### ⭐ 同日更晚：用户裁定「下单时干脆不设杠杆」
+
+上面的修复让调用**形状**正确了，但请求本身仍然**每一次下单都发**。用户实测**还是失败**，
+于是直接拍板：**「下单的时候不用你设置杠杆，取消这个请求。」**
+
+语义改动只有一处，但影响面是整个下单路径：
+
+| 之前 | 现在 |
+|---|---|
+| `set_leverage=None` → 回退到 `limits.max_leverage`（5×），**每次下单先设一遍** | `set_leverage=None` → **下单时不动杠杆**，一个请求都不发 |
+
+`effective_leverage` 因此**可以为 `None`**，含义是"不接管"。想设就单独设一次：页面上的
+杠杆输入框**填了数字**才发（调用形状同上一节）；**留空 = 显式发 `leverage: 0`**，
+而不是省略字段 —— 省略等于"沿用服务端上一次的值"，与本次要堵的默认值陷阱同类。
+
+**代价（写在最前面，这是用户明确选择的，不是缺陷）**：不再有"未指定 = 显式落到上限"
+这层保护，账户会坐在交易所当前的杠杆上。实盘实测 17 条腿无一在 5×
+（XRP long 30×、ETH/SUI short 20×、DOGE long 10×，其余 `long:3/short:1`）。
+
+**理由**：账户杠杆是**账户级配置，不是订单属性**。每笔调仓先打 2×N 次 `set-leverage`
+（19 合约 ≈ 27 秒）会拖垮下单、撞击限流（50011），失败时还把一笔本来能成交的调仓堵在门口。
+
+**账本必须分得开两件事**（这是本条的记账红线）：
+`record["leverage"] = []` + `record["leverage_note"]` = **按配置没去设**（意图）；
+`violations[leverage_failed]` = **设了但失败**（事故）。靠 `_leverage_applied` 区分。
+
+**真机验证**：在**真实**私有客户端（真凭据/真代理/真签名）的传输层装探针，跑
+`_apply_leverage` —— demo 与 live 均 **0 条请求发出、0 条含 leverage**；
+`/api/live/status` 返回 `leverage=null, leverage_managed=false`。
+
+> 上一版这里写着「⚠️ 仍未做：`leverage_failed` 要不要升级成 blocking 违规」——
+> 该问题已被本次裁定绕过：默认路径根本不发这个请求，也就没有"没设上"这回事。
 
 ---
 

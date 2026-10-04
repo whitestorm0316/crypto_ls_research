@@ -31,9 +31,16 @@ from crypto_ls_research.execution.engine import DEFAULT_SIGNAL, LiveEngine
 from crypto_ls_research.execution.limits import LiveLimits
 from crypto_ls_research.execution.store import Store, archives, reset_mode
 from crypto_ls_research.execution import auto_ctl
+from crypto_ls_research.execution import navhist
 
 MODES = ("paper", "demo", "live")
 MODE_LABEL = {"paper": "本地纸面", "demo": "OKX 模拟盘", "live": "OKX 实盘"}
+
+#: A NAV mark is appended at most this often by the 「刷新账户」 button.  The
+#: engine already marks on every rebalance and reconcile; this only adds the
+#: intraday resolution the history chart needs, and without a floor a
+#: click-happy UI would append a mark per click.
+NAV_MARK_MIN_GAP = 300.0
 
 _LOCK = threading.RLock()
 _ENGINES: Dict[str, LiveEngine] = {}
@@ -118,8 +125,9 @@ def engine(mode: str, limits: Optional[dict] = None,
 
     `set_leverage` is `object` rather than `Optional[float]` on purpose: the
     distinction between "not supplied" (`None`) and "supplied as empty/0"
-    ("do not touch leverage") matters, and collapsing them would make an
-    explicit "turn it off" indistinguishable from "never mentioned".
+    ("do not touch leverage") matters.  Both end up meaning *don't send the
+    leverage request* -- but the second one is an explicit **off**, so it must
+    also clear a value left over from an earlier request instead of keeping it.
 
     `td_mode` is the opposite: it is accepted only so that an explicit
     *conflict* is rejected loudly.  The margin mode is a pinned constant
@@ -145,6 +153,8 @@ def engine(mode: str, limits: Optional[dict] = None,
         # `td_mode` is deliberately *not* applied here: `LiveEngine` derives it
         # from the constant, and a conflicting value has already been rejected.
         if set_leverage is not None:
+            # 数字 → 下一次下单时设置一次；空 / 0 / 'off' → `None` = 关掉。两者都必须
+            # 真正落到 `eng.set_leverage` 上，否则"关掉"会退化成"沿用上一次的值"。
             eng.set_leverage = _clean_leverage(set_leverage)
         return eng
 
@@ -166,6 +176,52 @@ def _recent_jobs(n: int = 12) -> List[dict]:
     with _LOCK:
         rows = sorted(_JOBS.values(), key=lambda j: j["created"], reverse=True)
         return [_job_view(j) for j in rows[:n]]
+
+
+def _nav_of(st: dict) -> Optional[float]:
+    """The account NAV out of a `/status` payload, or None if unreadable."""
+    acct = st.get("account") or {}
+    for v in (acct.get("nav"), st.get("equity_usdt")):
+        try:
+            f = float(v)
+        except (TypeError, ValueError):
+            continue
+        if f == f and f > 0:
+            return f
+    return None
+
+
+def record_nav_mark(mode: str, st: dict, *, gap: float = NAV_MARK_MIN_GAP,
+                    now: Optional[float] = None) -> Optional[float]:
+    """Append a NAV mark for the history chart, at most one per `gap` seconds.
+
+    Deliberately *not* on every `/status` poll: the console polls status while
+    a job runs, and a mark per poll would turn `equity.jsonl` into a request
+    log.  This is called from the explicit 「刷新账户」 action, so the desk's
+    history grows by one point per refresh at most -- and the engine's own
+    rebalance/reconcile marks keep accumulating either way.
+
+    Returns the mark it wrote, or None when it was throttled / unreadable.
+    """
+    nav = _nav_of(st)
+    if nav is None:
+        return None
+    store = Store(mode)
+    rows = store.equity()
+    t = time.time() if now is None else float(now)
+    if rows:
+        try:
+            last = float(rows[-1].get("ts") or 0.0)
+        except (TypeError, ValueError):
+            last = 0.0
+        if last and t - last < gap:
+            return None
+    store.add_equity(nav, ts=t)
+    return nav
+
+
+def _truthy(v: object) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
 # ---------------------------------------------------------------------------
@@ -191,16 +247,54 @@ def route_get(path: str, q: dict) -> Optional[Tuple[dict, int]]:
         mode = one("mode", "paper")
         eng = engine(mode)
         st = eng.status()
-        # `set_leverage` is what we will *ask* the exchange for.  It is not the
-        # same as the leverage actually in force (which lives per-instrument on
-        # OKX and can differ per name), so label it honestly.
-        st["leverage"] = eng.set_leverage
+        # `effective_leverage` 现在可能是 `None` = **下单时不改杠杆**（这是默认）。
+        # 它仍然不等于"实际在用的杠杆"：真实杠杆按 `(合约, 保证金模式, 方向)` 存在
+        # 交易所，页面只能显示我们要不要去设它。
+        st["leverage"] = eng.effective_leverage
+        st["leverage_managed"] = eng.set_leverage is not None
         st["leverage_cap"] = eng.limits.max_leverage
         st["creds"] = creds_status()
         st["jobs"] = _recent_jobs(8)
         st["has_preview"] = mode in _LAST
         st["archives"] = archives(mode)
+        # `record=1` comes from the explicit 「刷新账户」 button, never from the
+        # automatic poll -- see `record_nav_mark`.  Read-only callers get a
+        # read-only endpoint: they simply omit the flag.
+        if _truthy(one("record")) and st.get("connected"):
+            marked = record_nav_mark(mode, st)
+            st["nav_marked"] = marked is not None
         return st, 200
+
+    if path == "/api/live/navhist":
+        # The account's own NAV history.  It is *rebuilt* (see
+        # `navhist.reconstruct`) because neither OKX nor the local ledger stores
+        # it: OKX only exposes the current balance and the ledger only the
+        # current book.  `rt=1` (default) also pulls the live 1h candles from
+        # OKX's public endpoint so the curve reaches the bar still forming;
+        # when that is unreachable it falls back to the local cache and says so
+        # in `source`/`warnings` instead of quietly drawing a stale line.
+        mode = one("mode", "paper")
+        if mode not in MODES:
+            return {"error": f"unknown mode {mode!r}", "modes": list(MODES)}, 400
+        bar = str(one("bar", "1h") or "1h")
+        days = one("days")
+        try:
+            days = int(days) if days not in (None, "") else None
+        except (TypeError, ValueError):
+            return {"error": f"days must be an integer, got {days!r}"}, 400
+        want_live = _truthy(one("rt", "1"))
+        try:
+            hist = navhist.build(
+                mode, bar=bar, days=days, use_okx=want_live,
+                client=navhist.okx_client() if want_live else None)
+        except ValueError as e:
+            return {"error": str(e)}, 400
+        except Exception as e:                                     # noqa: BLE001
+            # A rebuild that explodes must not take the whole desk down with it:
+            # the panel can render the error, the orders still go out.
+            return {"error": f"{type(e).__name__}: {e}",
+                    "trace": traceback.format_exc()[-800:]}, 500
+        return hist.to_dict(), 200
 
     if path == "/api/live/jobs":
         return {"jobs": _recent_jobs(int(one("n", 12) or 12))}, 200
