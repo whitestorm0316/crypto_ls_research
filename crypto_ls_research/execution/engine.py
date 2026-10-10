@@ -470,11 +470,25 @@ class LiveEngine:
         # per-thread urllib opener (`self._local`), a locked RTT deque and a
         # locked rate limiter -- it was built to be called from more than one
         # thread.  Measured 616ms -> ~320ms.
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        # `margin_usage()` reads the same `/account/balance` response
+        # `equity_usdt()` does, so it is a **third** concurrent call rather than
+        # a rename: the two answer different questions (what the account is
+        # worth vs what is locked up) and both are shown side by side.  Same
+        # 2-worker pool as before plus one slot, so this stays off the critical
+        # path the user feels.
+        with ThreadPoolExecutor(max_workers=3) as pool:
             fut_pos = pool.submit(cli.positions, "SWAP")
             fut_nav = pool.submit(cli.equity_usdt)
+            fut_mgn = pool.submit(cli.margin_usage, "USDT")
             rows = fut_pos.result()
             nav = fut_nav.result()
+            try:
+                margin = fut_mgn.result()
+            except Exception:                                    # noqa: BLE001
+                # Never let the extra read break the account snapshot: a missing
+                # margin figure must read as "unavailable", not as a crash on a
+                # page that used to work.
+                margin = {"unavailable": True}
         sp = self.specs()                    # cached in-process; needed for notional
         cur_sz: Dict[str, float] = {}
         marks: Dict[str, float] = {}
@@ -520,6 +534,12 @@ class LiveEngine:
                 "positions": detail, "pos_mode": pos_mode,
                 "acctLv": cfg.get("acctLv"), "uid": cfg.get("uid"),
                 "leverage": cfg.get("lever"), "source": "okx",
+                # What the venue says is locked up.  Displayed next to
+                # `Σ notionalUsd` because the two are routinely confused -- see
+                # `OKXPrivate.margin_usage` for why they legitimately differ.
+                "margin": margin,
+                "gross_notional": sum(abs(p.get("notional") or 0.0)
+                                      for p in detail),
                 "equity_error": None if nav > 0 else "净值读取为 0"}
 
     # ---- paper account ---------------------------------------------------

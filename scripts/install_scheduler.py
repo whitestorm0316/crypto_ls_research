@@ -63,15 +63,47 @@ import sys
 import textwrap
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-LABEL = "com.crypto-ls.auto-trader-demo"
-PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
-SYSTEMD_DIR = os.path.expanduser("~/.config/systemd/user")
-SYSTEMD_UNIT = "crypto-ls-auto-trader-demo"
 
+#: One label **per trading mode**.  Installing the live timer must not silently
+#: overwrite the demo one: they are different jobs (different money, different
+#: limits file), and a shared label would make the second install replace the
+#: first -- leaving one of them unguarded while `--status` still looked healthy.
+LABELS = {
+    "demo": "com.crypto-ls.auto-trader-demo",
+    "paper": "com.crypto-ls.auto-trader-paper",
+    "live": "com.crypto-ls.auto-trader-live",
+}
+UNITS = {
+    "demo": "crypto-ls-auto-trader-demo",
+    "paper": "crypto-ls-auto-trader-paper",
+    "live": "crypto-ls-auto-trader-live",
+}
+
+#: Default install target.  Kept as `demo` so the documented command in
+#: `AUTO_TRADER_README.md` keeps meaning what it always meant.
 MODE = "demo"
 REBALANCE_DAYS = 1.0
 INTERVAL_MIN = 30.0
 BAR = "1h"
+
+#: Back-compat module constants for the demo job (imported by tests / scripts).
+LABEL = LABELS["demo"]
+PLIST = os.path.expanduser(f"~/Library/LaunchAgents/{LABEL}.plist")
+SYSTEMD_DIR = os.path.expanduser("~/.config/systemd/user")
+SYSTEMD_UNIT = UNITS["demo"]
+
+
+def label_for(trading_mode: str) -> str:
+    return LABELS[trading_mode]
+
+
+def plist_path_for(trading_mode: str) -> str:
+    return os.path.expanduser(
+        f"~/Library/LaunchAgents/{LABELS[trading_mode]}.plist")
+
+
+def unit_name_for(trading_mode: str) -> str:
+    return UNITS[trading_mode]
 
 
 def find_python() -> str:
@@ -94,12 +126,30 @@ def runner_path() -> str:
 
 
 # ---------------------------------------------------------------------------
-def plist_xml(py: str, hour: int, minute: int, mode: str, window_tol: float) -> str:
-    """launchd 任务。`StartCalendarInterval` 在错过时间后会在唤醒时补跑一次。"""
-    args = [py, runner_path(), "--mode", mode]
+def _runner_args(hour: int, minute: int, mode: str, window_tol: float,
+                 trading_mode: str, allow_live: bool) -> list:
+    """The argv the scheduler invokes, for any platform.
+
+    `--allow-live` is passed **only** when the caller asked for it *and* the mode
+    is `live`.  Emitting it unconditionally would mean the flag is on by default
+    in the one place that matters most (an unattended timer), which is exactly
+    what the flag exists to prevent.
+    """
+    args = [f"--mode", mode, "--trading-mode", trading_mode,
+            "--rebalance-days", "1"]
     if mode == "window":
         args += ["--exec-window", f"{hour:02d}:{minute:02d}",
                  "--exec-window-tol", str(window_tol)]
+    if trading_mode == "live" and allow_live:
+        args.append("--allow-live")
+    return args
+
+
+def plist_xml(py: str, hour: int, minute: int, mode: str, window_tol: float,
+              trading_mode: str = MODE, allow_live: bool = False) -> str:
+    """launchd 任务。`StartCalendarInterval` 在错过时间后会在唤醒时补跑一次。"""
+    args = [py, runner_path()] + _runner_args(hour, minute, mode, window_tol,
+                                             trading_mode, allow_live)
     arg_xml = "\n".join(f"    <string>{a}</string>" for a in args)
     log_dir = os.path.join(ROOT, "logs")
     return textwrap.dedent(f"""\
@@ -109,7 +159,7 @@ def plist_xml(py: str, hour: int, minute: int, mode: str, window_tol: float) -> 
     <plist version="1.0">
     <dict>
       <key>Label</key>
-      <string>{LABEL}</string>
+      <string>{label_for(trading_mode)}</string>
       <key>ProgramArguments</key>
       <array>
     {arg_xml}
@@ -122,9 +172,9 @@ def plist_xml(py: str, hour: int, minute: int, mode: str, window_tol: float) -> 
         <key>Minute</key><integer>{minute}</integer>
       </dict>
       <key>StandardOutPath</key>
-      <string>{log_dir}/scheduler.out.log</string>
+      <string>{log_dir}/scheduler-{trading_mode}.out.log</string>
       <key>StandardErrorPath</key>
-      <string>{log_dir}/scheduler.err.log</string>
+      <string>{log_dir}/scheduler-{trading_mode}.err.log</string>
       <key>EnvironmentVariables</key>
       <dict>
         <key>PYTHONPATH</key><string>{ROOT}</string>
@@ -139,15 +189,14 @@ def plist_xml(py: str, hour: int, minute: int, mode: str, window_tol: float) -> 
     """)
 
 
-def systemd_unit(py: str, hour: int, minute: int, mode: str, window_tol: float) -> str:
-    args = [py, runner_path(), "--mode", mode]
-    if mode == "window":
-        args += ["--exec-window", f"{hour:02d}:{minute:02d}",
-                 "--exec-window-tol", str(window_tol)]
+def systemd_unit(py: str, hour: int, minute: int, mode: str, window_tol: float,
+                 trading_mode: str = MODE, allow_live: bool = False) -> str:
+    args = [py, runner_path()] + _runner_args(hour, minute, mode, window_tol,
+                                              trading_mode, allow_live)
     cmd = " ".join(args)
     return textwrap.dedent(f"""\
     [Unit]
-    Description=Crypto LS demo auto-trader daily tick
+    Description=Crypto LS {trading_mode} auto-trader daily tick
     After=network-online.target
 
     [Service]
@@ -161,15 +210,15 @@ def systemd_unit(py: str, hour: int, minute: int, mode: str, window_tol: float) 
     """)
 
 
-def systemd_timer(hour: int, minute: int) -> str:
+def systemd_timer(hour: int, minute: int, trading_mode: str = MODE) -> str:
     return textwrap.dedent(f"""\
     [Unit]
-    Description=Daily 23:30 tick for the crypto LS demo auto-trader
+    Description=Daily {hour:02d}:{minute:02d} tick for the crypto LS {trading_mode} auto-trader
 
     [Timer]
     OnCalendar=*-*-* {hour:02d}:{minute:02d}:00
     Persistent=true
-    Unit={SYSTEMD_UNIT}.service
+    Unit={unit_name_for(trading_mode)}.service
 
     [Install]
     WantedBy=timers.target
@@ -177,36 +226,41 @@ def systemd_timer(hour: int, minute: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-def install_macos(py: str, hour: int, minute: int, mode: str, tol: float) -> int:
-    os.makedirs(os.path.dirname(PLIST), exist_ok=True)
+def install_macos(py: str, hour: int, minute: int, mode: str, tol: float,
+                  trading_mode: str = MODE, allow_live: bool = False) -> int:
+    plist = plist_path_for(trading_mode)
+    label = label_for(trading_mode)
+    os.makedirs(os.path.dirname(plist), exist_ok=True)
     os.makedirs(os.path.join(ROOT, "logs"), exist_ok=True)
-    with open(PLIST, "w", encoding="utf-8") as f:
-        f.write(plist_xml(py, hour, minute, mode, tol))
-    print(f"[OK] 写入 {PLIST}")
+    with open(plist, "w", encoding="utf-8") as f:
+        f.write(plist_xml(py, hour, minute, mode, tol, trading_mode, allow_live))
+    print(f"[OK] 写入 {plist}")
     # bootout first: loading over an existing job silently keeps the OLD plist.
-    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"],
+    subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
                    capture_output=True)
-    r = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", PLIST],
+    r = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", plist],
                        capture_output=True, text=True)
     if r.returncode != 0:
         print(f"[!!] launchctl bootstrap 失败：{r.stderr.strip()}")
         print("     可先用 launchctl load -w 试：")
-        print(f"       launchctl load -w {PLIST}")
+        print(f"       launchctl load -w {plist}")
         return 1
-    print(f"[OK] 已注册 launchd 任务 {LABEL}")
+    print(f"[OK] 已注册 launchd 任务 {label}")
     print(f"     每天 {hour:02d}:{minute:02d} 触发（休眠唤醒后会补跑一次）")
-    print(f"     查看：launchctl print gui/{os.getuid()}/{LABEL}")
+    print(f"     查看：launchctl print gui/{os.getuid()}/{label}")
     return 0
 
 
-def install_linux(py: str, hour: int, minute: int, mode: str, tol: float) -> int:
+def install_linux(py: str, hour: int, minute: int, mode: str, tol: float,
+                  trading_mode: str = MODE, allow_live: bool = False) -> int:
+    unit = unit_name_for(trading_mode)
     os.makedirs(SYSTEMD_DIR, exist_ok=True)
-    svc = os.path.join(SYSTEMD_DIR, f"{SYSTEMD_UNIT}.service")
-    tmr = os.path.join(SYSTEMD_DIR, f"{SYSTEMD_UNIT}.timer")
+    svc = os.path.join(SYSTEMD_DIR, f"{unit}.service")
+    tmr = os.path.join(SYSTEMD_DIR, f"{unit}.timer")
     with open(svc, "w", encoding="utf-8") as f:
-        f.write(systemd_unit(py, hour, minute, mode, tol))
+        f.write(systemd_unit(py, hour, minute, mode, tol, trading_mode, allow_live))
     with open(tmr, "w", encoding="utf-8") as f:
-        f.write(systemd_timer(hour, minute))
+        f.write(systemd_timer(hour, minute, trading_mode))
     print(f"[OK] 写入 {svc}")
     print(f"[OK] 写入 {tmr}")
     subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
@@ -215,26 +269,29 @@ def install_linux(py: str, hour: int, minute: int, mode: str, tol: float) -> int
     if r.returncode != 0:
         print(f"[!!] systemctl 失败：{r.stderr.strip()}")
         return 1
-    print(f"[OK] 已启用 systemd timer {SYSTEMD_UNIT}.timer")
+    print(f"[OK] 已启用 systemd timer {unit}.timer")
     print(f"     每天 {hour:02d}:{minute:02d} 触发（Persistent=true，错过后补跑）")
     return 0
 
 
-def uninstall() -> int:
+def uninstall(trading_mode: str = MODE) -> int:
     rc = 0
     if sys.platform == "darwin":
-        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"],
+        label = label_for(trading_mode)
+        plist = plist_path_for(trading_mode)
+        subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{label}"],
                        capture_output=True)
-        if os.path.exists(PLIST):
-            os.remove(PLIST)
-            print(f"[OK] 已删除 {PLIST}")
+        if os.path.exists(plist):
+            os.remove(plist)
+            print(f"[OK] 已删除 {plist}")
         else:
             print("（plist 本来就不存在）")
     else:
+        unit = unit_name_for(trading_mode)
         subprocess.run(["systemctl", "--user", "disable", "--now",
-                        f"{SYSTEMD_UNIT}.timer"], capture_output=True)
-        for p in (os.path.join(SYSTEMD_DIR, f"{SYSTEMD_UNIT}.service"),
-                  os.path.join(SYSTEMD_DIR, f"{SYSTEMD_UNIT}.timer")):
+                        f"{unit}.timer"], capture_output=True)
+        for p in (os.path.join(SYSTEMD_DIR, f"{unit}.service"),
+                  os.path.join(SYSTEMD_DIR, f"{unit}.timer")):
             if os.path.exists(p):
                 os.remove(p)
                 print(f"[OK] 已删除 {p}")
@@ -242,15 +299,20 @@ def uninstall() -> int:
     return rc
 
 
-def status() -> int:
+def status(trading_mode: str = MODE) -> int:
+    rel = os.path.relpath(os.path.abspath(__file__), ROOT)
     if sys.platform == "darwin":
+        label = label_for(trading_mode)
         r = subprocess.run(["launchctl", "print",
-                            f"gui/{os.getuid()}/{LABEL}"],
+                            f"gui/{os.getuid()}/{label}"],
                            capture_output=True, text=True)
         if r.returncode != 0:
-            print("[--] launchd 任务未注册")
-            print(f"     安装：python3 {os.path.relpath(os.path.abspath(__file__), ROOT)} --install")
+            print(f"[--] launchd 任务未注册（{trading_mode}）")
+            print(f"     安装：python3 {rel} --install --trading-mode {trading_mode}")
+            if trading_mode == "live":
+                print(f"           （实盘还要加 --allow-live）")
             return 1
+        print(f"[OK] {trading_mode} 定时器已注册：{label}")
         for line in r.stdout.splitlines():
             s = line.strip()
             if s.startswith(("state =", "last exit code =", "runs =",
@@ -259,7 +321,8 @@ def status() -> int:
             elif "Hour" in s or "Minute" in s:
                 print(f"     {s}")
         return 0
-    r = subprocess.run(["systemctl", "--user", "status", f"{SYSTEMD_UNIT}.timer",
+    unit = unit_name_for(trading_mode)
+    r = subprocess.run(["systemctl", "--user", "status", f"{unit}.timer",
                         "--no-pager"], capture_output=True, text=True)
     print(r.stdout or r.stderr)
     return 0 if r.returncode == 0 else 1
@@ -279,6 +342,15 @@ def main(argv=None) -> int:
     ap.add_argument("--exec-window-tol", type=float, default=5.0,
                     help="window 模式下窗口宽度（分钟）")
     ap.add_argument("--python", default=None, help="显式指定 python3 路径")
+    ap.add_argument("--trading-mode", default=MODE,
+                    choices=["demo", "paper", "live"],
+                    help="这个定时器拉起的**交易账户**：demo（默认，模拟盘）/ "
+                         "paper / live（实盘，**真钱**，必须同时给 --allow-live）。"
+                         "每个模式有独立的 launchd label，装 live 不会覆盖 demo。")
+    ap.add_argument("--allow-live", action="store_true",
+                    help="实盘定时器必须显式带上。这是「由人明确打开一次」的开关："
+                         "装进去意味着**每天**无人值守地下真钱单。"
+                         "它只开「允许下单」这道门，不放宽任何限额。")
     a = ap.parse_args(argv)
 
     if not (a.install or a.uninstall or a.status):
@@ -286,9 +358,18 @@ def main(argv=None) -> int:
         return 2
 
     if a.uninstall:
-        return uninstall()
+        return uninstall(a.trading_mode)
     if a.status:
-        return status()
+        return status(a.trading_mode)
+
+    # 实盘守卫放在解析之后、**任何写盘之前**：装一个起不来的定时器比不装更糟
+    # ——它每天准点失败，而 `--status` 显示"已注册"。
+    if a.trading_mode == "live" and not a.allow_live:
+        print("!! --trading-mode live 需要同时显式给出 --allow-live。")
+        print("   装进定时器意味着每天无人值守地下真钱单，不能靠默认值打开。")
+        print(f"   命令：python3 {os.path.relpath(os.path.abspath(__file__), ROOT)} "
+              f"--install --trading-mode live --allow-live --at {a.at}")
+        return 2
 
     hh, mm = a.at.split(":")
     hour, minute = int(hh), int(mm)
@@ -298,15 +379,21 @@ def main(argv=None) -> int:
     py = a.python or find_python()
     print(f"解释器 : {py}")
     print(f"项目    : {ROOT}")
-    print(f"触发    : 每天 {hour:02d}:{minute:02d}")
+    print(f"账户    : {a.trading_mode}"
+          + ("   ★★★ 实盘 · 真钱 ★★★" if a.trading_mode == "live" else ""))
+    print(f"label   : {label_for(a.trading_mode)}")
+    print(f"触发    : 每天 {hour:02d}:{minute:02d}"
+          "（拉起守护进程；**下单时刻**由回测网格决定，不由这里决定）")
     print(f"模式    : {a.mode}"
           + ("（不偏离回测口径）" if a.mode == "timer"
              else "（⚠ 偏离回测网格，先看 phase_sweep.csv）"))
     print()
     if sys.platform == "darwin":
-        return install_macos(py, hour, minute, a.mode, a.exec_window_tol)
+        return install_macos(py, hour, minute, a.mode, a.exec_window_tol,
+                             a.trading_mode, a.allow_live)
     if sys.platform.startswith("linux"):
-        return install_linux(py, hour, minute, a.mode, a.exec_window_tol)
+        return install_linux(py, hour, minute, a.mode, a.exec_window_tol,
+                             a.trading_mode, a.allow_live)
     print(f"!! 不支持的平台 {sys.platform}；Windows 请用 START_AUTO_TRADER_DEMO.bat")
     return 2
 

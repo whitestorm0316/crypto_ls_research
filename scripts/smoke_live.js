@@ -482,6 +482,9 @@ if (typeof optGridDays === 'function') globalThis.__T.optGridDays = optGridDays;
 if (typeof diffFromOptimal === 'function') globalThis.__T.diffFromOptimal = diffFromOptimal;
 /* 网格候选表也导出：测试要从中取一个「不是验收口径」的网格，而不是自己写死 3。 */
 if (typeof AUTO_GRID_CHOICES !== 'undefined') globalThis.__T.AUTO_GRID_CHOICES = AUTO_GRID_CHOICES;
+/* 保证金单元格：断言它把「占用 / 可用 / 占比」三样都印出来，
+ * 以及取不到时印「—」而不是假装 $0.00。 */
+if (typeof marginCell === 'function') globalThis.__T.marginCell = marginCell;
 `;
 vm.createContext(sandbox);
 vm.runInContext(src, sandbox, { filename: 'app.js' });
@@ -900,6 +903,50 @@ const LOADING = ['正在读取…', '正在读取账户…'];
        * 就是没渲染 —— 用户被指去改一个页面上没有的东西）。
        * 所以这条断言的是**引用能解析到控件**，不是字面。同一条纪律见页头横幅那段：
        * 检查来源，不检查字面值。 */
+      /* --- 无人值守开关 + 保证金显示（2026-10-10）--- */
+      const realAuto = S.live.auto;
+      const ahOn = T.liveAutoHtml.call(null, undefined);
+      /* 开关是「每天都自动下单」的总闸。断言它**渲染出来**且**带 id**
+       * （页面提到一个控件就必须真有那个控件）。 */
+      const mkAuto = (enabled, running) => {
+        S.live.auto = { enabled, running, will_trade: enabled && running,
+          at: '11:00', ran_today: false, state: {}, ctl: {}, grid: {} };
+        return T.liveAutoHtml();
+      };
+      const aOff = mkAuto(false, false);
+      const aOnRunning = mkAuto(true, true);
+      const aOnNoProc = mkAuto(true, false);
+      S.live.auto = realAuto;
+      check('开关渲染出可点的控件',
+        aOff.includes('id="autoToggle"') && aOnRunning.includes('id="autoToggle"'));
+      /* 2026-10-10：执行者换成**控制台自己**（不再有外部守护进程）。
+       * 文案随之改：开着且在跑 ⇒ 说"每天 11:00 自动执行"；
+       * 开着但线程没起 ⇒ 明说"现在不会下单"（最危险的那种误读）。 */
+      const ranTxt = '自动执行';
+      check('开关文案区分「已开启」与「调度线程没在跑」',
+        aOnRunning.includes(ranTxt)
+        && aOnNoProc.includes('没在跑')
+        && aOnNoProc.includes('不会下单'),
+        `开着且在跑=${aOnRunning.includes(ranTxt)} `
+        + `开着无线程=${aOnNoProc.includes('没在跑')}`);
+      check('开关关闭时不宣称会自动交易',
+        !aOff.includes(ranTxt));
+      /* 不要再指向一个不存在的控件/进程：这句旧文案是用户当场指出来的问题
+       * （「为什么还要开启守护进程呢」）。断言它**不再出现**。 */
+      check('开关文案不再提「启动守护进程」（执行者已是控制台）',
+        !aOnRunning.includes('启动守护进程') && !aOff.includes('启动守护进程'));
+
+      /* 保证金占用必须和「持仓名义」**并排出现**：用户实测过页面 $227 /
+       * OKX $246 看着像矛盾（其实是两个量）。断言的是两者同页可读。 */
+      const mHtml = (m) => T.marginCell({ margin: m }, 356);
+      const ok = mHtml({ margin_used: 254.7, avail: 102.6, margin_frac: 0.713 });
+      const na = mHtml({ unavailable: true });
+      check('保证金占用与可用余额都显示出来',
+        ok.includes('254') && ok.includes('102') && ok.includes('71'),
+        `缺字段：254=${ok.includes('254')} 102=${ok.includes('102')} 71=${ok.includes('71')}`);
+      check('取不到保证金时显示「—」而不是假装 0',
+        na.includes('—') && !na.includes('$0.00'));
+
       check('杠杆面板指向的「总敞口上限」在限额表里真的有输入框',
         lvh.includes('总敞口上限') && h.includes('data-limit="max_gross_frac"'),
         `面板提到=${lvh.includes('总敞口上限')} 有控件=${h.includes('data-limit="max_gross_frac"')}`);

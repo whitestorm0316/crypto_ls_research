@@ -34,6 +34,12 @@ from crypto_ls_research.tests.test_auto_trader import FakeEngine
 @pytest.fixture
 def tmp_live(tmp_path, monkeypatch):
     monkeypatch.setattr(store_mod, "LIVE_DIR", str(tmp_path / "live"))
+    # 无人值守开关默认**关**（2026-10-10 加入），而本文件测的是**通知**，
+    # 不是开关本身。默认关会让每个用例都停在 `skip / auto_disabled` 上、
+    # 一行通知都不发 —— 这里显式打开，把开关这件事留给
+    # `test_unattended_switch.py` 去测。
+    st = store_mod.Store("demo")
+    st.save_auto_config({"enabled": True})
     return tmp_path / "live"
 
 

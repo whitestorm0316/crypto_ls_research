@@ -2254,6 +2254,87 @@ API 守卫拿字面量比）。**漏掉的第 5 条是「把常量翻回 `cross`
 
 ---
 
+### Q46. 实盘自动交易定时器（每天 11:01）+「一键准备」（2026-10-09）
+
+用户要求：「每天 11:01 起一个定时任务，正式资金盘的，一键准备+下单，下单后通知飞书」。
+**先查后装**，查出三处必须改的代码缺陷，同时纠正我自己两处误报。
+
+#### 一、我先报错了两件事（记录在此，因为它们是同一类错）
+
+**① 「ETH short 挂在 20×」——`lever` 字段不可信，我又信了一次。**
+我按 `/api/v5/account/positions` 返回的 `lever` 报「ETH short 20×、爆仓距离 4.02%」。
+实读 `/api/v5/account/leverage-info`：ETH `isolated` 的 **long 与 short 都是 1×**；
+再用 `liqPx` 反推（`L = 1/(|liqPx−markPx|/markPx + mmr)`）得 **1.01×、距离 98.50%**。
+
+对全部 21 条腿做同样反推：
+
+| 区间 | 结果 |
+|---|---|
+| 反推杠杆范围 | **0.70× – 1.01×** |
+| 高于配置值（1×）的腿 | **0 条** |
+| 低于 1× 的（更安全，因 mmr/费率使 `liqPx` 略远） | 3 条（ARB 0.82、USELESS 0.70、PONS 0.78） |
+
+⇒ **账户没有脆弱腿，不需要动杠杆。** 这与 Q38 已记载的「`lever` 是账户级配置的**镜像**、
+改配置≠改持仓（回读延迟 ~60s）」是同一条 —— 我读的是字段，不是 `liqPx`。
+**报杠杆前必须从 `liqPx` 反推**，这条现在写进了 `MEMORY.md`。
+
+**② `max_gross_notional=5000` 相对 NAV $356 看着极松 —— 但它成立。**
+它是**绝对美元上限**（设计意图就是防「账户比预期大 100 倍时按比例放行」，见 `limits.py`
+文件头），而当前毛敞口只有 **$229**。**不要拿绝对上限和 NAV 比大小下结论。**
+
+#### 二、三处真正的代码缺陷（都已修）
+
+| 缺陷 | 位置 | 后果 |
+|---|---|---|
+| `allow_live=False` **硬编码** | `scripts/scheduled_tick.py` | 实盘定时器**永远起不来** —— 不是「忘了开」，是代码里没有那条路 |
+| `MODE` / `LABEL` 写死 `demo` | `scripts/install_scheduler.py` | 装 live 会把 demo 任务**静默顶掉**，而 `--status` 仍显示「已注册」 |
+| `max_turnover_frac = 1.0` | `artifacts/live/live/limits.json` | 换手闸门实际**不约束**（历史三次实盘只用 19–21%） |
+
+**修法**
+
+* `scheduled_tick.py`：新增 `--allow-live`；缺则**退出码 3**；`allow_live=bool(a.allow_live)`。
+  ⚠️ 守卫的检查放在**任何破坏性步骤之前** —— 否则 `--force-restart` 会先把一个健康的
+  守护进程停掉，然后才发现参数不合法（最贵的失败时刻）。
+* `install_scheduler.py`：`LABELS`/`UNITS` **按交易模式分开**（demo/paper/live 三个独立 label）；
+  新增 `--trading-mode` 与 `--allow-live`；live 缺 `--allow-live` ⇒ **退出码 2 且不写任何文件**；
+  日志按模式分开（`logs/scheduler-live.out.log`）。`--allow-live` **只在 live 时**才进 plist。
+* `limits.json`：`max_turnover_frac` 1.0 → **0.35**。策略自身的换手预算是
+  `execution.max_daily_turnover = 0.2`，所以 0.35 留了 1.75× 余量而仍然咬得住。
+
+**守卫**：新增 `tests/test_live_scheduler.py` **8 条**，**变异 5/5 全抓**
+（tick 删守卫 / tick 写死 `allow_live=False` / live 借 demo 的 label / 安装器删守卫 /
+demo plist 也被塞进 `--allow-live`）。还原后 sha256 与注入前一致。
+
+**两个测试写法上的坑（当场被抓）**
+
+1. 断言「守卫在第一次调用之前」时不能用 `src.index("auto_ctl.")` ——
+   `from ... import auto_ctl` 这行 **import 本身**含该子串，恒排在守卫前面 ⇒ 断言恒假。
+   要用**调用形状**（`auto_ctl.is_running(`），并单独再钉一次 `auto_ctl.stop(`。
+2. 解析子进程 JSON 输出时 `tail.index("{")` 会撞在**日志行的 `{`** 上
+   （报 `Expecting property name … char 1`）⇒ 取**最后一行独立的 `{`**。
+
+#### 三、落地状态
+
+* **plist 已写好并校验通过**：`~/Library/LaunchAgents/com.crypto-ls.auto-trader-live.plist`
+  （`plutil -lint` OK；`StartCalendarInterval` = 11:01；argv 带 `--trading-mode live --allow-live`）。
+* ⚠️ **`launchctl` 不能从工具调用/沙箱里注册**：`bootstrap` 与 `load -w` 均报
+  `Bootstrap failed: 5: Input/output error`。用**一个 5 行的最小 plist 做对照实验**同样报
+  error 5 ⇒ **是沙箱限制，不是 plist 的问题**。**注册需用户双击 `INSTALL_LIVE_TIMER.command`。**
+* **dry-run 全链验证**（`--mode live --allow-live --dry-run --once`）：刷新行情 → 算信号 →
+  到期闸门 → `skip / not_due`（**正确**：今天 11:03 已手动调仓过，`已过 7/24 根 bar`）
+  → 通知 `该结果不推送`（符合「常规 tick 静默、只在 state change 时推」）。
+* **飞书通道实测**：`--test` 返回 `{"ok": true, "code": 0}`（读 **body 的 `code`**，
+  不是 HTTP 200 —— 四家服务商都用 200 返「被拒」）。
+* 全量 **620 passed / 1 skipped**；`node scripts/smoke_live.js` 全部通过。
+
+#### 四、⚠️ 11:01 是「拉起时刻」，不是「下单时刻」
+
+下单时刻由**回测网格**决定：信号北京 10:00 产生 → 回测成交价取 **11:00** 那根 bar 的开盘
+→ 守护进程的到期窗口实际 **11:10–13:10** 才打开。11:01 把进程拉起来之后，它会自己空转到
+窗口开门。**所以 11:01 与 11:05 的下单结果完全相同**，差别只是早 4 分钟开始等。
+
+---
+
 ## 数据来源索引
 
 | 结论 | 机器可读来源 |
@@ -2285,6 +2366,7 @@ API 守卫拿字面量比）。**漏掉的第 5 条是「把常量翻回 `cross`
 | 保证金模式 / 逐仓 vs 全仓（Q36–Q38） | `artifacts/margin_mode/tables/41_position_margin.csv`、`41b_mode_summary.csv`、`41c_liq_distance_by_mode.csv`、`41d_market_move_liquidation.csv`、`41e_leverage_config.csv`、`41f_config_vs_actual.csv` |
 | 跨模式 `cur_sz` 求和（Q44，**只诊断**） | 同上 `41_position_margin.csv`（按 `instId` 分组即可复现）+ `execution/engine.py:472` |
 | 单标的插针容忍度 / 逐仓的频率代价（Q45） | `artifacts/margin_mode/tables/42_wick_tolerance.csv`、`42b_single_name_wick.csv`、`42c_liquidation_frequency.csv`；复现 `python scripts/wick_margin_modes.py demo --freq` |
+| 实盘定时器（Q46）：plist / 限额 / 守卫 | `~/Library/LaunchAgents/com.crypto-ls.auto-trader-live.plist`、`artifacts/live/live/limits.json`、`crypto_ls_research/tests/test_live_scheduler.py`；安装 `python scripts/install_scheduler.py --install --trading-mode live --allow-live --at 11:01` |
 | 容量、退市压测、偏差审计 | `artifacts/v3/tables/23_*.csv`、`24_*.csv`、`25_bias_audit.csv` |
 | 标的池 scope | `artifacts/v3/tables/00b_universe_scope.json` |
 | 默认配置对照 | `artifacts/main/tables/19_period_stability.csv`、`03_concentration.json`、`03_coin_attribution.csv` |

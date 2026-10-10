@@ -85,6 +85,29 @@ from .store import RebalanceBusy, Store, display_ts
 #: Below this the loop would hammer the exchange on a typo (`--interval 0.01`).
 MIN_INTERVAL_MIN = 1.0
 
+#: The per-account unattended-trading switch lives in `auto_config.json` under
+#: this key.  One name, used by the daemon (to gate orders), the API (to read
+#: and write it) and the tests -- a second spelling of it would let the page
+#: write a key the daemon never reads, and the switch would look broken.
+AUTO_ENABLED_KEY = "enabled"
+
+
+def resolve_auto_enabled(cfg: Optional[dict]) -> bool:
+    """Read the switch out of an `auto_config.json` payload.
+
+    **Absent, unreadable, or malformed all mean `False`.**  The direction is the
+    whole point: this gates real orders on an account nobody is watching, so the
+    failure mode has to be "did not trade", never "traded anyway".
+
+    Deliberately strict about the *type* as well: `"false"` (the string) is not
+    `False` in Python, and a value that arrived from a hand-edited JSON file or
+    an HTTP body is not guaranteed to be a bool.  Anything that is not exactly
+    `True` is off.
+    """
+    if not isinstance(cfg, dict):
+        return False
+    return cfg.get(AUTO_ENABLED_KEY) is True
+
 
 def bar_hours(bar: str) -> float:
     """`"1h"` -> 1.0, `"15m"` -> 0.25.  Unknown shapes fall back to 1h."""
@@ -458,6 +481,20 @@ class AutoTrader:
             return True
         return float(ba) > self.refresh_after_hours
 
+    def _auto_enabled(self) -> bool:
+        """Is unattended trading switched on for this account?
+
+        **Disabled unless the user switched it on.**  The default has to point
+        this way: a daemon that is running (because it was started once, weeks
+        ago, or because an installer left it in the login items) must not begin
+        placing orders on an account nobody armed.
+
+        The switch lives in `auto_config.json` and is re-read on every tick, so
+        the page toggle is live.  A corrupt or unreadable file reads as *off* --
+        fail closed, never "assume the last thing I saw".
+        """
+        return resolve_auto_enabled(self.store.load_auto_config())
+
     def _refresh(self) -> dict:
         self._log("行情偏旧，先做增量刷新…")
         try:
@@ -484,6 +521,19 @@ class AutoTrader:
 
         if kill_switch_on():
             return self._finish(out, "skip", "kill_switch", t0)
+
+        # The per-account unattended switch.  Read **fresh every tick** (not
+        # cached at construction) so flipping it on the page takes effect
+        # immediately instead of after the next restart -- a switch that needs a
+        # restart is a switch people stop trusting.
+        #
+        # Ordered next to the kill switch, i.e. **before** the data refresh: an
+        # account that is switched off must cost nothing, and "do nothing" has
+        # to mean nothing, not "spend 20s refreshing then decide not to trade".
+        if not self._auto_enabled():
+            out["auto_enabled"] = False
+            return self._finish(out, "skip", "auto_disabled", t0)
+        out["auto_enabled"] = True
 
         st = self.engine.data_staleness()
         if self._needs_refresh(st):

@@ -825,6 +825,10 @@ def test_status_does_not_pay_for_the_same_endpoint_twice(tmp_live, monkeypatch):
             calls.append("equity")
             return 1000.0
 
+        def margin_usage(self, ccy="USDT"):
+            calls.append("margin")
+            return {"margin_used": 0.0, "avail": 0.0}
+
         def probe(self):
             calls.append("probe")
             return {"ok": True}
@@ -833,10 +837,14 @@ def test_status_does_not_pay_for_the_same_endpoint_twice(tmp_live, monkeypatch):
     eng = LiveEngine(mode="demo")
     st = eng.status()
 
-    # 断言的是「每个端点只打一次」，**不是**调用顺序：`positions` 与
-    # `equity_usdt` 现在并行发出（见 test_positions_and_equity_are_fetched_concurrently），
-    # 谁先 append 取决于线程调度。原来这里写的是精确序列，一并行就变成偶发红灯。
-    assert sorted(calls) == ["config", "equity", "positions"]
+    # 断言的是「每个端点只打一次」，**不是**调用顺序：三个读现在并行发出
+    # （见 test_positions_and_equity_are_fetched_concurrently），谁先 append
+    # 取决于线程调度。原来这里写的是精确序列，一并行就变成偶发红灯。
+    #
+    # `margin` 是 2026-10-10 加的第三个（同一份 /account/balance 响应，
+    # 但作为**独立的注入点**出现，所以这里单独计一次）。
+    assert sorted(calls) == ["config", "equity", "margin", "positions"]
+    assert "probe" not in calls, "成功路径不该去打 probe（那会让状态页多做一次往返）"
     assert st["connected"] is True and st["ok"] is True and st["uid"] == "1"
     assert st["account"]["nav"] == pytest.approx(1000.0)
     assert "diagnosis" not in st                 # probe() only runs on failure
@@ -860,24 +868,41 @@ def test_positions_and_equity_are_fetched_concurrently(tmp_live, monkeypatch):
     pos_up = threading.Event()
     nav_up = threading.Event()
 
+    # `margin_usage` 是 2026-10-10 加的第三次调用（读同一个 /account/balance，
+    # 但回答的是另一个问题：账户值多少 vs 锁住多少）。三者**都必须同时在飞**，
+    # 所以会合点要等**三个**信号，等两个就抓不到"第三个退化成串行"。
+    mgn_up = threading.Event()
+    barrier = threading.Barrier(3, timeout=2.0)
+
     class Cli:
         def account_config(self):
             return {"posMode": "net_mode", "acctLv": "2", "uid": "1"}
 
+        def _rendezvous(self, label):
+            try:
+                barrier.wait()
+            except threading.BrokenBarrierError:                # pragma: no cover
+                raise AssertionError(f"{label} 没有和另外两个请求同时在飞（退化成串行了）")
+
         def positions(self, t):
-            pos_up.set()
-            assert nav_up.wait(2.0), "净值请求没有和持仓请求同时在飞（退化成串行了）"
+            self._rendezvous("持仓请求")
             return []
 
         def equity_usdt(self):
-            nav_up.set()
-            assert pos_up.wait(2.0), "持仓请求没有和净值请求同时在飞（退化成串行了）"
+            self._rendezvous("净值请求")
             return 1000.0
+
+        def margin_usage(self, ccy="USDT"):
+            self._rendezvous("保证金请求")
+            return {"margin_used": 0.0, "avail": 0.0}
 
     monkeypatch.setattr(engine_mod.LiveEngine, "_private", lambda self: Cli())
     acct = LiveEngine(mode="demo").account()
 
     assert acct["nav"] == pytest.approx(1000.0)
+    # 三个数都要落到快照里（并排显示的前提）
+    assert "margin" in acct and acct["margin"]["margin_used"] == 0.0
+    assert acct["gross_notional"] == 0.0
     assert acct["source"] == "okx"
 
 

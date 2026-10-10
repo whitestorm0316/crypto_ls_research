@@ -17,6 +17,19 @@
 
 `--mode window` 时额外要求守护进程带执行窗口跑：如果当前跑着的守护进程没带
 窗口，会**先停后起**（否则窗口参数永远不会生效，而日志里看不出区别）。
+
+实盘（`--trading-mode live`）
+------------------------------
+`live` 会把**真钱**单子下出去，所以这里必须过一次 `--allow-live`：
+
+  * 缺 `--allow-live` 时**拒绝启动**（退出码 3），把话说明白，而不是让
+    `auto_ctl.start` 回一句「实盘自动交易需要显式确认」然后静静地什么都没发生。
+    这是「由人明确打开一次」的开关，不是可以靠默认值绕过去的东西。
+  * `--allow-live` 只往下传到守护进程，**不改任何风控**：`check_plan` 的每个
+    `block` 仍然照常生效。它开的是"允许下单"这道门，不是"放宽限额"。
+  * 装到定时器里意味着**每天**都会以这个身份起来。所以安装器（
+    `install_scheduler.py --trading-mode live`）要求显式指定，且用**独立的
+    label**，不会把 demo 的任务覆盖掉。
 """
 from __future__ import annotations
 
@@ -50,12 +63,26 @@ def main(argv=None) -> int:
     ap.add_argument("--rebalance-days", type=float, default=REBALANCE_DAYS)
     ap.add_argument("--force-restart", action="store_true",
                     help="无论是否在跑都先停后起（用于改参数后强制生效）")
+    ap.add_argument("--allow-live", action="store_true",
+                    help="`--trading-mode live` 必须显式带上：定时器会每天无人"
+                         "值守地下真钱单。只开「允许下单」这道门，不放宽任何限额。")
     a = ap.parse_args(argv)
 
     from crypto_ls_research.execution import auto_ctl
 
     want_window = a.exec_window if a.mode == "window" else None
     m = a.trading_mode
+
+    # 能力/权限检查放在**任何破坏性步骤之前**：下面的 `force_restart` 会先停掉
+    # 正在跑的守护进程，如果到那时才发现没有 `--allow-live`，就会把一个健康的
+    # 账本停在一半 —— 最贵的失败时刻。所以先判，再动。
+    if m == "live" and not a.allow_live:
+        print("[拒绝] --trading-mode live 需要同时显式给出 --allow-live。")
+        print("       定时器会在无人值守时下真钱单，这个开关必须由人明确打开一次。")
+        print("       只开「允许下单」这道门；check_plan 的每个 block 仍然照常生效。")
+        print("       安装：python3 scripts/install_scheduler.py --install "
+              "--trading-mode live --allow-live --at HH:MM")
+        return 3
 
     running = auto_ctl.is_running(m)
     st = auto_ctl.read_state(m) if running else {}
@@ -81,9 +108,11 @@ def main(argv=None) -> int:
 
     print(f"[>>] 启动 {m}（rebalance_days={a.rebalance_days:g}，"
           f"窗口 {want_window or '无'}）")
+    if m == "live":
+        print("[!!] 实盘模式：订单将以**真实资金**成交。熔断开关仍可在控制台拉下。")
     r = auto_ctl.start(m, rebalance_days=a.rebalance_days,
                        interval_min=INTERVAL_MIN, bar=BAR,
-                       dry_run=False, allow_live=False,
+                       dry_run=False, allow_live=bool(a.allow_live),
                        exec_window=want_window,
                        exec_window_tol=a.exec_window_tol,
                        exec_window_utc=False)

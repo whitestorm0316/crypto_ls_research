@@ -28,10 +28,14 @@ from crypto_ls_research.execution.credentials import (
     set_kill_switch,
 )
 from crypto_ls_research.execution.engine import DEFAULT_SIGNAL, LiveEngine
-from crypto_ls_research.execution.limits import LiveLimits
+from crypto_ls_research.execution.limits import LiveLimits, live_confirm_phrase
 from crypto_ls_research.execution.store import Store, archives, reset_mode
 from crypto_ls_research.execution import auto_ctl
 from crypto_ls_research.execution import navhist
+from crypto_ls_research.execution.auto_trader import (
+    AUTO_ENABLED_KEY, resolve_auto_enabled,
+)
+from webapp import auto_schedule
 
 MODES = ("paper", "demo", "live")
 MODE_LABEL = {"paper": "本地纸面", "demo": "OKX 模拟盘", "live": "OKX 实盘"}
@@ -59,6 +63,89 @@ def _ensure_worker() -> None:
             _WORKER = threading.Thread(target=_worker, daemon=True,
                                        name="live-job-worker")
             _WORKER.start()
+
+
+# ---------------------------------------------------------------------------
+# 每日调度：由控制台进程自己执行，不需要任何外部守护进程。
+#
+# 为什么可行：控制台是双重 fork + `setsid()` 起的（父进程 launchd），能长期活着。
+# 而原来那条「守护进程」路有个反复出问题的脆弱点 —— 从 Web 点按钮派生的子进程
+# 会随调用方的进程树被回收（README §一·补 那一整节）。控制台自己没这个问题。
+# ---------------------------------------------------------------------------
+_REGISTRY = auto_schedule.Registry()
+
+
+def auto_runner(mode: str) -> dict:
+    """到点时执行的动作：**走和网页按钮完全同一条路径**。
+
+    刻意不在这里直接调 `engine.execute()`：那条路会绕过 `_submit` 的作业队列，
+    于是网页和定时器可能同时在下单（两个 execute 各读一遍同一本书、各发全量单）。
+    提交进同一个队列，`execute` 自己的跨进程锁 + 队列的串行化一起兜住这件事。
+
+    两步（刷新行情 → 计划并下单）与 `livePrepare()` 按钮一致，这样"自动"和
+    "手动点一次"的结果是同一份产物，而不是两套逻辑。
+    """
+    from crypto_ls_research.execution.engine import DEFAULT_SIGNAL
+    bar = DEFAULT_SIGNAL["bar"]
+
+    def refresh(log):
+        return LiveEngine.refresh_market_data(bar=bar, progress=log)
+
+    j1 = _submit("refresh", mode, refresh, label=f"自动任务：刷新 {bar} 行情")
+
+    # 刷新是异步作业，必须等它结束再算计划 —— 否则计划会基于还没刷新的缓存，
+    # 拿到的是一根旧 bar（这正是"自动下单买了昨天的仓位"那类事故）。
+    _wait_job(j1["id"], timeout=300.0)
+
+    def plan_and_execute(log):
+        eng = engine(mode)
+        # 与网页「下单」按钮同样的入参：dry_run=False（真下）、force=False
+        # （不越过到期闸门）、confirm 由 live 模式的服务端短语提供。
+        plan = eng.preview(force_signal=False, progress=log)
+        log(f"计划 {plan.get('plan', {}).get('n_orders')} 笔，提交执行…")
+        return eng.execute(confirm=(live_confirm_phrase() if mode == "live" else None),
+                           force=False, dry_run=False, progress=log)
+
+    return _submit("auto", mode, plan_and_execute, label="自动任务：下单")
+
+
+def _wait_job(jid: str, timeout: float = 300.0) -> Optional[dict]:
+    """等一个作业结束。超时返回 None（调用方自行决定要不要继续）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        job = _JOBS.get(jid)
+        if job and job.get("status") in ("done", "failed"):
+            return job
+        time.sleep(0.5)
+    return None
+
+
+def ensure_scheduler(mode: str) -> dict:
+    """确保该账户的调度线程在跑（幂等）。**开关关着也装线程** —— 线程自己会跳过，
+    这样页面上拨开关立即生效，不需要重启控制台。"""
+    st = Store(mode)
+    _REGISTRY.ensure(
+        mode, auto_runner,
+        state_path=lambda: st.path(auto_schedule.STATE_FILE),
+        is_enabled=lambda: resolve_auto_enabled(st.load_auto_config()),
+        log=lambda m: print(m, flush=True))
+
+
+def start_enabled_schedulers() -> list:
+    """控制台启动时调用：把所有**开关打开**的账户的调度器建起来。
+
+    没有这一步，改代码重启一次就再也不自动了 —— 而页面上开关还显示「已开启」，
+    是最坏的那一种（看着在跑，其实什么都没接上）。
+    """
+    started = []
+    for mode in MODES:
+        try:
+            if resolve_auto_enabled(Store(mode).load_auto_config()):
+                ensure_scheduler(mode)
+                started.append(mode)
+        except Exception as e:                                    # noqa: BLE001
+            print(f"[auto] 恢复 {mode} 调度失败：{type(e).__name__}: {e}", flush=True)
+    return started
 
 
 def _worker() -> None:
@@ -339,12 +426,50 @@ def route_get(path: str, q: dict) -> Optional[Tuple[dict, int]]:
 
     if path == "/api/live/auto":
         mode = one("mode", "paper")
-        return {"mode": mode, "state": auto_ctl.read_state(mode),
-                "ctl": auto_ctl.read_ctl(),
-                "running": auto_ctl.is_running(mode),
-                "grid": auto_ctl.grid_for(mode)}, 200
+        return _auto_view(mode), 200
 
     return None
+
+
+def _auto_view(mode: str) -> dict:
+    """Everything the page needs to render the auto panel for one account.
+
+    `enabled` (the persisted switch) and `running` (is a daemon alive) are
+    **independent**, and conflating them is how a page ends up claiming trading
+    is on when it is not:
+
+      * `enabled=True, running=False` -> configured, but nothing will happen.
+      * `enabled=False, running=True` -> a process is up and will correctly do
+        nothing; this is the *safe* state, not a broken one.
+
+    So both are reported, plus a derived `will_trade` that is the honest answer
+    to "is this account going to place orders unattended?".
+    """
+    st = Store(mode)
+    cfg = st.load_auto_config()
+    enabled = resolve_auto_enabled(cfg)
+
+    # `running` 现在指**后端调度线程**，不再指那个独立守护进程。
+    # 旧字段（守护进程的心跳/控制文件）仍然带回，因为页面别处还在用它们显示
+    # 网格与检查间隔；但「会不会自动交易」这个问题只由 `enabled and running`
+    # 回答，而 `running` 的语义已经换成控制台自己的调度器。
+    sched = _REGISTRY.get(mode)
+    running = bool(sched and sched.is_alive())
+    return {
+        "mode": mode,
+        "enabled": enabled,
+        "running": running,
+        "will_trade": bool(enabled and running),
+        "at": (sched.at if sched else auto_schedule.DEFAULT_AT),
+        "ran_today": bool(sched and sched.already_ran_today()),
+        "last": (sched.last if sched else {}),
+        "scheduler": next((r for r in _REGISTRY.status() if r["mode"] == mode), None),
+        "state": auto_ctl.read_state(mode),
+        "ctl": auto_ctl.read_ctl(),
+        "grid": auto_ctl.grid_for(mode),
+        "config": {k: v for k, v in cfg.items() if not k.startswith("_")},
+        "config_path": st.auto_path(),
+    }
 
 
 _MODE_NOTE = {
@@ -453,6 +578,11 @@ def route_post(path: str, body: dict) -> Optional[Tuple[dict, int]]:
         return _auto_start(body)
     if path == "/api/live/auto/stop":
         return _auto_stop(body)
+
+    if path == "/api/live/auto/enable":
+        return _auto_set_enabled(body, True)
+    if path == "/api/live/auto/disable":
+        return _auto_set_enabled(body, False)
 
     if path == "/api/live/creds":
         mode = body.get("mode")
@@ -570,3 +700,50 @@ def _auto_stop(body: dict) -> Tuple[dict, int]:
     if mode not in MODES:
         return {"ok": False, "error": f"bad mode {mode!r}"}, 400
     return auto_ctl.stop(mode), 200
+
+
+def _auto_set_enabled(body: dict, on: bool) -> Tuple[dict, int]:
+    """Persist the per-account unattended switch.
+
+    Three rules, each of which exists because of a specific way this can hurt:
+
+    1. **Switching `live` ON requires the same typed phrase the order path
+       uses** (`LIVE-<today>`).  This switch is what turns "a process is
+       running" into "real orders at 11:00 every day, unattended".  A checkbox
+       is too cheap for that; the phrase is the same "are you awake" control
+       already used before a manual live order, so it is one thing to learn,
+       not two.
+    2. **Switching OFF is always allowed and never gated.**  Anything that makes
+       it harder to stop trading than to start it is backwards.
+    3. **The response reports what was written, re-read from disk.**  Echoing
+       the request would let a failed write look like a successful one -- and
+       the failure mode here is the worst kind: the page says "已开启" while the
+       file still says off (or vice versa).
+    """
+    mode = body.get("mode", "paper")
+    if mode not in MODES:
+        return {"ok": False, "error": f"bad mode {mode!r}"}, 400
+
+    # 用户裁定（2026-10-10）：**不要确认短语，就一个普通开关**。
+    # 便利性与"不会误碰就每天自动下真钱单"之间的取舍由他做了选择 ——
+    # 页面必须把代价写在按钮旁边（见 `liveAutoHtml` 的说明），而不是靠一道
+    # 会被当成麻烦的闸门来暗示。
+    st = Store(mode)
+    cfg = st.load_auto_config()
+    cfg[AUTO_ENABLED_KEY] = bool(on)
+    cfg["changed_ts"] = time.time()
+    cfg["changed_by"] = "console"
+    st.save_auto_config(cfg)
+
+    # 开关一落盘就把调度线程备好（**不是在开启时才装**：线程自己每轮读开关，
+    # 所以关→开 不需要任何额外动作，开→关 也立即生效）。
+    ensure_scheduler(mode)
+
+    # Re-read rather than echo, and report the *resolved* boolean (not the raw
+    # JSON value) so the page and the scheduler can never disagree about what
+    # "enabled" means.
+    view = _auto_view(mode)
+    return {"ok": True, "mode": mode, "requested": bool(on),
+            "enabled": view["enabled"], "running": view["running"],
+            "will_trade": view["will_trade"],
+            "config_path": st.auto_path()}, 200

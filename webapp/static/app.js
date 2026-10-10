@@ -2375,6 +2375,38 @@ function liveModeHtml() {
 const posNotional = (p) => (p && p.notional != null && isFinite(p.notional)
   ? Number(p.notional) : null);
 
+/* 保证金占用 —— **和「持仓名义」是两个不同的量**，必须并排显示。
+ *
+ * 用户实测（2026-10-09 live）：页面「持仓名义 $227」而 OKX「保证金占用 $246」，
+ * 看着像有一个是错的。其实都对：
+ *   · 名义额 = Σ notionalUsd，按**标记价**折算的**风险敞口**；
+ *   · 保证金 = 交易所 `isoEq`，逐仓里**被锁住的钱**。
+ * 逐仓的保证金锚在**开仓时的名义**，亏损会吃掉它、**盈利不释放**它，
+ * 所以两者必然不等（该账户逐腿倍数 0.98–1.26）。
+ *
+ * 我曾试图用 名义/upl/杠杆 在前端复现 margin，21 条腿里没有能全部对上的闭式解
+ * —— 因为不必复现：交易所已经直接告诉了我们。所以这里**只取服务端字段**，
+ * 算不出来就写「—」。不要在这里做任何折算。 */
+function marginCell(a, nav) {
+  const m = a && a.margin;
+  if (!m || m.unavailable) {
+    return `<div class="cell"><div class="k">保证金占用</div>
+      <div class="v" style="font-size:12.5px">—</div>
+      <div class="s">交易所未返回该项</div></div>`;
+  }
+  const used = m.margin_used;
+  const avail = m.avail;
+  const frac = m.margin_frac;
+  /* 把占比的颜色绑到「还剩多少可动」上，因为那才是可操作的约束：
+   * 保证金占用高 = 可用余额少 = 下一次调仓可能开不出新腿。 */
+  const tone = frac == null ? '' : (frac >= 0.85 ? 'var(--danger)'
+    : (frac >= 0.65 ? 'var(--warn)' : ''));
+  const head = frac != null ? `${fmt.pct(frac, 1)}` : '—';
+  return `<div class="cell"><div class="k">保证金占用</div>
+    <div class="v"${tone ? ` style="color:${tone}"` : ''}>${fmt.dol(used)}</div>
+    <div class="s">占净值 <b${tone ? ` style="color:${tone}"` : ''}>${head}</b> · 可用 ${fmt.dol(avail)}</div></div>`;
+}
+
 function liveAcctHtml() {
   const L = S.live;
   const st = L.status;
@@ -2421,6 +2453,7 @@ function liveAcctHtml() {
       <div class="s" title="来自信号参数 execution.max_daily_turnover，按 UTC 日重置。它不是风控限额表里的「单次换手硬上限」——那个是超过即整批拒绝的闸门。">${esc(usedNote)}</div></div>
     <div class="cell"><div class="k">行情来源</div><div class="v" style="font-size:12.5px">${esc(st.prices_source || '—')}</div>
       <div class="s">持仓名义 ${fmt.dol(gross)}${gross > 0 && nav > 0 ? ` (${fmt.n(gross / nav, 3)}×)` : ''}</div></div>
+    ${marginCell(a, nav)}
   </div>`;
 
   /* --- 多空占比汇总：基于账户快照的实时持仓，名义额服务端已算（含 ctVal） --- */
@@ -3121,6 +3154,45 @@ function liveAutoHtml() {
     }
   }
 
+  /* --- 每日自动交易开关 ---
+   * ⚠️ 这一格以前写的是「它**不替代**下面的『启动守护进程』——两者都满足才会真正
+   * 交易」，而 `running` 当时指那个独立守护进程。用户当场问：「为什么还要开启守护
+   * 进程呢，现在后端不是开着吗」—— **他说得对**：那句话读起来像两个按钮功能重叠，
+   * 而实际是缺一不可，措辞把人绕进去了。
+   *
+   * 2026-10-10 起架构换了：**执行者是控制台进程自己**（它双重 fork + setsid，
+   * 父进程是 launchd，能长期活着），不再需要外部守护进程。所以这一格现在只需要
+   * 说清楚「开关 + 到点」两件事，不再提守护进程。
+   *
+   * `enabled`（许可位，落盘）与 `running`（调度线程活着）仍然是两个量，分开说。
+   */
+  const dis0 = L.busy ? 'disabled' : '';
+  const autoOn = !!A.enabled;
+  const autoErr = L.autoErr ? `<div class="s" style="color:var(--danger)">读取失败：${esc(L.autoErr)}</div>` : '';
+  const at = A.at || '11:00';
+  const ranToday = !!A.ran_today;
+  const autoState = (autoOn && running)
+    ? `已开启 · 每天 ${at} 自动执行${ranToday ? '（今天已完成）' : ''}`
+    : autoOn ? `已开启，但调度线程没在跑 ⇒ 现在不会下单`
+      : `已关闭`;
+  h += `<div class="banner ${autoOn && running ? '' : 'warn'}" style="margin-top:12px">
+    <div class="ico">${autoOn && running ? '✓' : '!'}</div><div style="flex:1">
+    <b>每日自动交易：${esc(autoState)}</b>
+    <p style="margin:6px 0 0">开启后，<b>控制台进程自己</b>会在每天 <b>${esc(at)}</b>
+    刷新行情并下单，成交后推飞书 —— 不需要你打开页面，也不需要另起任何进程。</p>
+    <p style="margin:4px 0 0" class="muted" style="font-size:11.5px">
+      风控照常生效：换手预算、名义额上限、到期限额和平时手动下单用的是同一套闸门。
+      今天${ranToday ? '<b>已经执行过</b>，不会重复下单' : '尚未执行'}。</p>
+    ${autoErr}
+    <div class="row" style="margin-top:8px;gap:8px;align-items:center">
+      <button class="btn sm ${autoOn ? 'ghost' : 'primary'}" id="autoToggle" ${dis0}>
+        ${autoOn ? '关闭自动交易' : '开启自动交易'}</button>
+      <span class="muted" style="font-size:11.5px">
+        ${autoOn ? '关闭后即使到点也不会下单（只记一笔跳过）；随时可关，立即生效'
+                 : (L.mode === 'live' ? '⚠ 实盘：开启后每天无人复核地下真钱单' : '随时可关，关掉立即生效')}</span>
+    </div>
+    </div></div>`;
+
   const accGrid = optGridDays();
   const opts = AUTO_GRID_CHOICES.map(([d, label, tip]) =>
     `<option value="${d}" ${rd === d ? 'selected' : ''}>${label} — ${tip}`
@@ -3413,6 +3485,11 @@ function liveBind() {
   if (ast) ast.onclick = liveAutoStart;
   const asp = $('#autoStop');
   if (asp) asp.onclick = liveAutoStop;
+  const atg = $('#autoToggle');
+  if (atg) atg.onclick = () => {
+    const cur = !!((L.auto || {}).enabled);
+    liveAutoToggle(!cur);
+  };
   const fd = $('#liveFlatDry');
   if (fd) fd.onclick = () => liveFlatten(true);
   const fl = $('#liveFlat');
@@ -3561,6 +3638,42 @@ async function liveAutoStop() {
   } finally {
     L.busy = false;
     livePaintAll();
+  }
+}
+
+/* 无人值守开关。与「启动/停止守护进程」是**两件事**：
+ *   enabled  = 持久化的许可位，决定到点会不会下单（存在 auto_config.json）
+ *   running  = 后端的**调度线程**是否活着（不再是外部守护进程）
+ * 两者独立：enabled 但线程没起 ⇒ 什么都不会发生；线程在跑但没 enabled ⇒
+ * 每轮直接跳过、正确地不下单。页面必须把两件事分开说，否则会出现
+ * 「显示已开启、其实不会交易」。 */
+async function liveAutoToggle(on) {
+  const L = S.live;
+  if (L.busy) return;
+  L.busy = true;
+  L.note = on ? '正在开启无人值守…' : '正在关闭无人值守…';
+  livePaintAll();
+  try {
+    // 用户裁定（2026-10-10）：不要确认短语，就一个普通开关。
+    // 实盘那一次风险用**按钮旁的显式警告**承担，而不是用一道会被当成麻烦的闸门。
+    const body = { mode: L.mode };
+    const d = await liveApi(`/api/live/auto/${on ? 'enable' : 'disable'}`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    /* 服务端回的是**落盘后重读**的值。用它，不用请求值：
+     * 写盘失败时回显请求会让页面显示「已开启」而文件仍是关的。 */
+    if (!d.ok) throw new Error(d.error || '操作失败');
+    const at = (d.at || '11:00');
+    L.note = d.enabled
+      ? (d.running ? `已开启：每天 ${at} 由控制台自动刷新行情并下单。`
+        : `已开启，但调度线程没在跑 —— 现在不会下单。请刷新页面；若仍如此，重启控制台。`)
+      : '已关闭：到点也不会下单（只记一笔跳过）。';
+  } catch (e) {
+    L.note = String(e && e.message || e);
+  } finally {
+    L.busy = false;
+    await liveLoadAuto();
   }
 }
 

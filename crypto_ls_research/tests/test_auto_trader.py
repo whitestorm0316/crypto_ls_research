@@ -32,6 +32,13 @@ from crypto_ls_research.execution.limits import LiveLimits
 @pytest.fixture
 def tmp_live(tmp_path, monkeypatch):
     monkeypatch.setattr(store_mod, "LIVE_DIR", str(tmp_path / "live"))
+    # 无人值守开关默认**关**（2026-10-10 加入）。本文件测的是到期闸门与各道
+    # 守卫，不是开关本身。在 fixture 里统一打开（而不是每个用例里打开）是刻意的：
+    # 有 15 个用例直接 `AutoTrader(...)` 构造、不走 `_bot`，漏掉任何一个，
+    # 那个用例就会停在 `skip / auto_disabled` 上 —— 而"全都 skip"看起来仍然
+    # 像"都有结论"，会把真问题伪装成通过。
+    for m in ("paper", "demo", "live"):
+        store_mod.Store(m).save_auto_config({"enabled": True})
     return tmp_path / "live"
 
 

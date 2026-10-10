@@ -1118,6 +1118,19 @@ def main():
                 if r["status"] == "interrupted":
                     r["status"] = "failed"
             write_runs(RUNS)
+    # 每日自动交易的调度器就活在这个进程里 —— 不需要外部守护进程。
+    # **启动时按开关重建**：改代码重启之后，之前打开的账户仍然会自动交易。
+    # 没有这一步，"重启一次就再也不自动了"而页面上开关还显示「已开启」，
+    # 那是最坏的一种失败（看着在跑，其实什么都没接上）。
+    try:
+        from webapp import live_api
+        started = live_api.start_enabled_schedulers()
+        print(f"[ok] 每日调度：已恢复 {started or '（没有账户开启）'}", flush=True)
+    except Exception as e:                                        # noqa: BLE001
+        # 调度器起不来不该拦住控制台：页面还要能用来手动下单与排查。
+        print(f"[!!] 每日调度启动失败（控制台仍可用）：{type(e).__name__}: {e}",
+              flush=True)
+
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"[ok] console on http://127.0.0.1:{port}", flush=True)
     print(f"[ok] project root: {ROOT}", flush=True)

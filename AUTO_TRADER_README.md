@@ -116,7 +116,76 @@ st.save_limits(lim.to_dict())
 > 最后一道墙。调高它意味着接受更大的一次性损失上限。**上实盘前重新评估。**
 
 
-## 三、当前配置
+## 三、每日自动交易（2026-10-10 起：**执行者是控制台本身**）
+
+**不需要任何外部守护进程。** 控制台进程自己就是一个常驻者 —— 它是双重 fork +
+`setsid()` 起的，父进程是 launchd，能长期活着。所以「每天 11:00 执行」就做成
+它内部的一个后台线程（`webapp/auto_schedule.py`）。
+
+> 为什么原来的守护进程是错的：从 Web 点按钮派生的子进程会随调用方的进程树一起
+> 被回收（日志断在半句、无 traceback、`is_running()` 几秒后变回 False）。
+> 见「§一·补」那一整节。控制台**自己**没有这个问题 —— 于是没必要再起一个进程。
+
+### 一个开关，按账户分开
+
+位置：交易台 → 自动任务面板顶部。paper / demo / live 各一个。
+
+| 概念 | 含义 | 存放 |
+|---|---|---|
+| `enabled` | **许可位**：到点会不会下单 | `artifacts/live/<mode>/auto_config.json` |
+| `running` | 后端**调度线程**是否活着 | 进程内（不是心跳文件） |
+| `will_trade` | `enabled AND running` | 派生值 —— 这才是「会不会自己下单」 |
+
+⚠️ **两者独立，页面必须分开说**：
+
+* `enabled=True, running=False` → 配好了，但**什么都不会发生**（最危险的误读）
+* `enabled=False, running=True` → 线程在跑但每轮直接跳过（**安全状态**，不是故障）
+
+### 五条规矩
+
+1. **默认关。** 从没配置过的账户不会因为恰好有个进程活着就开始下单。
+   读不到 / 损坏 / 类型不对（`"true"`、`1`）**一律当关** —— fail closed。
+2. **开关每轮重读。** 页面拨开关**立即生效**，不用重启。需要重启才生效的开关，
+   人会停止信任它，然后就不再关了。
+3. **关着时零动作。** 闸门排在数据刷新**之前**，关着连行情都不刷新
+   （实测 `skip / auto_disabled`，**0.0s**）。"什么都不做"必须真的是什么都不做。
+4. **每天只执行一次。** 落盘记 `last_run_day`；且**只在"成功提交之后"才记账**
+   —— 失败要能重试，成功必须立刻防重复（重复提交 = 双倍下单）。
+5. **错过不补。** 到点后 **10 分钟**内算赶上，超过就等下一个窗口。⚠️ 这条是实测
+   逼出来的：第一版只判 `now >= at`，我在 **15:25** 重启控制台时它立刻跑了一次
+   （`runs.jsonl` 里那条 `15:25:31`），拿的是当天已经过期的信号。错过就等明天，
+   「晚一次」远比「用旧信号下一次」便宜。
+
+### 走的是和网页按钮同一条路
+
+调度器**不自己下单**：它把「刷新行情 → 生成计划并执行」提交进**网页按钮用的同一个
+作业队列**。所以换手预算、名义额上限、到期限额、`check_plan` 的每个 `block`
+统统照常生效，且网页与定时器互相串行化（各自直接 `execute()` 会变成"两个 actor
+各读一遍同一本书、各发全量单"）。
+
+### 重启自恢复
+
+控制台启动时会读每个账户的开关，**开着的自动把调度线程建起来**。没有这一步，
+"改代码重启一次"就等于"以后再也不自动了"，而页面上开关还显示「已开启」——
+用户没有任何线索。
+
+### 实盘提示
+
+**开启实盘 = 每天无人复核地下真钱单。** 没有确认短语闸门（2026-10-10 用户裁定：
+就一个普通开关），代价用按钮旁边的显式警告承担。风控闸门仍然是最后一道墙。
+
+```bash
+# 命令行等价写法（开关落在文件里，所以直接读写文件也行）
+python -c "
+from crypto_ls_research.execution.store import Store
+Store('live').save_auto_config({'enabled': True})   # 开
+Store('live').save_auto_config({'enabled': False})  # 关
+"
+```
+
+守卫：`crypto_ls_research/tests/test_unattended_switch.py`（**10 条 / 变异 8/8 全抓**）。
+
+## 三·补、当前配置
 
 | 项 | 值 |
 |---|---|
@@ -133,6 +202,22 @@ st.save_limits(lim.to_dict())
 
 ## 四、macOS 定时（launchd）
 
+### 每个交易账户一个定时器（互不覆盖）
+
+`--trading-mode` 决定这个定时器拉起的是**哪个账户**：`demo`（默认）/ `paper` /
+`live`。每个模式有**独立的 launchd label**：
+
+| 账户 | label |
+|---|---|
+| `demo` | `com.crypto-ls.auto-trader-demo` |
+| `paper` | `com.crypto-ls.auto-trader-paper` |
+| `live` | `com.crypto-ls.auto-trader-live` |
+
+> ⚠️ 共用一个 label 会让后装的把先装的**静默顶掉**，而 `--status` 依然显示
+> 「已注册」。所以 label 按模式分开，并且有测试钉住三者互不相同。
+
+### 模拟盘
+
 ```bash
 # 默认：11:05 拉起守护进程（确保那一刻在跑），不偏离回测口径
 python3 scripts/install_scheduler.py --install
@@ -147,6 +232,36 @@ python3 scripts/install_scheduler.py --install --mode window --at 23:30
 python3 scripts/install_scheduler.py --status
 python3 scripts/install_scheduler.py --uninstall
 ```
+
+### 实盘（真钱）—— 必须显式 `--allow-live`
+
+```bash
+python3 scripts/install_scheduler.py --install \
+        --trading-mode live --allow-live --at 11:01
+```
+
+macOS 上也可以直接**双击 `INSTALL_LIVE_TIMER.command`**（推荐：它会自检解释器、
+装完打状态、并跑一遍 dry-run 让你看到当天结论）。
+
+三条不能省的规矩：
+
+1. **缺 `--allow-live` 直接拒绝**（安装器退出码 2、`scheduled_tick.py` 退出码 3），
+   而且**拒绝时不写任何文件**。装一个起不来的定时器比不装更糟 —— 它每天准点失败，
+   而 `--status` 显示「已注册」。
+2. **拒绝点在任何破坏性步骤之前**。否则 `--force-restart` 会先把一个健康的账本
+   停掉，然后才发现参数不合法。有测试用源码顺序钉住这一点。
+3. `--allow-live` **只开「允许下单」这道门，不放宽任何限额**：`check_plan` 的每个
+   `block` 仍然照常生效。
+
+> ⚠️ **`launchctl` 不能从工具调用/沙箱里注册 job。** 实测连一个 5 行的最小 plist
+> 都报 `Bootstrap failed: 5: Input/output error`。安装器写好 plist 后如果
+> `bootstrap` 失败，会在终端告诉你手动执行哪两条命令。
+
+### ⚠️ 11:01 是「拉起时刻」，不是「下单时刻」
+
+下单时刻由**回测网格**决定，不由定时器决定：信号北京 10:00 产生 → 回测成交价取
+11:00 那根 bar 的开盘 → 守护进程的到期窗口实际 **11:10–13:10** 才打开。所以 11:01
+拉起进程后它会自己空转到窗口开门，**开启时刻不影响下单时刻**。
 
 **为什么用 launchd 而不是 cron**：
 1. cron 在笔记本休眠时**直接跳过**，醒来也不补；launchd 唤醒后会补跑。

@@ -420,6 +420,11 @@ class Store:
     #: the ledger, and silently forgetting the risk caps at that exact moment
     #: would be the worst possible time to do it.
     LIMITS_FILE = "limits.json"
+    #: The unattended-trading switch, per account (see `load_auto_config`).
+    #: Deliberately a **separate file** from the heartbeat `auto.json` that the
+    #: daemon rewrites every tick -- a setting that lives in a file which is
+    #: rewritten 48 times a day is a setting that will be lost.
+    AUTO_FILE = "auto_config.json"
 
     def load_limits(self) -> Optional[dict]:
         """The saved hard caps, or None if nothing was ever saved.
@@ -441,6 +446,32 @@ class Store:
 
     def limits_path(self) -> str:
         return self.path(self.LIMITS_FILE)
+
+    # -- unattended-trading switch -----------------------------------------
+    def load_auto_config(self) -> dict:
+        """The per-account "trade unattended" switch.  Always returns a dict.
+
+        Unlike `load_limits`, `{}` is a *fine* answer here: this is a small
+        config with sane defaults, not a set of caps where "absent" and "empty"
+        mean different things.  So the caller never has to distinguish them.
+
+        ⚠️ **Disabled is the default, and that direction is load-bearing.**  An
+        account that has never been configured must not silently start placing
+        orders because a daemon happened to be running.
+        """
+        with _LOCK:
+            d = _read_json(self.path(self.AUTO_FILE), None)
+        return dict(d) if isinstance(d, dict) else {}
+
+    def save_auto_config(self, d: dict) -> dict:
+        """Persist the switch.  Returns what was written, including the stamp."""
+        row = {**dict(d), "_saved": time.time(), "_mode": self.mode}
+        with _LOCK:
+            _atomic_json(self.path(self.AUTO_FILE), row)
+        return row
+
+    def auto_path(self) -> str:
+        return self.path(self.AUTO_FILE)
 
     # -- convenience -------------------------------------------------------
     def summary(self) -> dict:

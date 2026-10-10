@@ -510,6 +510,58 @@ class OKXPrivate:
         except (TypeError, ValueError):
             return 0.0
 
+    def margin_usage(self, ccy: str = "USDT") -> dict:
+        """Money actually locked up, per the venue -- **not** a derived figure.
+
+        Why this exists: the desk displays `Σ notionalUsd` as 「持仓名义」, and
+        the venue displays `isoEq` as 「保证金占用」.  Those are **two different
+        quantities** and they legitimately differ (measured 2026-10-09 on the
+        live account: 226.94 vs 246.22, +8.5%).  An isolated position's margin
+        is anchored at its **entry** notional and only ratchets *up* as the leg
+        loses; a winning leg does not release margin.  So a reader who compares
+        the two numbers without knowing this concludes "one of them is wrong".
+
+        The fix is to show both, from the venue's own fields, and never to model
+        the second one.  I spent a while trying to reproduce `margin` from
+        notional/upl/leverage and could not get a closed form that held on all
+        21 legs -- because the honest answer is that the venue already tells us.
+
+        `imr`/`mmr` are the *cross* figures; they read 0 when every position is
+        isolated, which is itself the cheapest proof of the margin mode in force.
+        """
+        b = self.balance(ccy)
+        row = {}
+        for r in b.get("details") or []:
+            if r.get("ccy") == ccy:
+                row = r
+                break
+
+        def f(k: str, default: float = 0.0) -> float:
+            v = row.get(k, b.get(k))
+            try:
+                return float(v) if v not in (None, "") else default
+            except (TypeError, ValueError):
+                return default
+
+        eq = f("eq") or f("totalEq")
+        iso = f("isoEq")
+        imr_cross = f("imr")
+        avail = f("availBal") or f("availEq")
+        return {
+            "eq": eq,
+            "avail": avail,
+            "iso_eq": iso,
+            "imr_cross": imr_cross,
+            "mmr_cross": f("mmr"),
+            "frozen": f("frozenBal"),
+            "upl": f("upl"),
+            # Locked = whatever the venue reserves, isolated + cross.
+            "margin_used": iso + imr_cross,
+            "margin_frac": ((iso + imr_cross) / eq) if eq > 0 else None,
+            "avail_frac": (avail / eq) if eq > 0 else None,
+            "ccy": ccy,
+        }
+
     def positions(self, inst_type: str = "SWAP", inst_id: Optional[str] = None) -> List[dict]:
         p: Dict[str, str] = {"instType": inst_type}
         if inst_id:
