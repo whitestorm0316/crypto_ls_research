@@ -136,12 +136,29 @@ def _plain_md(text: str) -> str:
     return _MD_CODE.sub(r"\1", _MD_BOLD.sub(r"\1", text))
 
 
+#: A urllib opener that **ignores `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`**.
+#:
+#: 🔴 为什么必须绕开环境代理（2026-10-13 实测，代价是一次漏发的调仓通知）：
+#: OKX 交易台是从一个带沙箱代理的 shell 里起的，于是控制台进程继承了
+#: `HTTP_PROXY=http://127.0.0.1:<随机端口>`。那个代理**只在工具调用期间存活**；
+#: 到了 11:00 定时执行时没有任何工具调用在跑，端口已经关闭，
+#: `urlopen` 于是报 `URLError: [Errno 61] Connection refused` —— 订单照下（走的是
+#: 交易所 SDK，不经这里），通知静默丢失。
+#:
+#: 飞书 / 企业微信是**公网**服务，本来就不该走本机代理；而这个代理恰恰是个
+#: 存活期不确定的临时物。所以这里显式用空 `ProxyHandler`，不受环境变量影响。
+#:
+#: ⚠️ 另一个选项是把 URL 加进 `no_proxy`，但那是**进程启动时**读一次的 ——
+#: 已经起来的控制台改不了，而"重启一次才生效"正是这类修复最容易失效的地方。
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _post_json(url: str, payload: dict, timeout: float) -> Tuple[int, str]:
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
         url, data=body, method="POST",
         headers={"Content-Type": "application/json; charset=utf-8"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:      # noqa: S310
+    with _OPENER.open(req, timeout=timeout) as r:                # noqa: S310
         return r.status, r.read(2000).decode("utf-8", "replace")
 
 
@@ -150,7 +167,7 @@ def _post_form(url: str, payload: dict, timeout: float) -> Tuple[int, str]:
     req = urllib.request.Request(
         url, data=body, method="POST",
         headers={"Content-Type": "application/x-www-form-urlencoded"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:      # noqa: S310
+    with _OPENER.open(req, timeout=timeout) as r:                # noqa: S310
         return r.status, r.read(2000).decode("utf-8", "replace")
 
 

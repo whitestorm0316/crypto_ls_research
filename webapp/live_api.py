@@ -16,6 +16,8 @@ just read the JSON/JSONL files the engine wrote.
 """
 from __future__ import annotations
 
+import json
+import os
 import queue
 import threading
 import time
@@ -35,7 +37,16 @@ from crypto_ls_research.execution import navhist
 from crypto_ls_research.execution.auto_trader import (
     AUTO_ENABLED_KEY, resolve_auto_enabled,
 )
-from webapp import auto_schedule
+# ⚠️ 用**相对 import**：`webapp/server.py` 把 `webapp/` 加进了 `sys.path`，所以本模块
+# 可能以顶层名 `live_api` 被加载。写成 `from webapp import auto_schedule` 会强制
+# 走「包」路径，与 `import auto_schedule`（顶层路径）**各加载一份**，而
+# `auto_schedule` 的 `Registry` 是**有实例状态**的 —— 两份就意味着两个 registry。
+# 相对 import 在同一父包下解析到同一个子模块，从根上避免这件事。
+try:
+    from . import auto_schedule
+except ImportError:                                              # pragma: no cover
+    # 以顶层名（`import live_api`）加载时没有父包，退回绝对 import。
+    import auto_schedule
 
 MODES = ("paper", "demo", "live")
 MODE_LABEL = {"paper": "本地纸面", "demo": "OKX 模拟盘", "live": "OKX 实盘"}
@@ -106,7 +117,147 @@ def auto_runner(mode: str) -> dict:
         return eng.execute(confirm=(live_confirm_phrase() if mode == "live" else None),
                            force=False, dry_run=False, progress=log)
 
-    return _submit("auto", mode, plan_and_execute, label="自动任务：下单")
+    job = _submit("auto", mode, plan_and_execute, label="自动任务：下单")
+    # 等执行结束，然后把结果**解析成通知词汇**推出去。
+    #
+    # ⚠️ 这里有一个曾经漏掉的洞（2026-10-12 用户报「自动交易进行了但没发飞书」）：
+    # `notify_for` 原本**只在 `auto_trader` 的循环里**被调用。执行搬到控制台之后，
+    # 这条路经过的是 `live_api`，于是**通知完全没人发** —— 交易正常、静默无声。
+    # 这正是"把执行搬走、把通知留下"会造成的典型后果。
+    done = _wait_job(job["id"], timeout=600.0)
+    if done and done.get("status") == "done":
+        try:
+            _notify_result(mode, done.get("result") or {})
+        except Exception as e:                                    # noqa: BLE001
+            # 通知绝不能影响交易 —— 这条纪律与 `Notifier.send()` 一致。
+            print(f"[auto] {mode} 通知发送失败（不影响交易）：{type(e).__name__}: {e}",
+                  flush=True)
+    return job
+
+
+#: `engine.execute()` 的 `stage` → 通知配置认的 `action`。
+#:
+#: **两个词汇表不一致**，这是第二个独立的缺陷：`notify_on` 认的是
+#: `traded` / `blocked` / `error`（那是 `auto_trader` 的 `action`），而
+#: `engine.execute()` 返回的 `action` 恒为 `"rebalance"`、真正区分结果的是
+#: `stage`。不映射的话，即使调了 `notify_for` 也会得到「该结果不推送」。
+#:
+#: `no_orders` 刻意不映射成 `traded`：没有订单不是"成交了"，推一条"已调仓 0 笔"
+#: 会让人以为出了什么事。
+_STAGE_TO_ACTION = {
+    "sent": "traded",
+    "blocked": "blocked",
+    "confirm_failed": "blocked",
+    "no_orders": "noop",
+    "dry_run": "dry_run",
+}
+
+
+#: 通知器缓存：(config_mtime, Notifier)。**按 mtime 热读**，与 `auto_trader`
+#: 的行为一致 —— 控制台同样会跑很久，有人"配了 webhook 但没重启"时必须自动生效，
+#: 否则 `--test`（新进程）通过、而常驻的这条静默不发，看起来像"策略什么都没做"。
+_NOTIFIER_CACHE: Dict[str, tuple] = {}
+
+
+def _notifier_now(mode: str):
+    from crypto_ls_research.execution.notify import CONFIG_PATH, Notifier
+
+    try:
+        mtime = os.path.getmtime(CONFIG_PATH)
+    except OSError:
+        mtime = None
+    cached = _NOTIFIER_CACHE.get(mode)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    n = Notifier.from_config(mode=mode)
+    _NOTIFIER_CACHE[mode] = (mtime, n)
+    d = n.describe()
+    print(f"[auto] {mode} 通知配置已读取："
+          + (f"{d['provider']} → {d['url']}" if d.get("ready") else "未启用/未就绪"),
+          flush=True)
+    return n
+
+
+def _notify_result(mode: str, result: dict) -> dict:
+    """把一次自动执行的产物推给通知通道。
+
+    只做**翻译 + 转发**：`notify_for` 仍然是唯一的判定点（它决定该不该推、
+    去重、格式化）。这里不重复它的逻辑，否则就有了第二份定义。
+    """
+    from crypto_ls_research.execution.notify import notify_for
+
+    stage = str(result.get("stage") or "")
+    out = dict(result)
+    out["action"] = _STAGE_TO_ACTION.get(stage, stage or "error")
+    out["mode"] = mode
+    # `blocked` 时把拦截原因带进正文，否则收到"被拦截"却不知道被什么拦的。
+    # ⚠️ 字段名是 `blocked_by` —— 那是 `format_rebalance()` 实际读的键。
+    # 我第一版填的是 `errors`，结果消息里只有「未发送任何订单」、一条原因都没有
+    # （被测试当场抓住）。**别猜字段名，去看格式化器读什么。**
+    if out["action"] == "blocked":
+        if not out.get("blocked_by"):
+            titles = [str(d.get("title") or d.get("key") or d)
+                      for d in (result.get("violations") or [])
+                      if str(d.get("sev") or "") == "block"]
+            out["blocked_by"] = titles or [str(e) for e in (result.get("errors") or [])] \
+                or ["风控拦截"]
+        out.setdefault("error", "；".join(str(b) for b in out["blocked_by"]))
+    if out["action"] == "traded":
+        out.setdefault("reason", "rebalance")
+
+    n = _notifier_now(mode)
+    r = notify_for(out, n)
+    # **把结果写回审计与心跳**，否则"它告诉我了吗"只能靠翻控制台日志回答。
+    # 2026-10-13：用户问「下单后还是没发飞书」，而 `runs.jsonl` 里连一个 `notify`
+    # 字段都没有 —— 只能去 grep 日志才发现是 `Errno 61`。那条信息应该和这次调仓
+    # 记在一起。（`auto_trader` 的 `_notify()` 一直把 `out["notify"]` 落盘，
+    # 是控制台这条路漏了。）
+    try:
+        _record_notify(mode, result, r, out["action"])
+    except Exception as e:                                        # noqa: BLE001
+        print(f"[auto] {mode} 通知结果写入审计失败（不影响交易）："
+              f"{type(e).__name__}: {e}", flush=True)
+    if r.get("ok"):
+        print(f"[auto] {mode} 已推送通知（{r.get('provider')}）：{out['action']}",
+              flush=True)
+    else:
+        print(f"[auto] {mode} 未推送（{r.get('skipped') or r.get('error')}）"
+              f"，action={out['action']}", flush=True)
+    return r
+
+
+def _record_notify(mode: str, result: dict, r: dict, action: str) -> None:
+    """把通知结果附到这次调仓的审计记录上（按 `run_id` 找回那一行）。
+
+    `runs.jsonl` 是只追加的，所以"改一行"= 重写整个文件。文件很小（每次调仓一条），
+    而且这里已经在下单路径之外（下单早完成了），所以这点代价换"能事后回答
+    『通知发了吗』"是值得的。
+
+    写失败**不算错**：它绝不能影响交易，调用方已经把异常吞掉了；审计缺一个字段
+    远不如把一次成功的调仓标成失败严重。
+    """
+    run_id = result.get("run_id")
+    if not run_id:
+        return
+    st = Store(mode)
+    # ⚠️ `store.runs()` 默认**最新在前**，写回时必须按原顺序（文件是时间序），
+    # 否则重写一次会把 `runs.jsonl` 倒过来。
+    rows = list(reversed(st.runs(limit=None)))
+    hit = False
+    for row in rows:
+        if row.get("run_id") == run_id:
+            row["notify"] = dict(r)
+            row["notify"]["action"] = action
+            hit = True
+            break
+    if not hit:
+        return
+    path = st.path("runs.jsonl")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+    os.replace(tmp, path)
 
 
 def _wait_job(jid: str, timeout: float = 300.0) -> Optional[dict]:
@@ -583,6 +734,25 @@ def route_post(path: str, body: dict) -> Optional[Tuple[dict, int]]:
         return _auto_set_enabled(body, True)
     if path == "/api/live/auto/disable":
         return _auto_set_enabled(body, False)
+
+    if path == "/api/live/auto/notify-test":
+        # 通知自检：**由控制台进程自己发一条**。
+        #
+        # 为什么需要这个端点（2026-10-13）：用户在 11:00 之后才问"为什么没发飞书"，
+        # 而那时唯一的证据是控制台日志里一行 `URLError: Errno 61`。如果不等到明天
+        # 11:00 就能自己验一次，这类问题能在部署当下被发现，而不是事后翻日志。
+        #
+        # ⚠️ 关键：它必须在**控制台进程**里执行。我在工具调用里另起一个进程发，
+        # 走的是我那次的代理环境 —— 那恰恰会掩盖问题（代理在我的调用期间是活的）。
+        mode = body.get("mode", "live")
+        if mode not in MODES:
+            return {"ok": False, "error": f"bad mode {mode!r}"}, 400
+        n = _notifier_now(mode)
+        d = n.describe()
+        r = n.send("✅ 通知自检 · 控制台",
+                   "这条由**控制台进程自己**发出。收到即说明 11:00 的定时调仓也发得出。",
+                   key=f"selftest-{time.time()}", action="traded")
+        return {"ok": bool(r.get("ok")), "notify": r, "config": d}, 200
 
     if path == "/api/live/creds":
         mode = body.get("mode")

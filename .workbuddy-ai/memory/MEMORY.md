@@ -1,21 +1,21 @@
 # 项目长期约定 — crypto_ls_research
 
-> **只放规则**（会踩错的、必须照做的）。长推导/表格在 `RULES-OPS.md`（**不注入**）；数字在
-> `artifacts/FINDINGS.md` 与 `.workbuddy-ai/memory/<日期>.md`。
-> ⚠️ **注入上限 ~17.2 KB**（实测）。**加东西必须等量压掉**，细则写 `RULES-OPS.md`；
-> 加完 `wc -c` 复核，**超 16.5 KB 就再压**。
+> **只放规则**（会踩错的、必须照做的）。长推导/表格在 `RULES-OPS.md`（**不注入**）；
+> 数字在 `FINDINGS.md` 与日志 `<日期>.md`。
+> ⚠️ **注入上限 ~17.2 KB**。**加东西必须等量压掉**（细则写 `RULES-OPS.md`）；加完
+> `wc -c` 复核，**超 16.5 KB 再压**。
 
 ## 环境 / 沙箱 / 进程
 - Python：`/Users/chenqifeng/.workbuddy-ai/binaries/python/envs/default/bin/python`。
 - `grep '\|'` **静默返 0 行** → 用 `grep -E`；`--include=*.py` zsh 报错 → 用 Grep 工具。
-  **无 `timeout`**；`ps` 被禁 → 探活 `kill -0 $(cat <pidfile>)`；**禁 `rm -rf`**。
-- ⚠️ **`/tmp` 在两次工具调用之间被清空** → pidfile/log **放仓库内**（`logs/`）。
+  **无 `timeout`**；`ps` 禁 → 探活 `kill -0 $(cat <pidfile>)`；**禁 `rm -rf`**。
+- ⚠️ **`/tmp` 在两次工具调用间被清空** → pidfile/log **放仓库内**。
 - 控制台 **8790**；`server.py::main()` 默认 **8770**（隔壁 a-stock 在用）→ **必须位置参数传**
-  `python -m webapp.server 8790`。漏掉 = `OSError: [Errno 48]`，而 `lsof`/`netstat` **查不到**。
-- **沙箱里 `curl` 探活不可信**（127.0.0.1 被代理接管，没起也回 **502**）→ 判活/读 API 用**裸 socket**
-  （`socket.create_connection` + 手写 HTTP/1.1）；`lsof -i` 也可能**静默无输出**。
-- 长任务用技能 `persistent-background-process/scripts/daemon_run.py`（**不在仓库**，**位置参数**
-  `<cwd> <logfile> <pidfile> <cmd...>`）；**`nohup ... &` 活不过一轮调用**。
+  `python -m webapp.server 8790`。漏掉 = `OSError: [Errno 48]`，`lsof`/`netstat` **查不到**。
+- **沙箱里 `curl` 探活不可信**（127.0.0.1 被代理接管，没起也回 **502**）→ 判活/读 API 用**裸 socket**；
+  `ps`/`lsof` 被禁或静默。
+- 长任务用技能 `persistent-background-process/scripts/daemon_run.py`（**不在仓库**，**位置
+  参数** `<cwd> <logfile> <pidfile> <cmd...>`）；**`nohup ... &` 活不过一轮调用**。
 - **数据流水线**：`data.download --bars 1h 15m 5m` → `data.asset_class --build` → `data.funding_build`
   （缓存只存已收盘 bar）。改 `webapp/*.py` 或 `crypto_ls_research/**` **必须重启 8790**；
   **静态文件（`app.js`）每请求读盘，不用重启**。
@@ -44,14 +44,13 @@
 - **比因子集之前先查两侧选名中位数**；**把「差异」叫「不成立」之前先算 σ**。`deflated_haircut`
   **按 tag 读**（跨 tag 比是错的）。
 
-## 已完成检验的结论（Q32–Q35）——**推导/数字在 `FINDINGS.md` + `RULES-OPS.md`**
-- **Q33**：**自写估计量必须先验证再信**（`_ols_nw` 曾把 HAC meat **多除一个 n** → t 虚高 ~45 倍）；
-  **条件子集的「年化收益」无意义**（报条件均值/条件 Sharpe）。**必须披露**：熊市 0.898、**高波动 0.118**。
-- **Q34**：**`long_ret`/`short_ret` 是带符号 P&L** ⇒ 镜像把 long 映到 **−short**（写成 `+short` 是最易犯的错）；
-  `flip_book=True` 翻转的是**装配好的目标**（不是 `score = -score`）。
-- **Q35**：**三条通道别混**（影线**逐位不进损益**，但 `range_pos` 读 180 根滚动极值 ⇒ **影线是信息**；
-  缺口改损益但**选股逐位不变**）。**扛不住**：**无止损/止盈/算法单**、**无账户级回撤熔断**
-  （`dd_scale` 读**回测模拟净值**）⇒ 唯一反应是下一网格点。守卫 `test_wick_channels.py`。
+## 已完成检验的结论（Q32–Q35）——**推导/数字在 `FINDINGS.md`**
+- **Q33**：**自写估计量必须先验证再信**（`_ols_nw` 曾把 HAC meat 多除一个 n ⇒ t 虚高 ~45 倍）；
+  **条件子集的「年化收益」无意义**；**必须披露**熊市 0.898、**高波动 0.118**。
+- **Q34**：**`long_ret`/`short_ret` 是带符号 P&L** ⇒ 镜像把 long 映到 **−short**（写 `+short` 最易错）。
+- **Q35**：**三条通道别混**（影线逐位不进损益，但 `range_pos` 读 180 根滚动极值 ⇒ 影线是信息）。
+  **扛不住**：无止损/止盈/算法单、无回撤熔断 ⇒ 唯一反应是下一网格点。
+
 
 ## 保证金模式：单源常量 `settings.MARGIN_MODE` = **`isolated`**（2026-09-30 定案）
 - **两次决定，理由不同、都成立**：① **频率** —— 逐仓每腿 `1/L − mmr`（3× **32.8%**），全仓
@@ -83,9 +82,9 @@
   一次）：唯一来源 `/api/spec` 的四个 headline 字段；引用旧指标必须带 `spec.RECORDED_NOTE`。
   **页面提到一个控件，就必须真有那个控件**；`smoke_live.js` 必须**逐字段镜像 `boot()`**
   （漏字段不报错，只让标记**双双消失**）。
-- **判据坏了不许靠改判据变绿**（资金费那条 FAIL 继续报，旁边加 `pass=None` 信息行、不计入门禁数）；
+- **判据坏了不许靠改判据变绿**（资金费那条 FAIL 继续报，旁边加 `pass=None` 信息行、不计门禁）；
   `check_traps` 的 `rev_short` **错过两次** ⇒ **警告的理由必须和用户做的事是同一件事**；
-  **禁止「整文件不含某字符串」式断言**→ 切定义块再查；**相邻对断言**优于「包含某数」
+  **禁止「整文件不含某字符串」**→切定义块再查；**相邻对断言**优于「包含某数」
   （`1.937` 是 `1.9375` 的子串）。纪律见 `dashboard-data-consistency`。
 
 ## 控制台 / 启动脚本（Q39）
@@ -100,9 +99,9 @@
 ## 数据源可切换 / 换交易所（Q40）——**表格全在 `RULES-OPS.md`**
 - **缓存目录唯一来源 = `settings.CACHE_DIR`**（读 `CRYPTO_CACHE_DIR`）；`store.CACHE` 与 `download.CACHE`
   都**从它派生，不许各自再算一遍**。
-- **`binance_client.klines_range()` 返回与 OKX 完全同形的 9 列**。最贵的坑是字段映射：
+- **`binance_client.klines_range()` 返回与 OKX 同形的 9 列**。最贵的坑是字段映射：
   **`vol_ccy` ← 基础币量、`amount` ← 计价币额**（`vwap = amount/vol_ccy` 必须是价格量级；写反
-  不报错，只会让 vwap 变 ~价格²）。守卫 `test_data_source_switch.py`（11 条）。
+  不报错，只让 vwap 变 ~价格²）。守卫 `test_data_source_switch.py`（11 条）。
 - ⚠️ **`min_avg_amount_usd` 是绝对美元阈值**（币安成交额是 OKX 的 **3.67 倍** ⇒ 同一个 `$3M` 在 OKX 筛出
   **16** 名、币安 **39** 名）⇒ **换数据源必须先看「有效横截面宽度」**。
 - ⚠️ **比两家价格前先除掉固定面值因子**（`1000PEPEUSDT` 这类**天然 ~1000 倍**）；收益尺度无关。
@@ -112,15 +111,16 @@
   ⚠️ 同时持两个场所的 panel 会 OOM ⇒ **用完即 `del` + `gc.collect()`**。
 
 ## 失效归因（Q41–Q43）——**只诊断，未优化**
-🔴 **细节整节在 `RULES-OPS.md`**（**`net = gross − …**+** funding` 的符号**、5 个回撤窗口边界不同、同期 IC 是「拿结果解释结果」、IC≠尾部价差、空腿亏损三分、**头号反复缺陷「算不出来」被静默丢掉**）。
-
+🔴 **细节整节在 `RULES-OPS.md`**（`net = gross − …**+** funding` 的符号、5 个回撤窗口
+边界不同、同期 IC 是「拿结果解释结果」、IC≠尾部价差、空腿亏损三分、
+**头号反复缺陷「算不出来」被静默丢掉**）。
 
 ## 订单方向（踩过最贵的一脚）
-- `long_short_mode`：**`posSide` = 动哪个仓、`side` = 方向**。加多 `buy/long`、减多 `sell/long`、**加空
-  `sell/short`、减空 `buy/short`**；flip = 两腿。
+- `long_short_mode`：**`posSide` = 动哪个仓、`side` = 方向**。加多 `buy/long`、减多 `sell/long`、
+  **加空 `sell/short`、减空 `buy/short`**；flip = 两腿。
 - `_orders_for_instrument` 曾用 `abs(tgt)-abs(cur)` 推 `side`，**丢符号** → 加空腿全变买入、**静默**
-  （订单被接受、计划正常，仓位反向走）。实测 demo 多头 **92.0%** vs 目标 **47.6%**
-  ⇒ **成交记录不能当策略演练**。修法 `d = tgt_sz - cur_sz`；守卫 `test_order_sides.py`。
+  （订单被接受、计划正常，仓位反向走）。实测 demo 多头 **92.0%** vs 目标 **47.6%** ⇒
+  **成交记录不能当策略演练**。修法 `d = tgt_sz - cur_sz`；守卫 `test_order_sides.py`。
 
 ## 自动交易 / 设置持久化 / 三个「倍数」——**完整规则在 `RULES-OPS.md`（同名章节）**
 - **`not_due` 是 `warn` 不是 `block`** ⇒ 到期判定必须写进调度器（断言「**`execute` 没被调用**」），
@@ -132,28 +132,35 @@
   **没有 leverage 参数**）。**唯一有效旋钮 = `execution.max_daily_turnover`**，但放开节流**会打坏策略**
   （Sharpe 1.82→1.10→0.46）。**杠杆唯一作用是保证金**（$70 在 5× 下缓冲 $0 ⇒ **18.4% 反向波动即亏光**）。
 
-## 无人值守开关 + 保证金显示（2026-10-10）
-- 🔴 **执行者是控制台自己，不是独立守护进程**（Q49）：控制台双重 fork + `setsid()`、
-  父进程 launchd ⇒ 能长期活着；Web 按钮派生的守护进程**会被进程树回收**（老毛病）。
-  调度器 `webapp/auto_schedule.py` 活在控制台内，**启动时自恢复**（`server.py::main`
-  读开关重建线程），否则"重启一次再也不自动"而页面仍显「已开启」。
-- **必须走和网页按钮同一个作业队列**（`live_api._submit`），不自己调 `execute()`。
+## 无人值守开关（2026-10-10/12）
+- 🔴 **执行者是控制台自己**（双重 fork + `setsid()` ⇒ 长期活着），`webapp/auto_schedule.py`，
+  **启动时自恢复**。**必须走和网页按钮同一个作业队列**（`live_api._submit`）。
 - 🔴 **到点判定是「窗口」不是「阈值」**：`at <= now <= at+10min`，错过**不补**
-  （实测：第一版 `now>=at`，15:25 重启控制台时它立刻拿过期信号跑了一次）。
-  幂等账**只在成功提交后写**；失败要能重试。
-- **`enabled`（落盘许可位）与 `running`（调度线程活着）是两个量**，派生
-  `will_trade = enabled AND running`。⚠️ 测试须覆盖**四种组合** —— 只测 `(False,False)`
-  会让两者同值 ⇒ **断言恒真**（假守卫）。⚠️ mock 要打**对对象**（`running` 来自
-  `_REGISTRY`，不是 `auto_ctl`）。**实盘无确认短语闸门**（用户裁定）。
-- 🔴 **默认关、且必须 `is True` 不能用真值测试**：`resolve_auto_enabled` 对非 dict /
-  缺失 / 类型不对（`"false"`、`1`）一律 False。⚠️ `"false"` 在 Python 里是**真值**，
-  用 `bool()` 会把开关**静默打开**（变异测试验证过这条）。
-- 🔴 **其余细节（保证金只读字段不折算、`LIVE_DIR` 无 env、先关后刷）整节在 `RULES-OPS.md`。**
+  （实测：第一版 `now>=at`，15:25 重启时立刻拿过期信号跑了一次）。幂等账**成功后才写**。
+- **`enabled`/`running` 是两个量**，派生 `will_trade`。⚠️ 测试覆盖**四种组合**
+  （只测 `(False,False)` ⇒ 断言恒真）；⚠️ mock 打**对对象**（`_REGISTRY`）。
+- 🔴 **细节（`is True` 不能真值测试、`LIVE_DIR` 无 env、保证金只读）在 `RULES-OPS.md`。**
 
-
-## 定时器 / 实盘 opt-in
-🔴 **细节整节在 `RULES-OPS.md`**（`allow_live=False` 硬编码导致实盘起不来、`LABELS/UNITS` 按模式分开、**`launchctl` 不能从沙箱注册**、守卫须早于第一次 `auto_ctl.` 调用）。**2026-10-10 起执行者改为控制台自身**（见下节）。
-
+## 无人值守 + 通知（Q49–Q51）——**细节整节在 `RULES-OPS.md`**
+- 🔴 **执行者是控制台自己**（双重 fork + `setsid()` ⇒ 长期活着），`webapp/auto_schedule.py`，
+  **启动时自恢复**；**必须走和网页按钮同一个作业队列**。
+- 🔴 **到点判定是「窗口」不是「阈值」**：`at <= now <= at+10min`，错过**不补**。幂等账
+  **成功后才写**。
+- 🔴 **通知必须和「执行」一起搬**：`notify_for()` 原本只在 `auto_trader` 里 ⇒ 搬到控制台后
+  **没人发通知**。且 `execute()` 的 `action` 恒为 `"rebalance"`、`notify_on` 认
+  `traded`/`blocked`/`error` ⇒ **必须翻译**（`_STAGE_TO_ACTION`）。⚠️ 拦截原因填
+  **`blocked_by`**（格式化器读的键），不是 `errors`。
+- 🔴 **模块重复加载**：`import live_api`（顶层名）与 `from webapp import live_api`（包名）
+  是**两个模块对象** ⇒ 线程建在 A、HTTP 读 B（日志说"已恢复"、页面显示"没在跑"）。
+  **统一用包路径导入**。
+- 🔴 **沙箱代理只在工具调用期间存活**：控制台继承 `HTTP_PROXY=127.0.0.1:<端口>` ⇒ 11:00
+  无工具调用 ⇒ 端口已关 ⇒ `urlopen` 报 **`Errno 61`**。**订单照下**（走交易所 SDK）⇒
+  "交易成功、通知静默"。修法：`build_opener(ProxyHandler({}))`；⚠️ 断言写「**没有**
+  ProxyHandler」（空的会被自动扔掉）。
+- ⚠️ **通知结果要落进 `runs.jsonl`**（`runs()` 默认最新在前 ⇒ 写回要 `reversed()`）；
+  **自检端点必须由控制台进程自己发**（另起进程会走那次调用的代理，掩盖问题）。
+- **`enabled`/`running` 是两个量**，派生 `will_trade`；⚠️ 测试覆盖**四种组合**、mock
+  打**对对象**（`_REGISTRY`）。守卫 `test_auto_schedule/test_auto_notify.py`。
 
 ## 测试约定
 - 期望值必须**从 fixture 派生**，别写死；断言用**页面同一格式化器**推导（时区一改就红）。
@@ -162,14 +169,12 @@
 - ⚠️ **对账断言要用「独立算一遍」的量**：拿 `short_pnl`（本身来自引擎 `name_gross`）去比
   `bars['short_ret']`，只钉住**区间分组** —— **前向起点挪一根 bar 它不会红**。
   必须有价格**独立算出**的列（Q43 的 `*_px`）钉**口径**。**变异测试当场抓出过这条假守卫。**
-- 新断言必须变异测试，且**验证「真的注入进去了」**（`src.count(old) == 1`）。用**备份+还原**（`cp` →
-  改 → 跑 → `cp` 回 → 比 sha256），**不要 `git stash`**；脚本用完移出仓库。**同时断言
-  「写入后 sha 变了」与「还原后 sha 回来了」。**
+- 新断言必须变异测试，且**验证「真的注入进去了」**（`src.count(old) == 1`）。用**备份+还原**
+  （`cp`→改→跑→`cp` 回→比 sha256），**不要 `git stash`**；脚本用完移出仓库。
 - 新 helper 要在测试**函数内** import（模块级 import 不存在符号 → 整文件 collection error）。
 - **多进程 sweep 不能从 stdin 跑**（spawn 报 `FileNotFoundError`）→ `n_jobs=1` 或真实文件。
 - `smoke_live.js` MiniDom：`clearClassScope` 子树级失效必须；`#content` 重建要清 `__lastHtml`。
 
 ## 通知 / OKX
 细节在 `RULES-OPS.md`。必记：**配完不重启 → 静默不发**（按 mtime 热读）；`send()` **永不抛**；
-**HTTP 200 不是结论** —— 四家**全部**用 200 返「被拒」；OKX envelope `code` 与逐行 `sCode` 是**两层**。⚠️ **仓位 USD 名义只能读 `notional`**：
-`sz × markPx` 差一个**合约面值**倍数（BTC `ctVal=0.01` ⇒ **100 倍**），**不报错、看着合理**。
+**HTTP 200 不是结论** —— 四家**全部**用 200 返「被拒」；OKX envelope `code` 与逐行 `sCode` 是**两层**。⚠️ **仓位 USD 名义只能读 `notional`**：`sz × markPx` 差一个**合约面值**倍数（BTC `ctVal=0.01` ⇒ **100 倍**），**不报错、看着合理**。

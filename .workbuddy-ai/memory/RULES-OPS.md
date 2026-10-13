@@ -969,3 +969,51 @@ mw_ret_names = pool_mean + excess_select + excess_weight
   **改到真实账户上**（我犯过）。
 - ⚠️ **保证金占用 ≠ 持仓名义**（Q47）：`isoEq` vs `Σ notionalUsd`。**只读交易所字段，
   不折算**（拟合过闭式解，21 条腿对不上）；`imr=mmr=0` 是最便宜的「全是逐仓」证据。
+
+---
+
+## 定时器 / 实盘 opt-in
+🔴 **细节整节在 `RULES-OPS.md`**（`allow_live=False` 硬编码导致实盘起不来、`LABELS/UNITS` 按模式分开、**`launchctl` 不能从沙箱注册**、守卫须早于第一次 `auto_ctl.` 调用）。**2026-10-10 起执行者改为控制台自身**（见下节）。
+
+---
+
+## 已完成检验的结论（Q32–Q35）——**推导/数字在 `FINDINGS.md` + `RULES-OPS.md`**
+- **Q33**：**自写估计量必须先验证再信**（`_ols_nw` 曾把 HAC meat **多除一个 n** → t 虚高 ~45 倍）；
+  **条件子集的「年化收益」无意义**（报条件均值/条件 Sharpe）。**必须披露**：熊市 0.898、**高波动 0.118**。
+- **Q34**：**`long_ret`/`short_ret` 是带符号 P&L** ⇒ 镜像把 long 映到 **−short**（写成 `+short` 是最易犯的错）；
+  `flip_book=True` 翻转的是**装配好的目标**（不是 `score = -score`）。
+- **Q35**：**三条通道别混**（影线**逐位不进损益**，但 `range_pos` 读 180 根滚动极值 ⇒ **影线是信息**；
+  缺口改损益但**选股逐位不变**）。**扛不住**：**无止损/止盈/算法单**、**无账户级回撤熔断**
+  （`dd_scale` 读**回测模拟净值**）⇒ 唯一反应是下一网格点。守卫 `test_wick_channels.py`。
+
+---
+
+## 通知必须和「执行」一起搬（2026-10-12，Q50）
+- 🔴 **搬走执行、留下通知 = 静默不发。** `notify_for()` 原本只在 `auto_trader` 里调用；
+  执行搬进控制台后那条路**没人发通知**（用户报「交易了但没飞书」）。**换地方执行时必须
+  问：它原有的副作用（通知/记账/审计）跟过来了吗？**
+- 🔴 **两个词汇表不一致**：`engine.execute()` 的 `action` **恒为 `"rebalance"`**，
+  真正区分结果的是 `stage`；而 `notify_on` 认 `traded`/`blocked`/`error`。
+  ⇒ 必须**翻译**（`_STAGE_TO_ACTION`）。不翻译即使调了也得到"该结果不推送"。
+- ⚠️ 拦截原因要填 **`blocked_by`**（`format_rebalance()` 读的键），不是 `errors`。
+  **别猜字段名，去看格式化器读什么。**
+- 🔴 **模块重复加载**：`server.py` 把 `webapp/` 加进 `sys.path` ⇒ `import live_api`（顶层名）
+  与 `from webapp import live_api`（包名）是**两个模块对象**，各有一份
+  `_REGISTRY`/`_JOBS`/`_ENGINES` ⇒ **线程建在 A、HTTP 读 B**，日志说"已恢复"而页面
+  显示"没在跑"。**统一用包路径导入**。守卫 `test_auto_notify.py`。
+- ⚠️ **"扫全文件找违规"会扫到自己注释**（断言 server.py 不许有某写法时命中 4 处，全是
+  解释它错的注释）⇒ 只看非 `#` 行。⚠️ **测试别带"已把被测对象换掉"的 fixture**。
+- 守卫 `test_auto_notify.py`（11 条 / 变异 6/6）。
+
+---
+
+## 无人值守开关（2026-10-10/12）
+- 🔴 **执行者是控制台自己**（双重 fork + `setsid()` ⇒ 长期活着），不是外部守护进程
+  （Web 派生的会被进程树回收）。`webapp/auto_schedule.py`，**启动时自恢复**。
+- **必须走和网页按钮同一个作业队列**（`live_api._submit`），不自己调 `execute()`。
+- 🔴 **到点判定是「窗口」不是「阈值」**：`at <= now <= at+10min`，错过**不补**
+  （实测：第一版 `now>=at`，15:25 重启时立刻拿过期信号跑了一次）。幂等账**只在
+  成功提交后写**；失败要能重试。
+- **`enabled`/`running` 是两个量**，派生 `will_trade`。⚠️ 测试覆盖**四种组合**
+  （只测 `(False,False)` ⇒ 断言恒真）；⚠️ mock 打**对对象**（`_REGISTRY`）。
+- 🔴 **细节（`is True` 不能用真值测试、`LIVE_DIR` 无 env、保证金只读）在 `RULES-OPS.md`。**

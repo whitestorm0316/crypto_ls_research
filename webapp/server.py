@@ -30,7 +30,23 @@ from spec import (  # noqa: E402
     build_run_args, check_traps,
 )
 import trades  # noqa: E402
-import live_api  # noqa: E402
+
+# ⚠️ **`live_api` 必须只有一份，且用包路径导入。**
+#
+# 背景（2026-10-12 实测踩到）：本文件上面把 `webapp/` 塞进了 `sys.path`，于是
+# `import live_api` 会以**顶层名**注册模块；而任何一处 `from webapp import live_api`
+# 会以 `webapp.live_api` 再加载**第二份**。两份各有自己的模块级状态
+# （`_REGISTRY` / `_JOBS` / `_ENGINES` / `_ENGINES`），后果是
+# 「调度线程建在 A 份、HTTP 处理器读 B 份」—— 启动日志显示 `已恢复 ['live']`，
+# 页面却显示 `running: false`。看着在跑，其实没接上，是本仓库最忌讳的失败形态。
+#
+# 现在两条路都堵上：
+#   1. 本文件**只用这一种**导入方式（下面的测试会盯着不许出现另一种）；
+#   2. `webapp/live_api.py` 对 `auto_schedule` 用**相对导入**，不再自造第二条路径。
+#
+# 保持包路径（而不是顶层名）的理由：`crypto_ls_research` 那边也是包，包路径下
+# 依赖解析不会因为 `sys.path` 的顺序而漂移。
+from webapp import live_api  # noqa: E402
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 ARTIFACTS = os.path.join(ROOT, "artifacts")
@@ -1123,7 +1139,15 @@ def main():
     # 没有这一步，"重启一次就再也不自动了"而页面上开关还显示「已开启」，
     # 那是最坏的一种失败（看着在跑，其实什么都没接上）。
     try:
-        from webapp import live_api
+        # ⚠️ 必须用**下面那个 `import live_api`**，不能写 `from webapp import live_api`。
+        #
+        # 本文件第 33 行是 `import live_api`（因为 `webapp/` 目录本身被塞进了
+        # `sys.path`），于是模块以**顶层名 `live_api`** 注册。而
+        # `from webapp import live_api` 会以 `webapp.live_api` 再 import **第二份**，
+        # 两份各有自己的模块级状态（`_REGISTRY` / `_JOBS` / `_ENGINES`）。
+        # 结果：调度线程建在了 A 份里，而 HTTP 处理器读的是 B 份 ——
+        # 日志说「已恢复 ['live']」，页面却显 `running: false`。
+        # 这正是"看着在跑、其实什么都没接上"，也就是本段注释想防的那种失败。
         started = live_api.start_enabled_schedulers()
         print(f"[ok] 每日调度：已恢复 {started or '（没有账户开启）'}", flush=True)
     except Exception as e:                                        # noqa: BLE001
