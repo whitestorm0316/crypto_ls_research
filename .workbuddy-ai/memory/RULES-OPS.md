@@ -945,33 +945,6 @@ mw_ret_names = pool_mean + excess_select + excess_weight
 
 ---
 
-## 无人值守开关 + 保证金显示（2026-10-10）
-- 🔴 **执行者是控制台自己，不是独立守护进程**（Q49）：控制台双重 fork + `setsid()`、
-  父进程 launchd ⇒ 能长期活着；Web 按钮派生的守护进程**会被进程树回收**（老毛病）。
-  调度器 `webapp/auto_schedule.py` 活在控制台内，**启动时自恢复**（`server.py::main`
-  读开关重建线程），否则"重启一次再也不自动"而页面仍显「已开启」。
-- **必须走和网页按钮同一个作业队列**（`live_api._submit`），不自己调 `execute()`。
-- 🔴 **到点判定是「窗口」不是「阈值」**：`at <= now <= at+10min`，错过**不补**
-  （实测：第一版 `now>=at`，15:25 重启控制台时它立刻拿过期信号跑了一次）。
-  幂等账**只在成功提交后写**；失败要能重试。
-- ⚠️ **「恒到点」的 fixture（`at="00:00"`）在加窗口后落在窗外** ⇒ 连带打红 5 条
-  自己的测试。夹具的"恒真"要跟着语义一起改。
-- **`enabled`（落盘许可位）与 `running`（调度线程活着）是两个量**，页面分开说，派生
-  `will_trade = enabled AND running`。⚠️ 测试须覆盖**四种组合** —— 只测 `(False,False)`
-  会让两者同值 ⇒ **断言恒真**（假守卫，变异抓过）。⚠️ mock 要打**对对象**
-  （`running` 来自 `_REGISTRY`，不是 `auto_ctl`）。**实盘无确认短语闸门**（用户裁定）。
-- 🔴 **默认关，方向承重**：`resolve_auto_enabled` 对非 dict/缺失/类型不对一律 False。
-  **必须 `is True`，不能用真值测试** —— `"false"` 在 Python 里是**真值**，`bool()` 会
-  把开关**静默打开**。
-- **每 tick 重读、排在数据刷新之前** ⇒ 拨开关立即生效，关着时连行情都不刷（**0.0s**）。
-  响应回**落盘后重读**的值（回显掩盖写盘失败）。`auto_config.json` 不与心跳共用。
-- ⚠️ **`Store` 目录是常量 `LIVE_DIR`、无 env 可覆写** ⇒ 测试必须 monkeypatch，否则
-  **改到真实账户上**（我犯过）。
-- ⚠️ **保证金占用 ≠ 持仓名义**（Q47）：`isoEq` vs `Σ notionalUsd`。**只读交易所字段，
-  不折算**（拟合过闭式解，21 条腿对不上）；`imr=mmr=0` 是最便宜的「全是逐仓」证据。
-
----
-
 ## 定时器 / 实盘 opt-in
 🔴 **细节整节在 `RULES-OPS.md`**（`allow_live=False` 硬编码导致实盘起不来、`LABELS/UNITS` 按模式分开、**`launchctl` 不能从沙箱注册**、守卫须早于第一次 `auto_ctl.` 调用）。**2026-10-10 起执行者改为控制台自身**（见下节）。
 
@@ -1007,13 +980,54 @@ mw_ret_names = pool_mean + excess_select + excess_weight
 
 ---
 
-## 无人值守开关（2026-10-10/12）
-- 🔴 **执行者是控制台自己**（双重 fork + `setsid()` ⇒ 长期活着），不是外部守护进程
-  （Web 派生的会被进程树回收）。`webapp/auto_schedule.py`，**启动时自恢复**。
-- **必须走和网页按钮同一个作业队列**（`live_api._submit`），不自己调 `execute()`。
-- 🔴 **到点判定是「窗口」不是「阈值」**：`at <= now <= at+10min`，错过**不补**
-  （实测：第一版 `now>=at`，15:25 重启时立刻拿过期信号跑了一次）。幂等账**只在
-  成功提交后写**；失败要能重试。
-- **`enabled`/`running` 是两个量**，派生 `will_trade`。⚠️ 测试覆盖**四种组合**
-  （只测 `(False,False)` ⇒ 断言恒真）；⚠️ mock 打**对对象**（`_REGISTRY`）。
-- 🔴 **细节（`is True` 不能用真值测试、`LIVE_DIR` 无 env、保证金只读）在 `RULES-OPS.md`。**
+## 两种「回测」：要不要先刷新行情，答案相反（Q52）
+- **研究/验证回测**（`scripts/exp_*.py`、验收基线）**不刷、也不能刷**：读
+  `data_cache/` 的 parquet（`load_panels` **只读盘不拉网**）。回测要**可复现** ——
+  每次跑前拉一次网 = 每次在**不同的**历史上下结论，基线数字立刻不可比。
+  刷新是**独立显式**一步（`data.download` → `asset_class` → `funding_build`），
+  刷完**历史变了、旧数字作废、必须重新基线**。
+- **实盘/纸面的「回测」**（`engine.target()` → `compute_live_target`）**必须先刷新**：
+  它就是**用回测引擎在最新缓存上跑一遍** ⇒ 缓存不新，目标仓就是旧的。
+  这正是 `auto_runner` 用 `refresh → 计划 → 下单` 顺序的原因。
+
+---
+
+## 数据源可切换 / 换交易所（Q40）——**表格全在 `RULES-OPS.md`**
+- **缓存目录唯一来源 = `settings.CACHE_DIR`**（读 `CRYPTO_CACHE_DIR`）；`store.CACHE` 与 `download.CACHE`
+  都**从它派生，不许各自再算一遍**。
+- **`binance_client.klines_range()` 返回与 OKX 同形的 9 列**。最贵的坑是字段映射：
+  **`vol_ccy` ← 基础币量、`amount` ← 计价币额**（`vwap = amount/vol_ccy` 必须是价格量级；写反
+  不报错，只让 vwap 变 ~价格²）。守卫 `test_data_source_switch.py`（11 条）。
+- ⚠️ **`min_avg_amount_usd` 是绝对美元阈值**（币安成交额是 OKX 的 **3.67 倍** ⇒ 同一个 `$3M` 在 OKX 筛出
+  **16** 名、币安 **39** 名）⇒ **换数据源必须先看「有效横截面宽度」**。
+- ⚠️ **比两家价格前先除掉固定面值因子**（`1000PEPEUSDT` 这类**天然 ~1000 倍**）；收益尺度无关。
+- ⚠️ **验收的 1.94 落在 ADV 门槛的尖峰上**（OKX 宇宙 ~16 时 1.942，邻居只有 1.184 / 1.511；币安最高
+  **1.494**）⇒ **1.94 至少部分是 (OKX 数据, 这个阈值) 的组合属性**（**关掉门槛 1.93 → 0.07**）。
+  **"同一份标的清单" ≠ "同一段历史"**（91/131 币安上市更晚）。复现 `binance_backtest.py --selectivity`；
+  ⚠️ 同时持两个场所的 panel 会 OOM ⇒ **用完即 `del` + `gc.collect()`**。
+
+---
+
+## 无人值守 + 通知（Q49–Q51）——**细节整节在 `RULES-OPS.md`**
+- 🔴 **执行者是控制台自己**（双重 fork + `setsid()` ⇒ 长期活着），`webapp/auto_schedule.py`，
+  **启动时自恢复**；**必须走和网页按钮同一个作业队列**。到点判定是**窗口**不是阈值
+  （`at <= now <= at+10min`，错过**不补**）；幂等账**成功后才写**；`enabled`/`running` 是两个
+  量、派生 `will_trade`（⚠️ 测试覆盖**四种组合**、mock 打**对对象**）。
+- 🔴 **通知必须和「执行」一起搬**：`notify_for()` 原本只在 `auto_trader` 里 ⇒ 搬到控制台后
+  **没人发通知**。且 `execute()` 的 `action` 恒为 `"rebalance"`、`notify_on` 认
+  `traded`/`blocked`/`error` ⇒ **必须翻译**；拦截原因填 **`blocked_by`**。
+- 🔴 **`execute()` 返回是嵌套的**（`record`/`summary`/`target`），而格式化器读**扁平**键
+  ⇒ 直接把外层喂进去会让每个字段都 `None`、消息里**全是「—」**（实测）。必须摊平；
+  ⚠️ `n_ok`/`n_fail` 只在 `record` 里。**报数字前先看格式化器读什么键。**
+- ⚠️ **两个毛敞口差一个 NAV 倍**：`target.gross` 是**倍数**（1.36），
+  `record["gross_target"]` 是**USDT 名义额**（226.8）。混用会印出「226.799× NAV」
+  ⇒ **同一句话里出现大得离谱的倍数时，先怀疑单位**。通知带净值/保证金/可用（三行分开）。
+- 🔴 **沙箱代理只在工具调用期间存活**：控制台继承 `HTTP_PROXY=127.0.0.1:<端口>` ⇒ 11:00 无
+  工具调用 ⇒ 端口已关 ⇒ `urlopen` 报 **`Errno 61`**。**订单照下**（走交易所 SDK）⇒
+  "交易成功、通知静默"。修法 `build_opener(ProxyHandler({}))`；⚠️ 断言写「**没有**
+  ProxyHandler」（空的会被扔掉）。
+- ⚠️ **通知结果要落进 `runs.jsonl`**（`runs()` 最新在前 ⇒ 写回要 `reversed()`）；**自检端点
+  必须由控制台进程自己发**（另起进程会走那次调用的代理，掩盖问题）。- 🔴 **模块重复加载**：`import live_api`（顶层名）与 `from webapp import live_api`（包名）
+  是**两个模块对象** ⇒ 线程建在 A、HTTP 读 B。**统一用包路径导入**。
+- **`enabled`/`running` 是两个量**，派生 `will_trade`；⚠️ 测试覆盖**四种组合**、mock 打
+  **对对象**（`_REGISTRY`）。守卫 `test_auto_schedule/test_auto_notify.py`。

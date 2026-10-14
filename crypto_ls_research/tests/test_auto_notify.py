@@ -409,3 +409,122 @@ def test_notify_result_is_written_back_to_the_audit(api, monkeypatch):
         # 没被通知的那条不该被塞字段
         other = next(r for r in rows if r["run_id"] == "r2")
         assert "notify" not in other
+
+# ---------------------------------------------------------------------------
+# 6. 嵌套结构必须摊平（否则通知里全是「—」）
+# ---------------------------------------------------------------------------
+def test_nested_execute_result_is_flattened(api):
+    """🔴 `execute()` 的返回是**嵌套**的，格式化器读的是**扁平**的键。
+
+    2026-10-14 用户收到的消息是「订单 — 笔 → 成交 — · 失败 —」—— 全破折号。
+    原因：我把外层 dict 直接交给 `format_rebalance()`，而数字都在 `record` /
+    `summary` / `target` 里 ⇒ 每个字段都 `None` ⇒ 格式化器一律打「—」。
+
+    ⚠️ 这条断言的是**成品正文里有真数字**，不是"函数被调用了"。只查调用的话，
+    一个"调了但喂错形状"的实现照样绿。
+    """
+    m, sent = api
+    result = {
+        "stage": "sent",
+        "record": {"run_id": "r1", "n_orders": 17, "n_ok": 17, "n_fail": 0,
+                   "nav": 353.47, "turnover_frac": 0.2151,
+                   "decision_ts": "2026-10-14T02:00:00+00:00"},
+        "summary": {"nav": 353.47, "n_orders": 17, "turnover_frac": 0.2151},
+        "target": {"decision_ts": "2026-10-14T02:00:00+00:00", "gross": 1.357},
+        "account": {"nav": 353.47, "gross_notional": 241.0,
+                    "margin": {"margin_used": 254.66, "avail": 102.63,
+                               "margin_frac": 0.72}},
+    }
+    r = m._notify_result("live", result)
+    assert r.get("ok"), f"没推送：{r}"
+    text = sent[0]["text"]
+    # 破折号 = 字段没读到。出现任何一个就说明形状没摊对。
+    assert "订单 — 笔" not in text, f"订单数没摊平：{text!r}"
+    assert "17 笔" in text and "成交 17" in text, f"正文缺订单数：{text!r}"
+    assert "353.47" in text, f"正文缺净值：{text!r}"
+    assert "21.51%" in text, f"正文缺换手：{text!r}"
+    assert "2026-10-14" in text, f"正文缺信号日：{text!r}"
+
+
+def test_notification_carries_nav_and_margin(api):
+    """用户 2026-10-14 要求：净值 + 保证金占用 + 可用余额都要打出来。
+
+    三个数回答三个不同的问题（账户值多少 / 其中多少被锁 / 还能开多少新仓），
+    所以断言三者**同时出现**，且**标签各不相同** —— 合并成一个数就退回 Q47 那个
+    已被记录过的混淆（"页面 $227 vs OKX $246，以为有一个是错的"）。
+    """
+    m, sent = api
+    result = {
+        "stage": "sent",
+        "record": {"run_id": "r1", "n_orders": 1, "n_ok": 1, "n_fail": 0},
+        "summary": {"nav": 353.47, "n_orders": 1},
+        "target": {"decision_ts": "2026-10-14T02:00:00+00:00"},
+        "account": {"nav": 353.47,
+                    "margin": {"margin_used": 254.66, "avail": 102.63,
+                               "margin_frac": 0.72}},
+    }
+    m._notify_result("live", result)
+    text = sent[0]["text"]
+    assert "净值" in text and "353.47" in text
+    assert "保证金占用" in text and "254.66" in text
+    assert "可用余额" in text and "102.63" in text
+    assert "72.00%" in text, f"缺保证金占比：{text!r}"
+
+
+def test_margin_missing_falls_back_with_an_honest_label(api):
+    """取不到保证金明细时退回「持仓名义」，但**必须写清标签**。
+
+    持仓名义与保证金不是同一个量（Q47）。让它冒充保证金，就是把一个已知的
+    混淆重新引入到通知里 —— 而通知是唯一不打开控制台就能看到的地方。
+    """
+    m, sent = api
+    result = {
+        "stage": "sent", "record": {"run_id": "r1", "n_orders": 1, "n_ok": 1},
+        "summary": {"nav": 353.47, "n_orders": 1},
+        "target": {"decision_ts": "2026-10-14T02:00:00+00:00"},
+        "account": {"nav": 353.47, "gross_notional": 241.0,
+                    "margin": {"unavailable": True}},
+    }
+    m._notify_result("live", result)
+    text = sent[0]["text"]
+    assert "持仓名义" in text and "241.00" in text
+    assert "保证金占用" not in text, "取不到保证金却打了这个标签"
+
+def test_gross_exposure_units_are_not_mixed(api):
+    """**两个不同口径的毛敞口不能混。**
+
+    * `target.gross`        = **权重和**（1.357 这样的倍数）
+    * `record["gross_target"]` = **USDT 名义额**（226.8 这种）
+
+    数值差一个 NAV 倍。我第一版把 record 的那个塞进了带「× NAV」标签的字段，
+    于是消息印出 **「目标毛敞口 226.799× NAV」** —— 一个持有 226 倍净值的仓位，
+    任何看到的人都会立刻不信任这条通知。
+    """
+    m, sent = api
+    result = {
+        "stage": "sent", "record": {"run_id": "r1", "n_orders": 1, "n_ok": 1,
+                                    "gross_target": 226.80},
+        "summary": {"nav": 353.47, "n_orders": 1},
+        "target": {"decision_ts": "2026-10-14T02:00:00+00:00", "gross": 1.357},
+        "account": {"nav": 353.47, "margin": {"margin_used": 1.0, "avail": 1.0}},
+    }
+    m._notify_result("live", result)
+    text = sent[0]["text"]
+    assert "1.357× NAV" in text, f"倍数没印对：{text!r}"
+    assert "226.8" not in text.split("实际毛敞口")[0], (
+        f"USDT 名义额被当成倍数印出来了：{text!r}")
+
+    # 只有 USDT 额、没有倍数时，必须标 USDT 而**不是** × NAV
+    result2 = {
+        "stage": "sent", "record": {"run_id": "r2", "n_orders": 1, "n_ok": 1,
+                                    "gross_target": 226.80},
+        "summary": {"nav": 353.47, "n_orders": 1},
+        "target": {"decision_ts": "2026-10-14T02:00:00+00:00"},
+        "account": {"nav": 353.47, "margin": {"unavailable": True}},
+    }
+    sent.clear()
+    m._notify_result("live", result2)
+    t2 = sent[0]["text"]
+    assert "226.80 USDT" in t2, f"应标 USDT：{t2!r}"
+    assert "226.8× NAV" not in t2 and "226.80× NAV" not in t2, (
+        f"USDT 值被标成了 × NAV：{t2!r}")

@@ -136,7 +136,6 @@ def auto_runner(mode: str) -> dict:
 
 
 #: `engine.execute()` 的 `stage` → 通知配置认的 `action`。
-#:
 #: **两个词汇表不一致**，这是第二个独立的缺陷：`notify_on` 认的是
 #: `traded` / `blocked` / `error`（那是 `auto_trader` 的 `action`），而
 #: `engine.execute()` 返回的 `action` 恒为 `"rebalance"`、真正区分结果的是
@@ -178,6 +177,57 @@ def _notifier_now(mode: str):
     return n
 
 
+#: `engine.execute()` 的返回是**嵌套**的：数字在 `record` / `summary` / `target` 里。
+#:
+#: 🔴 2026-10-14 用户收到「订单 — 笔 → 成交 — · 失败 —」—— 全部是破折号。
+#: 原因就是我把**外层 dict** 直接交给了 `format_rebalance()`，而它读的是**扁平**的键
+#: （`n_orders` / `n_ok` / `nav` / `decision_ts`）⇒ 每个字段都 `None` ⇒ 格式化器一律
+#: 打「—」。**这不是格式化器的问题，是我喂错了形状。**
+#:
+#: ⚠️ 两条纪律：
+#:   1. `record` 与 `summary` 都要取，**`n_ok`/`n_fail` 只在 `record` 里**
+#:      （成交数是执行后才有的），`nav` 两处都有。
+#:   2. 报告数字前先看**格式化器读什么键**（同 `blocked_by` 那一脚）。
+def _flatten_result(result: dict, mode: str) -> dict:
+    """把 `execute()` 的嵌套结果摊平成 `format_rebalance()` 认的形状。"""
+    rec = result.get("record") or {}
+    smy = result.get("summary") or {}
+    tgt = result.get("target") or {}
+    out: dict = {
+        "mode": mode,
+        "stage": result.get("stage"),
+        "decision_ts": tgt.get("decision_ts") or rec.get("decision_ts"),
+        "next_decision_ts": tgt.get("next_decision_ts") or rec.get("next_decision_ts"),
+        "nav": smy.get("nav", rec.get("nav")),
+        "n_orders": smy.get("n_orders", rec.get("n_orders")),
+        "n_ok": rec.get("n_ok"),
+        "n_fail": rec.get("n_fail"),
+        "turnover_frac": smy.get("turnover_frac", rec.get("turnover_frac")),
+        "order_notional": smy.get("order_notional", rec.get("order_notional")),
+        "gross_target": rec.get("gross_target"),
+        "gross_realised": rec.get("gross_realised"),
+        # ⚠️ `target.gross` 是**权重和**（≈1.36× NAV 这样的倍数），而
+        # `record["gross_target"]` 是**USDT 名义额**（≈226.8）。两者数值量级
+        # 差 NAV 倍，混用会让消息印出「目标毛敞口 226.799× NAV」这种荒谬的倍数
+        # （实测撞到过）。所以分开两个键，各配各的标签。
+        "target_gross_frac": tgt.get("gross"),
+        "target_gross_usdt": rec.get("gross_target"),
+        "run_id": rec.get("run_id"),
+        "violations": result.get("violations") or [],
+        "errors": rec.get("errors") or [],
+    }
+    # 账户快照（净值/保证金/可用）—— `execute` 不算它，由 `account()` 给。
+    # 通知里带上是为了回答"下完这单账户还剩多少"，而那是每次都要看的数。
+    acct = result.get("account")
+    if not isinstance(acct, dict):
+        try:
+            acct = engine(mode).account()
+        except Exception:                                        # noqa: BLE001
+            acct = {}
+    out["account"] = acct if isinstance(acct, dict) else {}
+    return out
+
+
 def _notify_result(mode: str, result: dict) -> dict:
     """把一次自动执行的产物推给通知通道。
 
@@ -187,9 +237,8 @@ def _notify_result(mode: str, result: dict) -> dict:
     from crypto_ls_research.execution.notify import notify_for
 
     stage = str(result.get("stage") or "")
-    out = dict(result)
+    out = _flatten_result(result, mode)
     out["action"] = _STAGE_TO_ACTION.get(stage, stage or "error")
-    out["mode"] = mode
     # `blocked` 时把拦截原因带进正文，否则收到"被拦截"却不知道被什么拦的。
     # ⚠️ 字段名是 `blocked_by` —— 那是 `format_rebalance()` 实际读的键。
     # 我第一版填的是 `errors`，结果消息里只有「未发送任何订单」、一条原因都没有

@@ -478,8 +478,40 @@ def format_rebalance(out: dict) -> Tuple[str, str]:
         lines.append(f"信号日 {d}（北京）" + (f" · 下次调仓 {nxt}（北京）" if nxt else ""))
     if out.get("nav") is not None:
         lines.append(f"净值 {_f(out['nav'])} USDT")
-    if out.get("target_gross") is not None:
+    # ⚠️ 两个**不同口径**的毛敞口，别混：
+    #   `target_gross_frac` 是**权重和**（1.36 这样的倍数，`LiveTarget.gross`）
+    #   `target_gross_usdt` 是**USDT 名义额**（226.8 这种，`record["gross_target"]`）
+    # 数值差一个 NAV 倍。混用会印出「目标毛敞口 226.799× NAV」这种荒谬倍数
+    # （实测撞到过）—— 所以各配各的标签，而不是共用一个键名。
+    if out.get("target_gross_frac") is not None:
+        lines.append(f"目标毛敞口 {_f(out['target_gross_frac'], 3)}× NAV")
+    elif out.get("target_gross_usdt") is not None:
+        lines.append(f"目标毛敞口 {_f(out['target_gross_usdt'])} USDT")
+    elif out.get("target_gross") is not None:
+        # 向后兼容旧调用方（`auto_trader` 传的是倍数口径）。
         lines.append(f"目标毛敞口 {_f(out['target_gross'], 3)}× NAV")
+
+    # 账户快照：**下完这单之后**还锁着多少、还能动多少。
+    #
+    # 刻意和「净值」分两行而不是合并：净值是**账户值多少**，保证金是**其中多少
+    # 被锁住**，可用是**还能开多少新仓**。三个数回答三个不同的问题，而 Q47 已经
+    # 记录过它们被混为一谈的代价（用户看到页面 $227 / OKX $246 以为有一个是错的）。
+    acct = out.get("account") or {}
+    mgn = acct.get("margin") if isinstance(acct, dict) else None
+    if isinstance(mgn, dict) and not mgn.get("unavailable"):
+        used = mgn.get("margin_used")
+        avail = mgn.get("avail")
+        frac = mgn.get("margin_frac")
+        if used is not None:
+            lines.append(
+                f"保证金占用 {_f(used)} USDT"
+                + (f"（占净值 {_pct(frac)}）" if frac is not None else ""))
+        if avail is not None:
+            lines.append(f"可用余额 {_f(avail)} USDT")
+    elif isinstance(acct, dict) and acct.get("gross_notional") is not None:
+        # 取不到保证金时退回「持仓名义」——它和保证金**不是**同一个量（Q47），
+        # 所以必须写清标签，不能让它冒充保证金。
+        lines.append(f"持仓名义 {_f(acct['gross_notional'])} USDT（未取到保证金明细）")
 
     if action == "traded":
         lines.append(f"订单 {_num(out.get('n_orders'))} 笔 → "
