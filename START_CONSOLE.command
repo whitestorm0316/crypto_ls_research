@@ -84,6 +84,28 @@ echo
 rc=$?
 
 echo
-echo "[exit code $rc]"
+if [ "$rc" = "137" ] || [ "$rc" = "9" ]; then
+  # 🔴 `137 = 128 + 9`（`9` = SIGKILL）⇒ **被 OOM killer 杀了**，不是代码报错。
+  #    这一步只是把"Killed / exit code 137"翻译成人话 —— 否则它看起来像崩溃，
+  #    而实际原因（内存不够）完全看不出来。
+  echo "[exit code $rc] ← 进程被 KILLED（SIGKILL）"
+  echo
+  echo "  这**不是代码报错**，是**内存不够被系统杀掉**（OOM killer）。"
+  echo "  常见触发：点控制台的「⚡ 一键准备（刷新行情＋生成计划）」——"
+  echo "  那一步会跑一次完整回测，峰值约 2.0 GB，加上控制台自身约 2.1 GB。"
+  echo
+  echo "  先确认："
+  echo "    dmesg | grep -i -E 'killed process|out of memory' | tail -5"
+  echo "    free -h"
+  echo
+  echo "  修法（2GB 机器加 4G swap 即可，实测算下来只差 76 MB）："
+  echo "    sudo fallocate -l 4G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=4096"
+  echo "    sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile"
+  echo "    echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab"
+  echo
+  echo "  详见 DEPLOY_LINUX.md 的「4a) 小内存机器」"
+elif [ "$rc" != "0" ]; then
+  echo "[exit code $rc]"
+fi
 read -r -p "按回车键关闭…" _ || true
 exit "$rc"

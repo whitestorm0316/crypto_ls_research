@@ -157,12 +157,19 @@ def load_panels(bar: str, start: str, end: str, insts: Optional[List[str]] = Non
     def wide(field: str) -> pd.DataFrame:
         cols = {i: df[field] for i, df in raw.items() if field in df.columns}
         w = pd.DataFrame(cols)
-        w = w.reindex(grid)
+        # ⚠️ 顺序有讲究（**每步都省一份全量拷贝**）：
+        #   1) 先 **reindex 到 float32 的 frame** —— `DataFrame(cols, index=grid)`
+        #      一步到位，省掉"建 float64 再 reindex"那一份；
+        #   2) `astype` 放在 `dtype=` 里由构造器完成，不再单独复制。
+        # 原写法是 `DataFrame(cols) → reindex(grid) → astype("float32")`，
+        # 三次全量分配（float64 → float64 → float32）。50k×154 下每份 62MB，
+        # 8 个字段就是 ~1.5GB 的瞬时峰值 —— 2GB 机器上直接被 OOM 杀。
+        w = pd.DataFrame(cols, index=grid, dtype="float32")
         # float32 keeps a 50k x 161 panel at ~32 MB per field.  Relative precision is
         # ~1e-7, five orders of magnitude finer than the return granularity we trade,
         # so it cannot move a backtest result -- but it does halve peak memory, which
         # is what lets the parameter sweeps run 4-wide without swapping.
-        return w.astype("float32")
+        return w
 
     panels = {f: wide(f) for f in FIELDS}
     # 🔴 **宽表建完立刻丢 raw**。raw 是 195 只逐帧 DataFrame（实测 ~290 MB），

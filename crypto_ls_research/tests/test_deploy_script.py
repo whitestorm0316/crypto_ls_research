@@ -381,9 +381,14 @@ def test_research_writes_a_log_file():
     # 真跑一次（--quick + 只跑 base，几秒），确认文件真的产生
     import glob
     before = set(glob.glob(os.path.join(ROOT, "logs", "research-*-*.log")))
+    # ⚠️ **`--max-insts 12` 不是凑数**：这条测试要验证的是"日志会落盘"，
+    #    而日志机制与宇宙大小无关。全量（154 只）跑一次要 **105 秒**、
+    #    峰值 ~1.8 GB；12 只只要 **9 秒**。
+    #    实测：不缩的时候，「整个测试文件一起跑」会把 pytest 进程 OOM 杀掉
+    #    （退出码 137，且**没有任何失败信息**，只知道套件突然没了）。
     r = subprocess.run(
         [sys.executable, "-m", "crypto_ls_research.run.research",
-         "--stages", "base", "--tag", "__logtest", "--quick"],
+         "--stages", "base", "--tag", "__logtest", "--max-insts", "12"],
         cwd=ROOT, capture_output=True, text=True, timeout=300)
     assert r.returncode == 0, f"回测没跑通：{r.stdout[-300:]}\n{r.stderr[-300:]}"
     after = set(glob.glob(os.path.join(ROOT, "logs", "research-*-*.log")))
@@ -407,10 +412,18 @@ def test_a_failed_stage_makes_the_process_exit_nonzero():
     （实测过：故意传一个不存在的因子，老代码退出码是 0。）
     """
     import subprocess
+    # ⚠️ 用**不存在的 stage 名**来制造失败，**不要**用"不存在的因子名"。
+    #
+    #   因子名校验发生在 `run_backtest` 里 —— 走到那里说明**面板已经全加载
+    #   完了**（154 只 × 50k bars，峰值 ~1.8 GB）。而这条测试只是想验证
+    #   "失败会非零退出"，不需要为此付一次完整回测的内存。
+    #   实测：旧写法**单跑就把测试进程 OOM 杀掉**（退出码 137）。
+    #
+    #   拼错的 stage 名在**调度循环里**就被发现（`fn is None`），
+    #   0 秒返回、一个面板都不加载。
     r = subprocess.run(
         [sys.executable, "-m", "crypto_ls_research.run.research",
-         "--stages", "base", "--tag", "__failtest",
-         "--override", 'factors.subset=["nope"]'],
+         "--stages", "nosuchstage", "--tag", "__failtest"],
         cwd=ROOT, capture_output=True, text=True, timeout=300)
     assert r.returncode != 0, (
         "回测失败了但退出码是 0 —— 调用者会以为成功")
@@ -486,7 +499,11 @@ from crypto_ls_research.run import research as R
 from crypto_ls_research.backtest.engine import run_backtest
 
 cats = load_categories()
-scoped = sorted(filter_insts(list_cached_insts("1h"), cats, "crypto")[0])
+# ⚠️ **只取 40 只，不用全宇宙**。降不降 float32 会不会改变结果，
+#    40 只 × 50k bars 完全够证明；用 154 只会让这个子进程的峰值
+#    再涨 ~1 GB，而 pytest 主进程的常驻量并不因此变小 ——
+#    实测「测试文件整体跑」时就是这样被 OOM 杀掉（退出码 137）的。
+scoped = sorted(filter_insts(list_cached_insts("1h"), cats, "crypto")[0])[:40]
 if not scoped:
     print("SKIP")
     sys.exit(0)
@@ -503,6 +520,9 @@ for label, dc in (("f32", True), ("f64", False)):
     res = run_backtest(p, R.base_cfg("1h", 24, "2021-01-01", "2026-09-26"))
     b = res.bars
     out[label] = [float(b[c].iloc[-1]) for c in b.columns if b[c].dtype.kind == "f"]
+    # 每次用完就丢：**同一个子进程里要跑两遍**，不丢会叠加
+    del p, res, b
+    import gc; gc.collect()
 print("RESULT " + repr(out))
 ''' % ROOT
     r = subprocess.run([sys.executable, "-c", code], cwd=ROOT,
@@ -515,3 +535,165 @@ print("RESULT " + repr(out))
     d = eval(line[0][len("RESULT "):])          # noqa: S307 - 本地自产
     assert d["f32"] == d["f64"], (
         f"float32 改变了回测结果：\n  f32={d['f32']}\n  f64={d['f64']}")
+
+
+# ---------------------------------------------------------------------------
+# 飞书通知：配置 CLI（2026-10-16：用户问「怎么添加飞书通知来着」）
+# ---------------------------------------------------------------------------
+def test_notify_cli_exists_and_documents_itself():
+    """🔴 `notify.py` 必须能当命令跑（`--set-url` / `--show` / `--test`）。
+
+    为什么重要：`config/notify.json` 被 **gitignore**（里面有 webhook URL，
+    拿到它谁都能往群里发消息）⇒ **每台新机器都要配一次**。
+    如果没有 CLI，用户只能手抄 JSON —— 而模板里还有 `enabled` 忘了改的坑
+    （`--set-url` 会自动写 `enabled: true`，手改很容易漏）。
+
+    `--set-url` / `--set-secret` / `--set-keyword` 都会**写完立刻自检**，
+    所以"配没配对"当场就知道，而不是等下次调仓才发现推不出去。
+    """
+    import pathlib
+    import subprocess
+    src = (pathlib.Path(ROOT) / "crypto_ls_research" / "execution" / "notify.py"
+           ).read_text(encoding="utf-8")
+    for flag in ("--test", "--show", "--set-url", "--set-secret", "--set-keyword"):
+        assert f'"{flag}"' in src, f"notify CLI 少了 {flag}"
+
+    r = subprocess.run(
+        [sys.executable, "-m", "crypto_ls_research.execution.notify", "--help"],
+        cwd=ROOT, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, f"--help 跑不起来：{r.stderr[-300:]}"
+    out = r.stdout + r.stderr
+    for flag in ("--test", "--show", "--set-url", "--set-secret", "--set-keyword"):
+        assert flag in out, f"--help 里没有 {flag}"
+
+
+def test_notify_show_redacts_the_webhook_url():
+    """🔴 `--show` 必须把 URL 打码。
+
+    webhook URL 的**最后一段就是凭据** —— 拿到它就能往群里发任意消息。
+    而 `--show` 的输出很容易被贴进 issue / 聊天记录里求助，
+    所以必须打码，不能图省事原样打出来。
+    """
+    import subprocess
+    r = subprocess.run(
+        [sys.executable, "-m", "crypto_ls_research.execution.notify", "--show"],
+        cwd=ROOT, capture_output=True, text=True, timeout=60)
+    out = r.stdout + r.stderr
+    # 无论本机配没配，都不该出现完整的 hook token
+    import re as _re
+    m = _re.search(r"/hook/([A-Za-z0-9_-]{8,})", out)
+    assert not m, f"--show 泄露了完整 webhook token：{m.group(0)[:60]}"
+
+
+# ---------------------------------------------------------------------------
+# 控制台被 OOM 杀时的提示（2026-10-16：用户点「一键准备」撞的）
+# ---------------------------------------------------------------------------
+def test_start_console_explains_a_sigkill_exit():
+    """🔴 `START_CONSOLE.command` 遇到 `137`/`9` 必须**翻译成人话**。
+
+    `137 = 128 + 9`（`9` = SIGKILL）⇒ 被 OOM killer 杀了，**不是崩溃**。
+    原先脚本只打 `[exit code 137]`，用户看到的是
+    「Killed ... [exit code 137] ... read: read error: 0: Bad file descriptor」
+    —— 完全看不出是内存问题（用户当时的原话就是「啥意思」）。
+
+    ⚠️ **具体的触发点**：控制台的「⚡ 一键准备（刷新行情＋生成计划）」
+    会跑一次完整回测（`target()` 里写着「正在计算信号（复用回测引擎）」），
+    峰值 ~2.0 GB；加上控制台自身 182 MB ≈ **2.1 GB**。
+    """
+    import pathlib
+    src = (pathlib.Path(ROOT) / "START_CONSOLE.command").read_text(encoding="utf-8")
+    assert '"137"' in src and '"9"' in src, "没有识别 SIGKILL 退出码"
+    assert "OOM" in src or "内存" in src, "没有说明真实原因（内存不够）"
+    assert "swap" in src, "没有给出修法（加 swap）"
+    # ⚠️ 不能把正常退出也喷一堆字
+    assert '"$rc" != "0"' in src or '!= "0"' in src, (
+        "没有把「正常退出」与「异常退出」分开 —— 会污染正常启动的输出")
+
+
+def test_deploy_doc_covers_the_console_oom_path():
+    """文档必须提到控制台那条路，不能只讲命令行回测。
+
+    用户是在**控制台**里撞的，而原先文档只写了
+    「回测跑到 panels: ... 戛然而止」那个命令行症状 —— 对不上他的现象。
+    """
+    import pathlib
+    doc = (pathlib.Path(ROOT) / "DEPLOY_LINUX.md").read_text(encoding="utf-8")
+    assert "一键准备" in doc, "没提控制台的「一键准备」这条触发路径"
+    assert "137" in doc, "没提 137 这个退出码"
+    assert "仅刷新行情" in doc, "没说明「仅刷新行情」是安全的（不含回测）"
+
+
+# ---------------------------------------------------------------------------
+# 内存：`wide()` 的拷贝次数（2026-10-16：用户 2GB 机器普通回测也 OOM）
+# ---------------------------------------------------------------------------
+def test_wide_builds_in_one_pass():
+    """🔴 `load_panels().wide()` 必须**一步**建成 float32 宽表。
+
+    原写法是三步，每步都分配一份**全量**矩阵：
+
+        pd.DataFrame(cols)      # float64，62 MB
+          .reindex(grid)        # 又一份 float64，62 MB
+          .astype("float32")    # 再一份 float32，31 MB
+
+    50k × 154 下，8 个字段 × 3 份 ⇒ 瞬时峰值 ~1.5 GB。
+    实测：`load_panels` 之后常驻内存 **973 MB → 555 MB（省 418 MB）**。
+
+    ⚠️ **数值必须逐位不变** —— 已用 40 只 × 50k bars 对拍过
+    （NaN 位置相同、逐位相同、最大差 0.0）。
+    """
+    import pathlib
+    src = (pathlib.Path(ROOT) / "crypto_ls_research" / "data" / "store.py"
+           ).read_text(encoding="utf-8")
+    i = src.find("def wide(field: str)")
+    assert i != -1, "找不到 wide()"
+    body = src[i:i + 1200]
+    # 一步构造：DataFrame(cols, index=grid, dtype="float32")
+    assert "index=grid" in body and 'dtype="float32"' in body, (
+        "wide() 没有一步构造 float32 宽表（仍会做多次全量拷贝）")
+    assert ".reindex(grid)" not in body, (
+        "wide() 里还在 reindex —— 那会多分配一份全量矩阵")
+    assert ".astype(\"float32\")" not in body, (
+        "wide() 里还在单独 astype —— 应由构造器的 dtype= 完成")
+
+
+def test_wide_one_pass_is_bit_identical():
+    """一步构造与三步构造**逐位相同**（这是它敢开着的唯一理由）。"""
+    import subprocess
+    code = '''
+import sys, numpy as np, pandas as pd, os
+sys.path.insert(0, %r)
+from crypto_ls_research.data.asset_class import load_categories, filter_insts
+from crypto_ls_research.data.store import list_cached_insts, _read_one, SECONDS_PER_BAR
+from crypto_ls_research.config.settings import CACHE_DIR
+cats = load_categories()
+scoped = sorted(filter_insts(list_cached_insts("1h"), cats, "crypto")[0])[:40]
+if not scoped:
+    print("SKIP"); sys.exit(0)
+cdir = os.path.join(CACHE_DIR, "candles", "1h")
+raw = {}
+for i in scoped:
+    d = _read_one(os.path.join(cdir, i + ".parquet"))
+    if d is not None:
+        raw[i] = d
+grid = pd.date_range("2021-01-01", "2026-09-26",
+                     freq=pd.Timedelta(seconds=SECONDS_PER_BAR["1h"]),
+                     inclusive="left", tz="UTC")
+cols = {i: d["close"] for i, d in raw.items()}
+old = pd.DataFrame(cols).reindex(grid).astype("float32")
+new = pd.DataFrame(cols, index=grid, dtype="float32")
+a = old.fillna(-1).to_numpy(); b = new.fillna(-1).to_numpy()
+print("RESULT", bool((old.isna() == new.isna()).all().all()), bool((a == b).all()))
+''' % ROOT
+    r = subprocess.run([sys.executable, "-c", code], cwd=ROOT,
+                       capture_output=True, text=True, timeout=300)
+    if "SKIP" in r.stdout:
+        pytest.skip("本机没有 crypto 宇宙的缓存")
+    assert r.returncode == 0, f"跑不动：{r.stderr[-400:]}"
+    line = [l for l in r.stdout.splitlines() if l.startswith("RESULT ")]
+    assert line, f"没拿到结果：{r.stdout[-200:]}"
+    # ⚠️ 打印的是 `RESULT True True`（空格分隔），**不是元组字面量** ——
+    #    第一版写 `eval(...)` 直接 SyntaxError（子进程里报错、测试却只说"跑不动"）。
+    nan_ok, val_ok = (x == "True" for x in
+                      line[0][len("RESULT "):].split())
+    assert nan_ok and val_ok, (
+        f"一步构造与三步构造结果不同：NaN 位置相同={nan_ok} 逐位相同={val_ok}")

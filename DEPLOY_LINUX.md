@@ -95,6 +95,66 @@ cp config/notify.example.json    config/notify.json      # 调仓通知才需要
 
 ---
 
+## 2b) 配飞书通知（调仓时推手机）
+
+⚠️ `config/notify.json` **被 gitignore**（里面有 webhook URL —— 拿到它谁都能往你群里发消息），
+所以每台机器都要配一次。
+
+### 用内置 CLI（推荐，比手改 JSON 稳）
+
+```bash
+# 一行搞定：写 URL + 自动 enabled:true + 立刻发一条测试消息
+python -m crypto_ls_research.execution.notify \
+  --set-url 'https://open.feishu.cn/open-apis/bot/v2/hook/你的hook'
+
+# 看当前状态（URL 自动打码）
+python -m crypto_ls_research.execution.notify --show
+
+# 单发一条测试消息
+python -m crypto_ls_research.execution.notify --test
+```
+
+成功的输出长这样：
+
+```json
+{"ok": true, "status": 200, "provider": "feishu",
+ "resp": "{\"StatusCode\":0,\"StatusMessage\":\"success\",...}"}
+```
+
+`ok: true` 且飞书返回 `success` ⇒ 群里应该已经收到一条「✅ 测试消息」。
+
+### webhook 从哪来
+
+飞书群 → 右上角 **设置** → **群机器人** → **添加机器人** → **自定义机器人** →
+复制 Webhook 地址（形如 `https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx`）。
+
+### 🔴 安全设置必须和配置对上
+
+飞书机器人有三种安全设置，**选错了消息会被拒**：
+
+| 飞书侧设置 | 配置侧要做什么 | 不对上的后果 |
+|---|---|---|
+| **签名校验** | `--set-secret '<密钥>'` | 不带签名 ⇒ 被拒 |
+| **自定义关键词** | `--set-keyword '<那个词>'` | 消息里没这个词 ⇒ **`code 19024`** |
+| **IP 白名单** | 什么都不用填（但要填服务器出口 IP） | IP 不在名单 ⇒ 被拒 |
+
+> ⚠️ 「签名校验」和「自定义关键词 」都不填，而飞书侧却开了——
+> 是最常见的失败原因。`--set-secret` / `--set-keyword` 会写完**立刻自检**，
+> 所以一跑就知道对不对。
+
+### 只推哪些、哪些模式推
+
+`config/notify.json` 里两个数组（CLI 不改这两个，要手编）：
+
+- **`notify_on`**：`traded`（调仓完成）/ `blocked`（风控拦截）/ `error`（出错）。
+  **`not_due`（非调仓日）刻意不推** —— 它每天都发生，推了就没人看了。
+- **`modes`**：默认 `["demo","live"]`。**`paper` 不在里面** —— 纸面账不是真钱，默认不推。
+
+### ⚠️ 改了配置**不用重启控制台**
+
+`Notifier.from_config()` 每次发送时重新读盘，所以改完立即生效
+（有测试守着这条：`test_auto_notify.py`）。
+
 ## 3) 下载行情数据 ← 主体
 
 ```bash
@@ -232,10 +292,37 @@ meta/inst_category.json  OK
 
 ## 4a) ⚠️ 小内存机器（2GB 及以下）：先加 swap
 
-**症状**：回测跑到 `panels: ... bars x ... instruments` 之后**戛然而止**，
-`scripts/rebuild_optimal_baseline.py` 报 **`★ 回测失败（退出码 -9）`**。
+**`-9` / `137` / `Killed` 都是同一件事：SIGKILL —— 被 OOM killer 杀了**，
+**不是代码报错**（所以日志里不会有 traceback）。
 
-**`-9` = SIGKILL = 被 OOM killer 杀了**（不是代码报错）。用 `dmesg` 确认：
+### 三个地方都会撞，因为都跑同一套回测引擎
+
+| 你在做什么 | 报什么 | 峰值内存（实测） |
+|---|---|---|
+| 命令行跑回测 | `退出码 -9`，日志停在 `panels: ...` | **2.19 GB** |
+| 控制台点「⚡ 一键准备」 | `Killed` + `[exit code 137]` | **~2.0 GB** |
+| 控制台点「仅刷新行情」 | 通常没事（只增量下载） | 很小 |
+
+> 🔴 **「一键准备（刷新行情＋生成计划）」= 刷新 + 跑一次完整回测**。
+> 页面自己也写了「首次要跑一次完整回测」。`target()` 里那句提示是
+> 「正在计算信号（**复用回测引擎**，约 40 秒）」。
+> 所以**控制台占 182MB + 回测 1.9GB ≈ 2.1GB** —— 2GB 机器必然被杀。
+
+⚠️ 而且**它不是慢慢泄漏**：实测连算两次，峰值都是 1817 MB（内存会释放）。
+是**单次峰值**就超了。
+
+### 确认是 OOM
+
+```bash
+dmesg | grep -i -E "killed process|out of memory" | tail -5
+free -h
+```
+
+（`START_CONSOLE.command` 里那行
+`line 88: read: read error: 0: Bad file descriptor` **不是错误** ——
+那是进程被杀后脚本还想等你按回车，而终端已经断了。看 `137` 和 `Killed` 就够了。）
+
+### 原来 4a 的症状说明（命令行回测）
 
 ```bash
 dmesg | grep -i -E "killed process|out of memory" | tail -5
@@ -245,11 +332,20 @@ dmesg | grep -i -E "killed process|out of memory" | tail -5
 
 | 宇宙 | `load_panels` 后 | 回测峰值 |
 |---|---|---|
-| 154 只（crypto，全量） | 1.0 GB | **2.0 GB** |
-| 60 只 | 0.6 GB | 1.0 GB |
-| 40 只 | 0.5 GB | 0.8 GB |
+| 154 只（crypto，全量） | **0.55 GB** | **1.76 GB** |
+| 60 只 | ~0.4 GB | ~1.0 GB |
+| 40 只 | ~0.3 GB | ~0.8 GB |
 
-**2GB 机器跑全量宇宙会压线**（峰值 2.0GB vs 物理 2GB），必须加 swap：
+> 这两列是**降过两轮内存之后**的数字（原先是 1.24 GB / 2.19 GB）：
+> ① `_read_one` 读入即转 float32 + `del raw`；
+> ② `wide()` 一步构造成 float32（原先 `DataFrame → reindex → astype`
+>    **三次全量拷贝**，这一项就省了 **418 MB**）。
+> 两轮都验证过**数值逐位不变**。
+
+**2GB 机器仍建议加 swap**（峰值 1.76 GB 已能跑，但没有余量 ——
+控制台同时开着就超了）：
+
+
 
 ```bash
 # 建一个 4G 的 swap 文件（一次性，几分钟）
@@ -267,6 +363,38 @@ free -h && swapon --show
 
 > ⚠️ 用 `fallocate` 在有些文件系统（如某些 overlayfs）上会失败，
 > 那就用 `dd`（慢但一定能成）。见上面的 `||` 分支。
+
+**加 4GB swap 之后够不够？** 算给你看：
+
+```
+控制台 182 MB + 生成计划峰值 1804 MB = 1986 MB
+物理 2048 MB                       → 已经能过（但没余量）
+加 4GB swap 后可用 6144 MB          → 富余 4158 MB ✓
+```
+
+**降完内存后已经能过**，但**没有余量** —— 浏览器多开几个标签页就危险。
+所以还是建议加 swap。
+
+### 或者：跑的时候把控制台停掉腾地方
+
+「生成计划」是按需起子进程跑回测的，所以：
+
+1. 先在控制台点「↻ **仅刷新行情**」（只增量下载，几 MB，几十秒），等它完成 ——
+   这一步不吃内存，**大概率不会死**；
+2. 然后**关掉控制台**（它占 182 MB），在命令行跑一次回测
+   （`--stages base`，或直接 `scripts/rebuild_optimal_baseline.py`）；
+3. 再开控制台，这时信号能从**磁盘缓存**（`signal_cache.json`）直接读，
+   不用重算。
+
+> ✅ 顺带核实过：守护进程的配置（`engine.DEFAULT_SIGNAL`）与验收基线
+> （`spec.OPTIMAL_CLI`）**是同一套** —— 都是 `1h / rebalance_days=1.0 /
+> asset_class=crypto` + 五因子。所以页头那个「已验收最优」与守护进程实际在跑的
+> **口径一致**，不存在"页头说的和实际做的不一样"。
+
+### 「仅刷新行情」会不会也死？
+
+不会 —— 那条路只跑 `data.download --incremental --only-candles --reuse-pool`，
+**不加载面板、不跑回测**，内存占用很小。**放心点。**
 
 加完 swap 后重跑即可 —— **宇宙不变，所以数字仍与验收基线同口径**
 （只是跑到 swap 时会慢一些）。

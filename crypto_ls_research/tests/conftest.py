@@ -94,3 +94,45 @@ def panels() -> Panels:
 @pytest.fixture(scope="session")
 def panels_late_listing() -> Panels:
     return synth_panels(n_inst=10, n_bars=4000, seed=11, first_bar_offset=250)
+
+
+# ---------------------------------------------------------------------------
+# 真跑回测的测试在低内存机器上会 OOM（2026-10-16）
+# ---------------------------------------------------------------------------
+def pytest_configure(config):
+    """给 mark 注册名字，避免 `-W error` 下报 unknown mark。"""
+    config.addinivalue_line(
+        "markers", "heavy: 真加载全量面板 / 真跑回测，内存峰值 ~1.8 GB")
+
+
+@pytest.fixture
+def heavy_ok():
+    """🔴 内存不够时**跳过**重测试，而不是让进程被 OOM 杀掉。
+
+    为什么需要它：`pytest` 是**一个进程跑到底**的 ——
+    某个测试的子进程退出后，**主进程的常驻内存并不退还系统**。
+    实测：`tests/test_deploy_script.py` 里几条真跑回测的测试，
+    单独跑都过（40-105 秒），但**整个文件一起跑就把进程杀了（退出码 137）**。
+    137 的表现是"测试套件突然没了、没有任何失败信息"，非常难查。
+
+    ⚠️ 判断依据是**可用内存**（MemAvailable），不是物理总量 ——
+    容器/swap 场景下后者会误导。
+    """
+    import os
+    need_mb = 2200                       # 实测全量回测峰值 ~1.8 GB + pytest 自身
+    avail = None
+    try:
+        with open("/proc/meminfo") as f:          # Linux
+            mem = {ln.split(":")[0]: ln.split()[1] for ln in f if ":" in ln}
+        for k in ("MemAvailable", "MemFree"):
+            if k in mem:
+                avail = int(mem[k]) // 1024
+                if k == "MemAvailable":
+                    break
+    except OSError:
+        pass
+    if avail is None:
+        return                                # macOS 等：不拦
+    if avail < need_mb:
+        pytest.skip(f"可用内存 {avail} MB < 需要 {need_mb} MB —— 跳过重测试"
+                    f"（否则会被 OOM 杀掉，退出码 137）")

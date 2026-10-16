@@ -1055,3 +1055,98 @@ mw_ret_names = pool_mean + excess_select + excess_weight
   `cp -r tables` 等于没备份。实测覆盖后 5 个回撤窗口立刻失效（W2 −0.1082→−0.1131）且
   **换不回来** ⇒ `rebuild_optimal_baseline.py` **默认拒绝覆盖**（要 `--force`）。
 - ⚠️ **`CRYPTO_CACHE_DIR` 设了就必须两端指同一个**；要两边可比就连 `meta/` 一起拷。
+
+---
+
+## 新机器 / 产物初始化 + 内存（Q58–Q62 细节）
+
+## 新机器 / 产物初始化（Q58–Q60）——**`init_linux.sh` + `DEPLOY_LINUX.md`**
+- 入口 `scripts/init_linux.sh`（幂等）→ `download` → `asset_class --build` → `funding_build`
+  → **5b 重建基线产物**。依赖只有 **numpy/pandas/scipy/matplotlib/seaborn/pytest**。
+  ⚠️ **`data_cache*/`、`artifacts/**`、凭据全被 gitignore** ⇒ 新机器上空的。
+- 🔴 **代理端口写在默认值里**：三个客户端读同一个 `OKX_PROXY`，**默认 `127.0.0.1:7897`**
+  （开发机端口）⇒ 换机器报 **`[Errno 111] Connection refused`**（**看不出是代理问题**）。
+  修法只需 `export OKX_PROXY=...`；空 ⇒ 直连。⚠️ 是**模块导入时**求值 ⇒ **必须 export
+  再起进程**。脚本有**代理体检**。
+- 🔴 **`--end` 默认硬编码 `2026-09-26` 且为排他上界** ⇒ 照默认跑**静静少二十来天、不报错**。
+- 🔴 **页头「基线数据缺失」是必然**（`artifacts/` 不在 git）。重建 **10 秒**：
+  `rebuild_optimal_baseline.py`（只跑 `base`；参数**从 `webapp/spec.py` 派生**）。
+  ⚠️ **`--override` 走 `json.loads`** ⇒ 列表须写 **JSON 数组**；`asset_class` 缺新合约
+  **fail-loud 退出**。
+- 🔴 **重建的数字 ≠ 记录值，不可修复**：① `--end` 被 `load_panels` **刻意忽略**（区间总到
+  "今天"）；② 候选池从「今天的实时挂单」建 ⇒ 9-29→10-16 宇宙 **140→154**、Sharpe
+  **1.9372→1.9688**（用基线 140 只后 **1.9258**）。**记录值只是某时点快照。**
+- 🔴 **别覆盖已验收基线**：`baseline.pkl`(33MB)+`tables/` 是**同一 tag 的两半** ⇒
+  `rebuild_optimal_baseline.py` **默认拒绝覆盖**（要 `--force`）。
+
+---
+
+## 测试约定（细则）
+
+## 测试约定
+- 期望值必须**从 fixture 派生**，别写死；断言用**页面同一格式化器**推导（时区一改就红）。
+- **断言用性质不用秒表**（请求计数 / 定时器 identity / 容器写入次数）；并行化后断言**重数**不断序。
+- pytest 必须 `TMPDIR="$(mktemp -d)"`（撞 root 残留 → 49 error）；**每次独立 TMPDIR**。
+- ⚠️ **解析文本做守卫先确认真的解析到了内容**（按行解析 shell 而调用是**续行**的 ⇒ 参数
+  一个没抓到、注入 `--bogus-flag` 测试全绿）⇒ **先拼续行** + 前提断言；
+  ⚠️ **扫全文件找违规会扫到自己的注释** ⇒ 只看非 `#` 行。
+- ⚠️ **对账断言要用「独立算一遍」的量**：拿 `short_pnl`（本身来自引擎 `name_gross`）去比
+  `bars['short_ret']`，只钉住**区间分组** —— **前向起点挪一根 bar 它不会红**。
+  必须有价格**独立算出**的列（Q43 的 `*_px`）钉**口径**。**变异测试当场抓出过这条假守卫。**
+- 新断言必须变异测试，且**验证「真的注入进去了」**（`src.count(old) == 1`）。用**备份+还原**
+  （`cp`→改→跑→`cp` 回→比 sha256），**不要 `git stash`**；脚本用完移出仓库。
+- 新 helper 要在测试**函数内** import（模块级 import 不存在符号 → 整文件 collection error）。
+- **多进程 sweep 不能从 stdin 跑**（spawn 报 `FileNotFoundError`）→ `n_jobs=1` 或真实文件。
+- `smoke_live.js` MiniDom：`clearClassScope` 子树级失效必须；`#content` 重建要清 `__lastHtml`。
+
+---
+
+## 飞书通知配置（Q63 细节）
+
+## 飞书通知配置（Q63）
+- **`config/notify.json` 被 gitignore**（里面是 webhook URL = 凭据）⇒ **每台机器都要配**。
+- ⭐ **有内置 CLI，不用手改 JSON**：`python -m crypto_ls_research.execution.notify`
+  带 `--show` / `--test` / `--set-url` / `--set-secret` / `--set-keyword`。
+  三个 `--set-*` 都**写完立刻自检**；`--set-url` 会自动写 **`enabled: true`**
+  （手改 JSON 最容易漏这个）。`--show` 的 URL **自动打码**。
+- 🔴 **飞书安全设置必须和配置对上**（最常见的失败）：
+  签名校验 → `--set-secret`；自定义关键词 → `--set-keyword`（不对上 ⇒ **`code 19024`**）；
+  IP 白名单 → 不用填但要填出口 IP。
+- `notify_on` 默认 `traded/blocked/error`（**`not_due` 刻意不推**）；
+  `modes` 默认 `demo/live`（**不含 `paper`**，纸面账不是真钱）。
+- ⚠️ **改配置不用重启控制台**（`from_config()` 每次发送时重读盘）。
+
+## 内存：2GB 机器跑全量回测会被 OOM（Q62）
+- 🔴 **退出码 `-9` = SIGKILL = OOM killer**，**不是代码报错** ⇒ 日志里**没有 traceback**
+  （进程被外部杀）。「**停在某行 + 无 traceback**」本身就是诊断。
+- **实测**（154 只 × 50.7k bars）：`load_panels` 后 **1.24 GB**、峰值 **2.19 GB** ⇒ **2GB
+  机器必然 OOM**。40 只约 0.8 GB、60 只约 1.0 GB。
+- ✅ **降内存（已做，不改变数值）**：`_read_one(downcast=True)` 读进来就转 **float32**
+  （单只 3.25→1.83 MB）；宽表建完 `del raw`。峰值 **2193→1977 MB**。⚠️ 安全的原因：
+  `wide()` 最后本来就 `astype("float32")`，只是把转换**提前**。守卫**真跑两次逐位比**。
+- ✅ **2GB 机器加 swap（4G）而不要缩宇宙** —— 缩宇宙会让 Sharpe 与验收基线不可比，
+  而页头会把它当"当前最优"显示（**谎报**）。`init_linux.sh` 有**内存体检**。
+
+---
+
+## 两种「回测」（Q52 细节）
+
+## 两种「回测」：要不要先刷新行情，答案相反（Q52）
+- **研究/验证回测**（`scripts/exp_*.py`、验收基线）**不刷、也不能刷**：读 `data_cache/` 的
+  parquet（`load_panels` **只读盘不拉网**）。要**可复现** —— 每次跑前拉网 = 每次在**不同的**
+  历史上下结论，基线立刻不可比。刷新是**独立显式**一步，刷完**旧数字作废**。
+- **实盘/纸面的**（`engine.target()`）**必须先刷新**：它是**用回测引擎在最新缓存上跑一遍**
+  ⇒ 缓存不新、目标仓就是旧的（`auto_runner` 的顺序因此是 `refresh → 计划 → 下单`）。
+
+---
+
+## 回测日志 / 失败退出码（Q61 细节）
+
+## 回测日志 / 失败退出码（Q61）——细节在 `DEPLOY_LINUX.md`
+- 🔴 **原先不写任何日志文件**（76 个 `print()` 全去 stdout）⇒「失败了去哪看日志」
+  **没有答案**。⭐ 现在 `--log` **默认开**（`logs/research-<tag>-<时间戳>.log`）。
+- 🔴 **阶段失败原先退出码是 0** ⇒ `init_linux.sh`/CI/`cmd && next` 把**失败当成功**，
+  而产物只写了一半。现在收集 `failed` 列表、收尾 `sys.exit(1)` + `### FAILED stages`。
+- ⚠️ **改完 `.py` 第一件事是 `ast.parse`**（我 Edit 时把两行粘成一行，靠它抓到）。
+- ⚠️ 临时看日志用 `... 2>&1 | tee logs/x.log`（**必须 tee**）。
+
