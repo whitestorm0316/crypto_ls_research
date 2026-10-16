@@ -359,3 +359,78 @@ python -m crypto_ls_research.execution.auto_ctl --stop --mode demo
 2. **守护进程无法由 AI 代为常驻**：任何从工具调用里 spawn 的进程会在该调用
    返回时被整个进程树回收，`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP |
    CREATE_BREAKAWAY_FROM_JOB` 全无效。**必须双击脚本，或由定时器/常驻进程派生。**
+
+## 九、登录 · 二重认证 · 外网访问（2026-10-16）
+
+### 为什么加
+
+控制台原来**没有任何鉴权**。它绑在 `127.0.0.1` 上，"只有本机能访问"被当成了
+安全边界 —— 但那是**本机进程之间没有边界**。同一台机器上任何一个进程
+（浏览器里的任意网页、你随手跑的一个脚本、一个装错包的 CLI）都能：
+
+```
+POST /api/live/execute      # 下真钱单
+GET  /api/live/creds        # 读走 OKX API key 的掩码信息
+POST /api/live/flatten      # 一键平掉全部仓位
+```
+
+### 怎么用
+
+**第一次**：打开页面 → 会自动进"首次设置" → 填用户名 + 口令（≥8 位）→
+页面显示**一串 TOTP 密钥** → 用 Google Authenticator / 1Password / Authy
+扫码或手输 → 之后每次登录都是「口令 + 6 位码」两步。
+
+> ⚠️ 那串密钥**只显示一次**。丢了只能删 `config/auth.json` 重建账号。
+> 验证器 App 里的条目名是 `LS 交易台:<用户名>`。
+
+**本机访问（默认）**：什么都不用设，`python -m webapp.server 8790`。
+
+**外网访问**：必须先有证书，否则服务**拒绝启动**：
+
+```bash
+# 1) 自签证书（浏览器会报"不安全"，手工确认一次即可）
+openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
+  -keyout ls-key.pem -out ls-cert.pem -subj '/CN=<你的域名或IP>'
+
+# 2) 启动
+./scripts/START_CONSOLE_TLS.sh          # 或：
+LS_HOST=0.0.0.0 LS_TLS_CERT=ls-cert.pem LS_TLS_KEY=ls-key.pem \
+  python -m webapp.server 8790
+```
+
+### 五条设计约束（每条都对应一种具体的伤害）
+
+| 约束 | 不做会怎样 |
+|---|---|
+| **闸门在唯一入口**（`do_GET/POST/DELETE` 开头），不在各端点里 | 散着做一定会漏一个，而漏的那个可能是 `/api/live/execute` |
+| **白名单，不是黑名单**（`_PUBLIC_API`） | 新端点默认"要登录"。黑名单漏加 = 一个静默的、能下单的洞 |
+| **未登录回 JSON 401 + `need_login`**，不是 302 | 前端一律 `resp.json()`，HTML 重定向页会抛 `Unexpected token '<'`，真因全被藏住 |
+| **TOTP 拒重放**（记已用过的步数） | 一个被肩窥/截获的码在那 30 秒内可反复使用 —— 而那正是二重认证唯一要防的窗口 |
+| **明文绑非本机 ⇒ 拒绝启动** | 口令和 TOTP 码明文过网，而登进来能下真钱单。"警告后继续"拦不住任何人 |
+
+### 其他细节
+
+* **口令**：`scrypt`（n=2^14），每账号独立 salt，串自描述参数（调参不用迁移）；
+  比较用 `hmac.compare_digest`，不用 `==`（`==` 会短路 ⇒ 时序侧信道）。
+* **会话**：`secrets.token_urlsafe(32)`，**只存哈希**（文件被读走也拿不到活 token）；
+  固定 8 小时绝对过期，**不滑动续期**（滑动 = "一直在用就永不过期" = 无限）。
+* **Cookie**：`HttpOnly` + `SameSite=Strict`（挡 CSRF）+ **仅 TLS 下加 `Secure`**
+  （明文加 `Secure` 会让浏览器丢 Cookie，本机开发永远登不上）。
+* **节流**：连续 5 次失败锁 5 分钟。
+* **两步票据**：口令过了只发一张 120 秒的**一次性**票据；
+  没有它，二重认证会被降级成单因子（拿到口令直接调 `?step=2`）。
+* **落盘**：`config/auth.json`（0600，原子替换），已在 `.gitignore`。
+
+### 测试
+
+`crypto_ls_research/tests/test_auth.py`（34 条 / 变异 10/10）+
+`test_console_api_contract.py` 里两条顺序守卫。关键几条：
+
+* TOTP 对 **RFC 6238 六组官方向量**；
+* **枚举 `live_api.py` 里所有路径，逐个断言未登录 401**（手抄清单会漂移）；
+* 未登录时"存在"与"不存在"的路径回**同一个** 401（否则是一条枚举通道）。
+
+⚠️ 冒烟测试现在需要凭据：
+```bash
+LS_TEST_USER=<用户名> LS_TEST_PASSWORD=<口令> node scripts/smoke_live.js
+```

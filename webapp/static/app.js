@@ -173,6 +173,12 @@ const fmt = {
 async function boot() {
   try {
     const r = await fetch('/api/spec');
+    if (r.status === 401) {
+      // 会话在 boot 之前过期了。**不能说"无法连接本地服务"** —— 服务是好的，
+      // 只是要重新登录。把用户送回登录页是唯一正确的动作。
+      authRender();
+      return;
+    }
     const d = await r.json();
     S.spec = d.spec; S.presets = d.presets; S.bundles = d.bundles;
     S.lib = d.lib_defaults || {}; S.baseline = d.baseline; S.optimalTag = d.optimal_tag;
@@ -2079,6 +2085,12 @@ async function liveApi(path, opts) {
   // `fetch` 不因 4xx/5xx reject，所以形状必须自己校验，不能只看 r.ok。
   if (d == null || typeof d !== 'object') {
     throw new Error(`${path} 返回的不是 JSON（HTTP ${r.status}）`);
+  }
+  // 会话过期：**回登录页**，不要把它当成一个业务错误显示。
+  // 否则用户看到的是"交易台加载失败"，而真正该做的是重新登录。
+  if (r.status === 401 && (d.need_login || d.need_setup)) {
+    authRender();
+    throw new Error('会话已过期，请重新登录');
   }
   if (!r.ok && !d.error) throw new Error(`${path} HTTP ${r.status}`);
   return d;
@@ -4023,4 +4035,178 @@ function liveExport() {
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
 }
 
-boot();
+
+/* ===========================================================================
+ * 登录 / 首次设置 —— 在 boot() 之前跑
+ * ===========================================================================
+ * 服务端**默认拒绝**一切 /api/（见 server.py::_gate），所以这里是唯一的入口：
+ * 没登录就不该渲染任何业务界面，否则用户会看到一堆 401 报错卡片。
+ *
+ * 两个容易做错的地方：
+ *   1. 401 必须**当返回值处理**，不能让它冒泡成"无法连接本地服务" ——
+ *      那会让人以为服务挂了，去重启一个本来好好的进程。
+ *   2. TOTP 密钥**只在创建那一次**回显。之后再也拿不到，所以界面上必须
+ *      提醒用户当场存下来；刷新一下就没了。
+ */
+async function authFetch(path, body) {
+  const opt = body === undefined
+    ? { credentials: 'same-origin' }
+    : { method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body) };
+  const r = await fetch(path, opt);
+  let d = null;
+  try { d = await r.json(); } catch (e) { d = { error: '服务端返回的不是 JSON' }; }
+  return { status: r.status, d };
+}
+
+function authShell(inner) {
+  return `<div style="max-width:420px;margin:8vh auto;padding:0 16px">
+    <div class="banner" style="display:block">
+      <h2 style="margin:0 0 4px">LS 交易台</h2>
+      <p class="muted" style="margin:0 0 14px;font-size:12px">
+        横截面市场中性 · 需登录</p>
+      ${inner}
+    </div></div>`;
+}
+
+function authErr(msg) {
+  return msg ? `<div class="s" style="color:var(--danger);margin-top:8px">${esc(msg)}</div>` : '';
+}
+
+async function authRender() {
+  const { d } = await authFetch('/api/auth/status');
+  const c = $('#content');
+  if (d && d.authed) { boot(); return; }
+  if (d && !d.configured) return authSetup();
+  authLogin(d && d.locked_for);
+}
+
+function authBind(id, fn) {
+  const el = $(id);
+  if (!el) return;
+  el.addEventListener('click', fn);
+  const inp = el.closest('div').querySelectorAll('input');
+  inp.forEach((i) => i.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') fn();
+  }));
+}
+
+function authLogin(lockedFor) {
+  $('#content').innerHTML = authShell(`
+    <label style="display:block"><span class="muted" style="font-size:11.5px">用户名</span>
+      <input id="auName" class="liveinput" style="width:100%" autocomplete="username"></label>
+    <label style="display:block;margin-top:10px"><span class="muted" style="font-size:11.5px">口令</span>
+      <input id="auPw" class="liveinput" type="password" style="width:100%"
+             autocomplete="current-password"></label>
+    <div id="auStep2" style="display:none;margin-top:10px">
+      <span class="muted" style="font-size:11.5px">验证器 6 位码</span>
+      <input id="auCode" class="liveinput" inputmode="numeric" maxlength="6"
+             placeholder="000000" autocomplete="one-time-code" style="width:100%">
+    </div>
+    <div class="row" style="margin-top:14px">
+      <button class="btn primary" id="auGo" style="width:100%">登录</button>
+    </div>
+    <div id="auMsg">${authErr(lockedFor > 0
+      ? `失败次数过多，请 ${Math.ceil(lockedFor)} 秒后再试` : '')}</div>
+    <p class="muted" style="font-size:11.5px;margin-top:12px">
+      两步：先口令，再验证器上的 6 位码。</p>`);
+
+  let ticket = null;
+  const go = async () => {
+    const name = $('#auName').value.trim();
+    const pw = $('#auPw').value;
+    const msg = $('#auMsg');
+    try {
+      if (ticket === null) {
+        const { d } = await authFetch('/api/auth/login', { user: name, password: pw });
+        if (d.step === 2) {
+          ticket = d.ticket;
+          $('#auStep2').style.display = '';
+          $('#auCode').focus();
+          msg.innerHTML = authErr('');
+          $('#auGo').textContent = '验证';
+          return;
+        }
+        msg.innerHTML = authErr(d.error || '登录失败');
+        return;
+      }
+      const { d } = await authFetch('/api/auth/verify',
+        { ticket, code: $('#auCode').value.trim() });
+      if (d.ok) { location.reload(); return; }
+      msg.innerHTML = authErr(d.error || '验证失败');
+      // 票据是一次性的：失败就退回第一步重来，否则用户会一直卡在这里
+      if (d.error && d.error.indexOf('票据') >= 0) {
+        ticket = null;
+        $('#auStep2').style.display = 'none';
+        $('#auGo').textContent = '登录';
+      }
+    } catch (e) { msg.innerHTML = authErr(String(e)); }
+  };
+  authBind('#auGo', go);
+  $('#auName').focus();
+}
+
+function authSetup() {
+  $('#content').innerHTML = authShell(`
+    <p style="margin:0 0 12px"><b>首次使用，先建一个账号。</b></p>
+    <label style="display:block"><span class="muted" style="font-size:11.5px">用户名</span>
+      <input id="auName" class="liveinput" style="width:100%" autocomplete="username"></label>
+    <label style="display:block;margin-top:10px"><span class="muted" style="font-size:11.5px">
+      口令（至少 8 位）</span>
+      <input id="auPw" class="liveinput" type="password" style="width:100%"
+             autocomplete="new-password"></label>
+    <label style="display:block;margin-top:10px"><span class="muted" style="font-size:11.5px">
+      再输一次</span>
+      <input id="auPw2" class="liveinput" type="password" style="width:100%"
+             autocomplete="new-password"></label>
+    <div class="row" style="margin-top:14px">
+      <button class="btn primary" id="auGo" style="width:100%">创建账号</button>
+    </div>
+    <div id="auMsg"></div>`);
+
+  authBind('#auGo', async () => {
+    const msg = $('#auMsg');
+    const name = $('#auName').value.trim();
+    const pw = $('#auPw').value, pw2 = $('#auPw2').value;
+    if (pw !== pw2) { msg.innerHTML = authErr('两次输入的口令不一致'); return; }
+    const { d } = await authFetch('/api/auth/setup', { user: name, password: pw });
+    if (!d.ok) { msg.innerHTML = authErr(d.error || '创建失败'); return; }
+    authShowSecret(name, d.secret, d.otpauth);
+  });
+  $('#auName').focus();
+}
+
+function authShowSecret(name, secret, otpauth) {
+  /* ⚠️ 密钥**只在这里显示这一次**（服务端之后不再返回）。
+   * 二维码用 otpauth:// 文本 + 前端现画太容易出兼容问题，所以给三条路：
+   * 手输密钥 / 点链接 / 复制。最重要的是"当场存下来"这句话要显眼。 */
+  const grouped = secret.replace(/(.{4})/g, '$1 ').trim();
+  $('#content').innerHTML = authShell(`
+    <p style="margin:0 0 10px"><b>账号已创建。</b>现在绑定验证器。</p>
+    <ol style="margin:0 0 12px 18px;padding:0;font-size:12.5px;line-height:1.7">
+      <li>打开 Google Authenticator / 1Password / Authy</li>
+      <li>选「手动输入密钥」，用户名填 <b>${esc(name)}</b></li>
+      <li>把下面这串密钥粘进去</li>
+    </ol>
+    <div class="mono" style="word-break:break-all;background:var(--bg2,#f5f5f5);
+         padding:10px;border-radius:6px;font-size:13px">${esc(grouped)}</div>
+    <div class="row" style="margin-top:10px;gap:8px">
+      <button class="btn sm" id="auCopy">复制密钥</button>
+      <a class="btn sm ghost" href="${esc(otpauth)}">在验证器里打开</a>
+    </div>
+    <p style="color:var(--danger);font-size:12px;margin-top:12px">
+      ⚠️ 这串密钥只显示这一次。丢了就登不进来（只能删掉 config/auth.json 重建）。</p>
+    <div class="row" style="margin-top:14px">
+      <button class="btn primary" id="auDone" style="width:100%">我已绑定，去登录</button>
+    </div>`);
+  authBind('#auCopy', async () => {
+    try { await navigator.clipboard.writeText(secret); $('#auCopy').textContent = '已复制'; }
+    catch (e) { $('#auCopy').textContent = '请手动复制'; }
+  });
+  authBind('#auDone', () => authRender());
+}
+
+// ⚠️ 入口换成 authRender：它先问「登没登」，登录后才 boot()。
+// 直接调 boot() 会让未登录时整页都是 401 错误卡片。
+authRender();

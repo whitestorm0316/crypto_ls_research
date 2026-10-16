@@ -30,6 +30,7 @@ from spec import (  # noqa: E402
     build_run_args, check_traps,
 )
 import trades  # noqa: E402
+import auth  # noqa: E402
 
 # ⚠️ **`live_api` 必须只有一份，且用包路径导入。**
 #
@@ -549,11 +550,202 @@ def _execute(run_id):
 # ---------------------------------------------------------------------------
 # HTTP
 # ---------------------------------------------------------------------------
+#: 不需要登录就能访问的路径。**白名单**，不是黑名单 ——
+#: 新增端点默认是"要登录"的，忘了加白名单只会让页面暂时登不上；
+#: 反过来（默认放行）则是一个静默的、能下单的洞。
+#:
+#: `/api/auth/*` 是登录流程本身；根路径与静态资源必须放行，否则登录页自己
+#: 都加载不出来。
+#:
+#: 🔴 **路径要和 `index.html` 实际请求的一致。** 我第一版写的是 `/app.js` /
+#: `/style.css`，而页面里写的是 **`/static/app.js`** / **`/static/style.css`**
+#: ⇒ 登录页的 CSS/JS 全被 401 挡掉，浏览器里只剩一具没有样式的空壳，
+#: 表现为"页面打不开"而控制台日志一切正常（2026-10-16 用户就是这么撞上的）。
+#: 现在用**前缀** `/static/`，并且用测试从 `index.html` 里**抓**引用的路径来对账。
+_PUBLIC_STATIC_PREFIX = ("/static/",)
+_PUBLIC_STATIC = ("/", "/index.html", "/favicon.ico")
+
+#: 登录流程本身的白名单（都在 `/api/` 下）。
+_PUBLIC_API = (
+    "/api/auth/status",
+    "/api/auth/setup",
+    "/api/auth/login",
+    "/api/auth/verify",
+    "/api/auth/logout",
+)
+
+AUTH = auth.AuthStore()
+LOGIN = auth.LoginFlow()
+SESSION_COOKIE = "ls_session"
+
+
+def _client_is_local(addr) -> bool:
+    """请求是不是来自本机。用于"只在 HTTPS 下放行外网"那类判断。"""
+    try:
+        return (addr or ("", 0))[0] in ("127.0.0.1", "::1", "localhost")
+    except (TypeError, IndexError):
+        return False
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "ls-console/1.0"
 
     def log_message(self, *a):                                   # noqa: D102
         pass
+
+    # -- auth --------------------------------------------------------------
+    def _cookie_token(self) -> Optional[str]:
+        raw = self.headers.get("Cookie") or ""
+        for part in raw.split(";"):
+            k, _, v = part.strip().partition("=")
+            if k == SESSION_COOKIE:
+                return v or None
+        return None
+
+    def _authed(self) -> bool:
+        return AUTH.resolve_session(self._cookie_token())
+
+    def _cookie(self, token: str, *, clear: bool = False) -> str:
+        """会话 Cookie。
+
+        `HttpOnly` 挡住 XSS 读走 token；`SameSite=Strict` 挡住**跨站请求伪造**
+        （否则你打开任意一个网页，它就能悄悄替你 POST 一次下单）；
+        `Secure` 只在 TLS 下加 —— 明文 HTTP 上加 Secure 会让浏览器直接丢掉
+        Cookie，于是**本机开发时永远登不上**（一个"安全设置导致功能全废"的典型）。
+        """
+        v = "" if clear else token
+        attrs = [f"{SESSION_COOKIE}={v}", "Path=/", "HttpOnly", "SameSite=Strict",
+                 f"Max-Age={0 if clear else auth.SESSION_TTL}"]
+        if getattr(self.server, "tls", False):
+            attrs.append("Secure")
+        return "; ".join(attrs)
+
+    def _needs_auth(self, path: str) -> bool:
+        """这个请求要不要先登录？**默认要。**"""
+        if not path.startswith("/api/"):
+            # 静态资源放行（登录页自己要用）。
+            # ⚠️ 用**前缀**匹配 `/static/`，不要逐条列举文件名 ——
+            # 列举就会和 `index.html` 里实际写的路径漂移（我第一版列的是
+            # `/app.js`，而页面请求的是 `/static/app.js`，结果登录页的 JS 被挡）。
+            if any(path.startswith(p) for p in _PUBLIC_STATIC_PREFIX):
+                return False
+            return path not in _PUBLIC_STATIC
+        return not any(path == p or path.startswith(p + "/")
+                       for p in _PUBLIC_API)
+
+    # -- auth routes -------------------------------------------------------
+    def _auth_route(self, path: str, body: dict):
+        """`/api/auth/*` 的所有处理。**每个分支都写清它信什么、不信什么。**"""
+        act = path[len("/api/auth/"):]
+
+        if act == "status":
+            # 公开。**只回"有没有配好"和"我登没登"** —— 不回用户名、不回任何
+            # 可用于缩小搜索空间的东西。
+            return self._json({
+                "configured": AUTH.is_configured(),
+                "authed": self._authed(),
+                "locked_for": round(AUTH.locked_for(), 1),
+                "user": (AUTH.user().get("name") if self._authed() else None),
+            })
+
+        if act == "setup":
+            # 首次设置：**只在还没账号时可用**。
+            if AUTH.is_configured():
+                return self._err(409, "账号已存在")
+            name = str(body.get("user") or "").strip()
+            pw = str(body.get("password") or "")
+            try:
+                secret = AUTH.create_user(name, pw)
+            except ValueError as e:
+                return self._err(400, str(e))
+            # TOTP 密钥**只在这一刻**回给浏览器（让用户扫进验证器）。
+            # 之后任何接口都不再返回它。
+            return self._json({
+                "ok": True,
+                "user": name,
+                "secret": secret,
+                "otpauth": auth.otpauth_url(secret, name, "LS 交易台"),
+                "hint": "用验证器 App 扫这个链接（或手输密钥），然后把 6 位码填进来",
+            })
+
+        if act == "login":
+            # 第一步：口令。**过了只发一张短命票据，不发会话。**
+            locked = AUTH.locked_for()
+            if locked > 0:
+                return self._err(429, f"失败次数过多，请 {int(locked)} 秒后再试",
+                                 locked_for=round(locked, 1))
+            name = str(body.get("user") or "")
+            pw = str(body.get("password") or "")
+            u = AUTH.user()
+            # 用户名和口令**一起**判定，且失败回同一句话：分别报"用户不存在"
+            # 会给出一条枚举用户名的路径。
+            if not (u.get("name") == name and auth.verify_password(pw, u.get("pw"))):
+                st = AUTH.note_fail()
+                return self._err(401, "用户名或口令不对", locked_for=round(
+                    st.get("locked_for", 0.0), 1))
+            return self._json({"ok": True, "step": 2,
+                               "ticket": LOGIN.start(u.get("name")),
+                               "hint": "请输入验证器上的 6 位码"})
+
+        if act == "verify":
+            # 第二步：TOTP。票据是一次性的，**claim 之后立刻作废**。
+            pending = LOGIN.claim(str(body.get("ticket") or ""))
+            if not pending:
+                return self._err(401, "票据无效或已过期，请重新输入口令")
+            u = AUTH.user()
+            # 用过的"步数"从盘上读进来（跨请求、跨重启都有效），验完再把
+            # 新用掉的那几个写回去。⚠️ 只在**成功**时写：失败的尝试不该
+            # 消耗掉一个合法码的位置。
+            used = AUTH.totp_used()
+            ok, why = auth.verify_totp(u.get("totp") or "",
+                                       str(body.get("code") or ""), used=used)
+            if not ok:
+                AUTH.note_fail()
+                return self._err(401, f"验证码错误（{why}）")
+            for c in used:
+                AUTH.remember_totp(c)
+            AUTH.note_ok()
+            tok = AUTH.new_session(self.headers.get("User-Agent") or "")
+            return self._json({"ok": True, "user": u.get("name")},
+                              cookies=[self._cookie(tok)])
+
+        if act == "logout":
+            AUTH.drop_session(self._cookie_token())
+            return self._json({"ok": True}, cookies=[self._cookie("", clear=True)])
+
+        return self._err(404, "not found")
+
+    def _gate(self) -> bool:
+        """返回 True = 已放行。False = 已经回了响应，调用方必须立刻 return。"""
+        path = urlparse(self.path).path
+
+        # 静态资源**永远**放行，与"有没有建账号""登没登录"都无关。
+        #
+        # 🔴 这条分支原本被漏掉了：`not AUTH.is_configured()` 那一支**自己又写了
+        # 一遍白名单判断**（`path in _PUBLIC_STATIC`），而它只认文件名、不认
+        # `/static/` 前缀 ⇒ 首次使用（还没建账号）时 `/static/app.js` 回 401 ⇒
+        # 页面的 JS 根本加载不出来 ⇒ 屏幕上只有一具空壳，**连"创建账号"按钮都没有**。
+        # （2026-10-16 用户截图报的就是这个。）
+        #
+        # 教训：同一条规则写两遍，两遍就会不一致。现在只留 `_needs_auth` 一处定义，
+        # 下面两个分支都问它。
+        if not self._needs_auth(path):
+            return True
+
+        if not AUTH.is_configured():
+            # 还没建账号：只允许走首次设置流程，别的一律挡掉并告诉前端去设置。
+            if path in ("/api/auth/status", "/api/auth/setup"):
+                return True
+            self._err(401, "尚未创建账号", need_setup=True)
+            return False
+
+        if self._authed():
+            return True
+        # ⚠️ 回 **JSON 401**，不是 302 重定向：前端一律 `resp.json()`，
+        # 一个 HTML 重定向页会让它抛 `Unexpected token '<'`，而真正的原因
+        # （没登录）被完全藏住 —— 这是本仓库已经踩过一次的同类坑。
+        self._err(401, "未登录或会话已过期", need_login=True)
+        return False
 
     # -- plumbing ----------------------------------------------------------
     def _send(self, code, body: bytes, ctype="application/json; charset=utf-8"):
@@ -567,9 +759,25 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
-    def _json(self, obj, code=200):
-        self._send(code, json.dumps(sanitize(obj), ensure_ascii=False,
-                                    allow_nan=False).encode("utf-8"))
+    def _json(self, obj, code=200, cookies: Optional[list] = None):
+        """`cookies` 用来在**同一个响应**里下达/清除会话 Cookie。
+
+        刻意不另开一个 `_json_with_headers`：登录成功必须"回 JSON + 种 Cookie"
+        原子发生，分成两步容易出现"发了 Cookie 却没回 body"这类半成品。
+        """
+        body = json.dumps(sanitize(obj), ensure_ascii=False,
+                          allow_nan=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        for c in (cookies or []):
+            self.send_header("Set-Cookie", c)
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _err(self, code, msg, **extra):
         self._json({"error": msg, **extra}, code)
@@ -606,6 +814,10 @@ class Handler(BaseHTTPRequestHandler):
         return super().send_error(code, message, explain)
 
     def do_GET(self):                                            # noqa: N802
+        # ⚠️ 鉴权在**唯一的入口**做，不散在每个端点里 —— 散着做一定会漏掉一个，
+        # 而漏掉的那个很可能是 `/api/live/execute`。
+        if not self._gate():
+            return
         u = urlparse(self.path)
         q = parse_qs(u.query)
         p = u.path
@@ -687,6 +899,9 @@ class Handler(BaseHTTPRequestHandler):
                                  else "no equity for " + tag, pending=pending)
             if p.startswith("/api/trades/"):
                 return self._trades(p, q)
+            if p == "/api/auth/status":
+                # 公开（白名单），前端用它决定显示"登录页"还是"首次设置页"。
+                return self._auth_route(p, {})
             if p.startswith("/api/live"):
                 r = live_api.route_get(p, q)
                 if r is not None:
@@ -704,6 +919,10 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def do_POST(self):                                           # noqa: N802
+        # ⚠️ 鉴权在**唯一的入口**做，不散在每个端点里 —— 散着做一定会漏掉一个，
+        # 而漏掉的那个很可能是 `/api/live/execute`。
+        if not self._gate():
+            return
         u = urlparse(self.path)
         try:
             n = int(self.headers.get("Content-Length") or 0)
@@ -711,6 +930,8 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return self._err(400, "bad json")
         try:
+            if u.path.startswith("/api/auth/"):
+                return self._auth_route(u.path, body)
             if u.path == "/api/check":
                 return self._json({"warnings": check_traps(
                     body.get("overrides") or {}, body.get("cli") or {})})
@@ -738,6 +959,10 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     def do_DELETE(self):                                         # noqa: N802
+        # ⚠️ 鉴权在**唯一的入口**做，不散在每个端点里 —— 散着做一定会漏掉一个，
+        # 而漏掉的那个很可能是 `/api/live/execute`。
+        if not self._gate():
+            return
         u = urlparse(self.path)
         try:
             if u.path.startswith("/api/runs/"):
@@ -1155,10 +1380,69 @@ def main():
         print(f"[!!] 每日调度启动失败（控制台仍可用）：{type(e).__name__}: {e}",
               flush=True)
 
-    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"[ok] console on http://127.0.0.1:{port}", flush=True)
+    host, tls_ctx = _resolve_bind(port)
+    srv = ThreadingHTTPServer((host, port), Handler)
+    # 处理器读它决定要不要给 Cookie 加 `Secure`（只在 TLS 下加）。
+    srv.tls = tls_ctx is not None
+    if tls_ctx is not None:
+        srv.socket = tls_ctx.wrap_socket(srv.socket, server_side=True)
+    scheme = "https" if srv.tls else "http"
+    print(f"[ok] console on {scheme}://{host}:{port}", flush=True)
     print(f"[ok] project root: {ROOT}", flush=True)
+    if host not in ("127.0.0.1", "::1"):
+        print(f"[!!] 正在监听 **{host}** —— 可从本机之外访问。"
+              f"确认防火墙/安全组只放行你需要的来源。", flush=True)
     srv.serve_forever()
+
+
+def _resolve_bind(port: int):
+    """监听地址 + TLS 上下文。**明文绑定到非本机一律拒绝启动。**
+
+    为什么这条要硬拒、而不是打个警告
+    --------------------------------
+    口令和 TOTP 码都要经这条连接传。明文 HTTP 在局域网上是**直接可读**的，
+    而这里登进去之后能做的是**下真钱单**。一个"点了继续"的警告框拦不住任何人，
+    真正的结果是：有一天真的把口令发在明文里了。
+
+    所以规则是：
+      * 默认 `127.0.0.1`（只有本机）—— 明文可以，别人碰不到。
+      * 想绑别的地址（`0.0.0.0` / 具体 IP / 域名）就必须**同时**给证书。
+      * 没证书又绑外网 ⇒ **直接 sys.exit**，并说清两条出路。
+
+    证书从环境变量给（别把私钥写进仓库）：
+      LS_TLS_CERT / LS_TLS_KEY  —— PEM 路径
+    """
+    host = os.environ.get("LS_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    cert = os.environ.get("LS_TLS_CERT")
+    key = os.environ.get("LS_TLS_KEY")
+
+    is_local = host in ("127.0.0.1", "::1", "localhost")
+    if is_local and not cert:
+        return host, None                      # 本机明文：可以
+
+    if not (cert and key):
+        sys.exit(
+            f"\n[拒绝启动] LS_HOST={host} 但没给 TLS 证书。\n\n"
+            f"  口令与二重认证码会**明文**经过这条连接，而登进来能下真钱单。\n"
+            f"  两条出路：\n"
+            f"    1) 只有本机用 —— 不要设 LS_HOST（默认 127.0.0.1）；\n"
+            f"    2) 要从外面访问 —— 生成自签证书：\n"
+            f"         openssl req -x509 -newkey rsa:2048 -nodes -days 825 \\\n"
+            f"           -keyout ls-key.pem -out ls-cert.pem -subj '/CN=<你的域名或IP>'\n"
+            f"       然后：\n"
+            f"         LS_HOST={host} LS_TLS_CERT=ls-cert.pem LS_TLS_KEY=ls-key.pem \\\n"
+            f"           python -m webapp.server {port}\n\n"
+            f"  ⚠️ 自签证书浏览器会报「不安全」——那是**预期**的，手工确认一次即可。\n"
+            f"     想要浏览器不报警就得用真域名 + Let's Encrypt（需要公网可达）。\n")
+
+    import ssl
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2          # 1.0/1.1 已不安全
+    try:
+        ctx.load_cert_chain(cert, key)
+    except (OSError, ssl.SSLError) as e:
+        sys.exit(f"[拒绝启动] 证书加载失败（{cert} / {key}）：{e}")
+    return host, ctx
 
 
 if __name__ == "__main__":

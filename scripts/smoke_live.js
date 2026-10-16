@@ -456,12 +456,29 @@ sandbox.globalThis = sandbox;
 sandbox.self = sandbox;
 
 const realFetch = globalThis.fetch;
-sandbox.fetch = (u, o) => realFetch(String(u).startsWith('/') ? BASE + u : u, o);
+/* 页面内的 fetch 也要带会话 cookie，否则渲染阶段仍是一路 401。
+ * ⚠️ 必须在展开成 BASE 之前注入 —— `sandbox.fetch` 会给相对路径补 BASE。 */
+sandbox.fetch = function (u, o) {
+  const url = String(u).startsWith('/') ? BASE + u : u;
+  const opt = Object.assign({}, o);
+  if (AUTH_COOKIE) {
+    opt.headers = Object.assign({}, (o && o.headers) || {},
+                                { Cookie: AUTH_COOKIE });
+  }
+  return realFetch(url, opt);
+};
 
 /* ---------------- 执行真实源码 ---------------- */
 let src = fs.readFileSync(APP, 'utf8');
-if (!/\nboot\(\);\s*$/.test(src)) throw new Error('app.js 末尾的 boot() 调用没找到，stub 需要更新');
-src = src.replace(/\nboot\(\);\s*$/, '\n');
+/* 入口是 `authRender()`（先问注册/登录，再 boot）。**先钉住它存在**，
+ * 否则一个"被删掉入口"的 app.js 会让所有断言在空跑中通过。 */
+if (!/\nauthRender\(\);\s*$/.test(src)) {
+  throw new Error('app.js 末尾的 authRender() 调用没找到，stub 需要更新');
+}
+src = src.replace(/\nauthRender\(\);\s*$/, '\n');
+/* 把 authRender 换成空实现：smoke 测的是**登录之后的界面**，
+ * 这里没有真后端，让它去 fetch /api/auth/status 只会拿到 undefined。 */
+src += '\n;globalThis.__authStub = true;\n';
 src += `
 ;globalThis.__T = { S, fmt, esc, applyPreset, renderContent, liveSkeleton, livePaintAll,
   liveModeHtml, liveAcctHtml, liveSignalHtml, liveGatesHtml, livePlanHtml, liveJobHtml,
@@ -490,9 +507,55 @@ vm.createContext(sandbox);
 vm.runInContext(src, sandbox, { filename: 'app.js' });
 const T = sandbox.__T;
 
+/* ---------------- 鉴权（2026-10-16 起服务端默认拒绝一切 /api/） ----------------
+ * 冒烟测的是**登录之后**的界面，所以得先真的登一次，而不是把鉴权绕过去。
+ * 凭据从环境变量来；没给的话用 LAB 账号 —— 它由 `--ensure-test-user` 建。
+ *
+ * ⚠️ **不要**在这里硬编码一个会话 token：那会让"鉴权坏了"这件事测不出来。
+ */
+let AUTH_COOKIE = null;
+
+async function authLogin() {
+  const user = process.env.LS_TEST_USER || '';
+  const pw = process.env.LS_TEST_PASSWORD || '';
+  const st = await realFetch(BASE + '/api/auth/status').then((r) => r.json());
+  if (!st.configured) {
+    throw new Error(
+      '控制台还没建账号 —— 先打开页面做首次设置，或设 LS_TEST_USER/LS_TEST_PASSWORD 后重跑');
+  }
+  if (!user || !pw) {
+    throw new Error(
+      '控制台已启用登录：请设 LS_TEST_USER 与 LS_TEST_PASSWORD 再跑冒烟测试');
+  }
+  const r1 = await realFetch(BASE + '/api/auth/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user, password: pw }),
+  }).then((r) => r.json());
+  if (!r1.ticket) throw new Error('登录第一步失败：' + (r1.error || '未知'));
+  // TOTP：冒烟测试跑在**同一台机器**上，可以直接从服务端的密钥算码。
+  // 这是唯一一处允许读密钥的地方，且只在测试进程内。
+  const { execFileSync } = require('child_process');
+  const py = [
+    'import sys;sys.path.insert(0,sys.argv[1])',
+    'from webapp.auth import AuthStore,totp_at',
+    'print(totp_at(AuthStore().user()["totp"]))',
+  ].join(';');
+  const code = execFileSync(process.env.PY || 'python3', ['-c', py,
+    require('path').resolve(__dirname, '..')], { encoding: 'utf8' }).trim();
+  const res = await realFetch(BASE + '/api/auth/verify', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ticket: r1.ticket, code }),
+  });
+  const sc = res.headers.get('set-cookie') || '';
+  const m = sc.match(/ls_session=[^;]+/);
+  if (!m) throw new Error('登录第二阶段没拿到会话 cookie');
+  AUTH_COOKIE = m[0];
+}
+
 /* ---------------- 断言工具 ---------------- */
 async function getJson(p) {
-  const r = await realFetch(BASE + p);
+  const opt = AUTH_COOKIE ? { headers: { Cookie: AUTH_COOKIE } } : {};
+  const r = await realFetch(BASE + p, opt);
   if (!r.ok) throw new Error(`${p} -> HTTP ${r.status}`);
   return r.json();
 }
@@ -517,6 +580,7 @@ function region(id) {
 const LOADING = ['正在读取…', '正在读取账户…'];
 
 (async () => {
+  await authLogin();
   const spec = await getJson('/api/spec');
   const meta = await getJson('/api/live/meta');
   const status = await getJson('/api/live/status?mode=paper');

@@ -1031,3 +1031,136 @@ mw_ret_names = pool_mean + excess_select + excess_weight
   是**两个模块对象** ⇒ 线程建在 A、HTTP 读 B。**统一用包路径导入**。
 - **`enabled`/`running` 是两个量**，派生 `will_trade`；⚠️ 测试覆盖**四种组合**、mock 打
   **对对象**（`_REGISTRY`）。守卫 `test_auto_schedule/test_auto_notify.py`。
+
+---
+
+## 无人值守 + 通知（Q49–Q53）——**细节整节在 `RULES-OPS.md`**
+- 🔴 **开关默认关、必须 `is True`**（`resolve_auto_enabled`；`"false"` 在 Python 里是**真值**，
+  `bool()` 会**静默打开**它）。⚠️ **`Store` 目录是常量 `LIVE_DIR`、无 env** ⇒ 测试须
+  monkeypatch，否则**改到真实账户上**。⚠️ **保证金 ≠ 持仓名义**（`isoEq` vs `Σ notionalUsd`）。
+- 🔴 **执行者是控制台自己**（`webapp/auto_schedule.py`，**启动时自恢复**）；**必须走和网页
+  按钮同一个作业队列**。到点判定是**窗口**不是阈值、错过**不补**；幂等账**成功后才写**。
+  `enabled`/`running` 是两个量、派生 `will_trade`（⚠️ 测试覆盖**四种组合**、mock 打**对对象**）。
+- 🔴 **通知要和「执行」一起搬**，且**翻译** `stage`→`action`（`execute()` 的 `action` 恒为
+  `"rebalance"`）；拦截原因填 **`blocked_by`**。⚠️ **`execute()` 返回是嵌套的**而格式化器读
+  **扁平**键 ⇒ 直接喂外层会让消息**全是「—」**（实测）。**报数字前先看格式化器读什么键。**
+- ⚠️ **两个毛敞口差一个 NAV 倍**：`target.gross` 是**倍数**、`record["gross_target"]` 是**USDT**。
+  混用印出「226.799× NAV」⇒ **倍数大得离谱时先怀疑单位**。（通知带净值/保证金/可用，三行分开）
+- 🔴 **沙箱代理只在工具调用期间存活**：控制台继承 `HTTP_PROXY` ⇒ 11:00 无工具调用时 `urlopen`
+  报 **`Errno 61`**，而**订单照下**（走交易所 SDK）⇒ "交易成功、通知静默"。修法
+  `build_opener(ProxyHandler({}))`。⚠️ **通知结果落进 `runs.jsonl`**（写回要 `reversed()`）。
+- 🔴 **模块重复加载**：`import live_api`（顶层名）与 `from webapp import live_api`（包名）是
+  **两个模块对象** ⇒ 线程建在 A、HTTP 读 B。**统一用包路径导入**；**自检端点须由控制台
+  进程自己发**。
+
+---
+
+## 控制台 / 启动脚本（Q39）
+- ⚠️ **`/api/` 错误必须是 JSON**：`BaseHTTPRequestHandler` 对**没实现的方法**回 `501 + HTML`
+  ⇒ 前端 `resp.json()` 抛 `Unexpected token '<'`，**根因全被藏住**。`server.py::send_error()`
+  已覆盖（**只**对 `/api/`）。⚠️ 旧进程 `GET` 全正常，**只有新方法回 501**。
+  守卫 `test_console_api_contract.py`。
+- **`fmt.dol` 两位小数**；例外是**真·亚分钱**（`|v|<0.005` 用有效数字，`$0.00` 会假装"这是零"）。
+  ⚠️ **负号在 `$` 前**（`-$1,234.50`）⇒ 先排绝对值再补符号；`-0` 仍是 `$0.00`。
+- ⚠️ 写启动/变异脚本三坑（细节 `RULES-OPS.md`）：`.command` 选解释器要验**能 import
+  numpy/pandas**；bash **`$VAR（` 吞全角括号** ⇒ 紧跟非 ASCII 写 `${VAR}`；**变异脚本还原放
+  `finally`** + 首尾打 sha。
+
+---
+
+## 保证金模式：单源常量 `settings.MARGIN_MODE` = **`isolated`**（2026-09-30 定案）
+- **两次决定，理由不同、都成立**：① **频率** —— 逐仓每腿 `1/L − mmr`（3× **32.8%**），全仓
+  `(1 − mmr·G)/G`（`G=0.43` → **231%**），任意 `L≥1,G≤1` 下**全仓 ≥ 逐仓**；② **偿付** ——
+  **空头亏损无上限**，全仓下单合约暴涨打爆**整个账户**（实测最脆弱那条 **30.7 倍**）。
+  **选了偿付**：全仓更不易被强平但一爆是全部；逐仓封顶在那条腿但常被强平。
+- 🔴 **模式必须和杠杆一起动**：逐仓距离就是 `1/L − mmr` ⇒ 实测强平频率（K=10/年，上界）
+  **3× → 29.5 次**、2× → 10.1、**1× → 1.0** ⇒ **按 1× 跑**。代价**不随流动性下降** ⇒
+  **换宇宙解决不了**。
+- **唯一来源 = 常量**：`td_mode` **只读**（赋值抛异常）、构造传冲突值抛错、`/api/live/*` 冲突回 **400**、
+  控制台**只读展示**且**标签从服务端值派生**（写死会在常量翻转时显示**相反**的模式）、运行记录带它。
+  **不许第二份可写副本。** ⚠️ **测试里的「冲突值」必须派生**（`_OTHER_MODE`）：写死会让测试
+  在常量翻转后**不再测试任何东西却依然全绿**。
+- ⚠️ **杠杆是账户级配置 `(instId, mgnMode, posSide)`，订单不带**；`set-leverage` 四坑
+  （缺 `posSide`→400、`batch-`→404、每合约两方向各一次、**回读延迟 ~60s**）。
+  🔴 **`positions[].lever` 是配置镜像、会滞后撒谎** —— **报杠杆前必须从 `liqPx` 反推**
+  （`L = 1/(dist+mmr)`）。已因此误报过一次「ETH short 20×」（实为 1.01×）。
+- ⚠️ **闸门假设必须显式**：`RiskConfig.leverage_in_force`（**不是上限**，上限在 `LiveLimits`）；
+  公式**仍是逐仓口径** ⇒ 它是**波动率筛选**、不是偿付约束；改它会**移动验收 Sharpe**。
+  对账 `margin_headroom_violations()` → `status()["margin_headroom"]`（**warn 不 block**）。
+  守卫 `test_margin_mode.py`（**28 条 / 变异 4/5，第 5 条刻意不抓**）。
+- 🔴 **Q44（只诊断，未修）：`account()` 的 `cur_sz` 跨模式求和**（`engine.py:472` 不分 `mgnMode`），
+  而 `Plan.td_mode` 是**整个 plan 的单一值** ⇒ 引擎按**两腿之和**下单、订单只动一种腿 ⇒
+  ① 另一种腿**永久冻结** ② `tgt < 该腿量` 时**被拒单**（`sell/long` 不能开空），永不收敛。
+  **改它 = 改下单量，需授权。**
+
+---
+
+## 鉴权 / 二重认证 / 外网访问（Q54 细节，2026-10-16）
+
+从 `MEMORY.md` 下沉。**加鉴权解决的首先不是"外网风险"，而是本机越权**：
+控制台原本绑 `127.0.0.1` 且**零鉴权**，而"只有本机能访问"被当成了安全边界 ——
+但那是本机**进程之间没有边界**。同机任何进程都能 `POST /api/live/execute` 下真钱单、
+`GET /api/live/creds` 读 key、`POST /api/live/flatten` 一键平仓。
+
+### 模块与接口
+- `webapp/auth.py`（**纯标准库**，无第三方依赖）：
+  - `hash_password` / `verify_password` —— `hashlib.scrypt`，串
+    `scrypt$n$r$p$salt$hash` **自描述**（调参不迁移）；比较用 `hmac.compare_digest`。
+  - `totp_at` / `verify_totp` / `new_totp_secret` / `otpauth_url` —— 手写 RFC 6238
+    （30s / 6 位 / SHA1），**对过 6 组官方向量**。`window=1`（±30s）；
+    传 `used` 集合即启用**重放防护**（记已用步数，落盘只留最近 20 个）。
+  - `AuthStore` —— `is_configured / create_user / new_session / resolve_session /
+    drop_session / drop_all_sessions / note_fail / note_ok / locked_for`。
+    文件 `config/auth.json`，**0600**，临时文件 + `os.replace` 原子替换。
+  - `LoginFlow` —— 两步登录之间的**一次性**票据，TTL 120s，`claim()` 用 `pop`。
+- `webapp/server.py`：
+  - `_PUBLIC_API`（白名单）/ `_PUBLIC_STATIC`
+  - `Handler._gate()` —— 挂在 `do_GET` / `do_POST` / `do_DELETE` **开头**
+  - `Handler._auth_route()` —— `/api/auth/{status,setup,login,verify,logout}`
+  - `_resolve_bind()` —— 监听地址 + TLS；**明文绑非本机直接 `sys.exit`**
+  - `_cookie()` —— `HttpOnly` + `SameSite=Strict` + **仅 TLS 下** `Secure`
+- `scripts/START_CONSOLE_TLS.sh` —— 外网启动脚本（缺证书就报错退出）
+
+### 参数
+| 项 | 值 | 说明 |
+|---|---|---|
+| scrypt | n=2^14, r=8, p=1 | 约 50–100ms/次 |
+| TOTP | 30s / 6 位 / SHA1 / window=1 | 与 Google Authenticator 等一致 |
+| 会话 TTL | 8 小时，**不滑动** | 滑动 = "一直在用就永不过期" |
+| 节流 | 5 次失败锁 300s | `MAX_FAILS` / `LOCKOUT_SEC` |
+| 票据 TTL | 120 秒 | 口令过 → TOTP 提交 |
+| TLS 环境变量 | `LS_HOST` / `LS_TLS_CERT` / `LS_TLS_KEY` | 私钥别进仓库 |
+
+### 踩过的坑
+1. 🔴 **`ROOT` 从别的文件抄会多爬一级**。`crypto_ls_research/execution/credentials.py`
+   在根下**两层**（`dirname(dirname(__file__))` + `".."`），而 `webapp/auth.py` 只在
+   **一层**。照搬 ⇒ `AUTH_FILE` 落到 `~/code/config/auth.json`（仓库**外面**）：
+   `.gitignore` 管不到、删仓库里的文件删不掉账号、换 clone 后"登录不上"无线索。
+   守卫：`test_auth_file_lives_inside_the_repo` + `test_auth_file_is_gitignored`
+   （后者用 `git check-ignore` **实查规则**，不是看 .gitignore 里有没有那行字）。
+2. ⚠️ **`==` 与 `compare_digest` 行为完全相同** ⇒ 任何只验 True/False 的测试都抓不到
+   替换。必须**断言语义**（`inspect.getsource` 里有 `compare_digest`），且要**精确到
+   具体那一处**（文件里有两处用它，泛泛地查函数里有它会漏）。
+3. ⚠️ **`_read()` 有两条"读不到"的路径**：`except`（OSError/ValueError）与
+   `else {}`（**类型不对**）。只测前者 ⇒ 把后者改成"返回假账号"测试仍全绿。
+   两条各要一条用例。
+4. ⚠️ **闸门在路由之前** ⇒ 未登录时"存在"与"不存在"的路径必须回**同一个** 401，
+   否则是一条**枚举端点**的通道（`test_unauthenticated_gets_401_not_404`）。
+5. ⚠️ 未登录回 **JSON 401 + `need_login`**，不是 302 重定向：前端一律 `resp.json()`，
+   HTML 重定向页会抛 `Unexpected token '<'`、真因全被藏住（同 Q39 那条）。
+6. ⚠️ **`Secure` 只在 TLS 下加**：明文加它浏览器会丢 Cookie ⇒ 本机开发永远登不上
+   （一个"安全设置把功能全废"的典型）。两种情形都实测过。
+7. ⚠️ **冒烟 stub 会断言 app.js 结尾** —— 入口从 `boot()` 换成 `authRender()` 后
+   直接抛错（错误消息自己写了"stub 需要更新"）。冒烟现需
+   `LS_TEST_USER` / `LS_TEST_PASSWORD`，且**真走登录**而不是绕过鉴权。
+
+---
+
+## 订单方向（Q44 细节）
+
+## 订单方向（踩过最贵的一脚）
+- `long_short_mode`：**`posSide` = 动哪个仓、`side` = 方向**。加多 `buy/long`、减多
+  `sell/long`、**加空 `sell/short`、减空 `buy/short`**；flip = 两腿。
+- `_orders_for_instrument` 曾用 `abs(tgt)-abs(cur)` 推 `side`，**丢符号** → 加空腿全变买入、**静默**
+  （订单被接受、计划正常，仓位反向走）。实测 demo 多头 **92.0%** vs 目标 **47.6%** ⇒
+  **成交记录不能当策略演练**。修法 `d = tgt_sz - cur_sz`；守卫 `test_order_sides.py`。
