@@ -22,6 +22,11 @@ cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
 PY="${PY:-python3}"
 
+# 代理：三个客户端（okx/binance/okx_private）都从**这一个变量**读。默认 7897
+# 是本机那台的端口；换机器必须显式给，否则表现为"网络不通"（实为代理端口错）。
+# 允许 `OKX_PROXY=` 显式置空 ⇒ 直连（服务器上常需要）。
+export OKX_PROXY="${OKX_PROXY-http://127.0.0.1:7897}"
+
 QUICK=0
 CHECK_ONLY=0
 for a in "$@"; do
@@ -68,6 +73,56 @@ if missing:
     raise SystemExit(1)
 print("  依赖齐全 OK")
 PYCHK
+
+# ---------------------------------------------------------------------------
+step "0b/6  代理体检（**先查再下**，否则会跑到第 2 步才 stack trace）"
+# ---------------------------------------------------------------------------
+# 🔴 三个客户端（`okx_client` / `binance_client` / `okx_private`）都从**同一个**
+#    环境变量 `OKX_PROXY` 读代理，**默认 `http://127.0.0.1:7897`**。
+#    换一台机器、代理端口不同（常见 7890）⇒ 到达交易所前先被本机代理拒掉，
+#    报的是 `URLError: [Errno 111] Connection refused` 或 `[Errno 61]` ——
+#    那个错**看不出是代理问题**，只像是"网络不通"。
+#
+# ⚠️ `DEFAULT_PROXY` 是**模块导入时**读一次的，所以必须在**启动子进程之前**
+#    把环境变量设好；进程起来之后再 export 没用。
+PROBE="$("$PY" - "$OKX_PROXY" <<'PYCHK' 2>/dev/null || true
+import socket, sys, urllib.parse
+raw = (sys.argv[1] if len(sys.argv) > 1 else "") or ""
+u = urllib.parse.urlparse(raw if "://" in raw else f"http://{raw}")
+if not u.hostname:
+    print("noproxy"); raise SystemExit(0)
+try:
+    s = socket.create_connection((u.hostname, u.port or 7890), timeout=3); s.close()
+    print(f"ok {u.hostname}:{u.port}")
+except Exception as e:
+    print(f"dead {u.hostname}:{u.port} {type(e).__name__}")
+PYCHK
+)"
+case "$PROBE" in
+  ok*)    ok "代理可达：${PROBE#ok }" ;;
+  noproxy)
+    warn "OKX_PROXY 为空 ⇒ 走**直连**。如果这台机器直连不通 OKX，下载会失败"
+    echo "     要挂代理：export OKX_PROXY=http://127.0.0.1:7890" ;;
+  *)
+    echo
+    echo "  ★ 代理连不上：${PROBE#dead }"
+    echo "    三个客户端都读同一个 \`OKX_PROXY\`（默认 127.0.0.1:7897），"
+    echo "    但你这台机器的代理端口不是这个 —— 这就是那个"
+    echo "    \`URLError: [Errno 111] Connection refused\` 的成因。"
+    echo
+    echo "    改法（**不用改代码**，先 export 再跑）："
+    echo "      export OKX_PROXY=http://127.0.0.1:7890      # 换成你的端口"
+    echo "      ./scripts/init_linux.sh"
+    echo
+    echo "    或者直接直连（服务器上通常走不通交易所，但先试这个）："
+    echo "      OKX_PROXY= ./scripts/init_linux.sh"
+    echo
+    if [ "$CHECK_ONLY" != "1" ]; then
+      echo "    先确认端口对不对：ss -ltnp | grep -E '789[0-9]|1080'"
+      exit 1
+    fi
+    ;;
+esac
 
 # ---------------------------------------------------------------------------
 step "1/6  凭据（不碰仓库，只在本地 config/）"

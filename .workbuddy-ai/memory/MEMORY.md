@@ -1,8 +1,8 @@
 # 项目长期约定 — crypto_ls_research
 
 > **只放规则**（会踩错的、必须照做的）。长推导/表格在 `RULES-OPS.md`（**不注入**）；
-> 数字在 `FINDINGS.md` 与日志 `<日期>.md`。⚠️ **注入上限 ~17.2 KB**：**加东西必须等量
-> 压掉**（细则写 `RULES-OPS.md`），加完 `wc -c` 复核、**超 16.5 KB 再压**。
+> 数字在 `FINDINGS.md` 与日志 `<日期>.md`。⚠️ **上限 ~17.2 KB**：**加东西必须等量压掉**
+> （细则写 `RULES-OPS.md`），加完 `wc -c` 复核。
 
 ## 环境 / 沙箱 / 进程
 - Python：`~/.workbuddy-ai/binaries/python/envs/default/bin/python`。
@@ -162,6 +162,12 @@
   两端指同一个**，否则"下的和读的不是一份"。
 - ⚠️ **OKX 的 USDT 永续约六成是代币化股票/商品**（实测 crypto 283 / equity 186 / commodity 8）
   ⇒ `asset_class --build` 不能省。
+- 🔴 **代理端口写在默认值里**：三个客户端（`okx_client`/`binance_client`/`okx_private`）
+  都读同一个 `OKX_PROXY`，**默认 `127.0.0.1:7897`**（开发机的端口）⇒ 换机器报
+  **`[Errno 111] Connection refused`**（**看不出是代理问题**，只像"网络不通"）。
+  修法只需 `export OKX_PROXY=...`，**不用改代码**；`OKX_PROXY=`（空）⇒ 直连。
+  ⚠️ `DEFAULT_PROXY` 是**模块导入时**求值 ⇒ **必须 export 再起进程**。脚本有**代理体检**
+  （排在下载之前，不通就 exit 1 并说清改哪里）。
 
 ## 测试约定
 - 期望值必须**从 fixture 派生**，别写死；断言用**页面同一格式化器**推导（时区一改就红）。

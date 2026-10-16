@@ -153,3 +153,71 @@ def test_the_script_documents_the_survivorship_caveat():
     assert "候选池" in src and ("survivorship" in src.lower()
                                 or "实时挂单" in src), (
         "脚本里没提候选池是从今天的实时挂单建的 ⇒ 跨机器结论不可比")
+
+
+# ---------------------------------------------------------------------------
+# 代理（2026-10-16：新机器上第一次跑就撞了 `Errno 111 Connection refused`）
+# ---------------------------------------------------------------------------
+def test_script_exports_the_proxy_variable():
+    """🔴 `init_linux.sh` 必须 `export OKX_PROXY`。
+
+    三个客户端（`okx_client` / `binance_client` / `okx_private`）都从**这一个**
+    环境变量读代理，默认 `http://127.0.0.1:7897`。换台机器代理端口不同（常见
+    7890）就会在到达交易所之前被本机代理拒掉，报的是
+    `URLError: [Errno 111] Connection refused` —— 那个错**看不出是代理问题**。
+
+    ⚠️ 必须是 `export` 而不只是赋值：脚本是用子进程跑 `python -m ...` 的，
+    没 export 的话子进程读不到（`DEFAULT_PROXY` 是**模块导入时**读的，
+    所以还得在启动子进程**之前**就设好）。
+    """
+    src = _script_text()
+    assert re.search(r"^\s*export\s+OKX_PROXY=", src, re.M), (
+        "脚本没有 `export OKX_PROXY=...` —— 子进程读不到代理设置")
+
+
+def test_script_has_a_proxy_preflight_before_downloading():
+    """必须**先体检代理**再开始下载。"""
+    src = _script_text()
+    # 代理体检必须在 download 调用之前出现
+    i_probe = src.find("代理体检")
+    i_dl = src.find("crypto_ls_research.data.download")
+    assert i_probe != -1, "脚本里没有代理体检步骤"
+    assert i_dl != -1, "脚本里没有 download 调用"
+    assert i_probe < i_dl, (
+        "代理体检排在下载之后 —— 那就会先撞 stack trace 再报代理问题")
+
+
+def test_clients_all_read_the_same_proxy_variable():
+    """🔴 三个客户端读**同一个**变量名。
+
+    名字不一致的话，改一个端口要改三处，而漏掉的那处只会在换源（binance）
+    或实盘下单时才炸 —— 那时已经在下载/交易途中了。
+    """
+    import pathlib
+    repo = pathlib.Path(ROOT)
+    files = {
+        "okx_client": repo / "crypto_ls_research/data/okx_client.py",
+        "binance_client": repo / "crypto_ls_research/data/binance_client.py",
+        "okx_private": repo / "crypto_ls_research/execution/okx_private.py",
+    }
+    for name, p in files.items():
+        src = p.read_text(encoding="utf-8")
+        assert 'os.environ.get("OKX_PROXY"' in src, (
+            f"{name} 没读 `OKX_PROXY` —— 换机器时它会用错的代理端口")
+
+
+def test_empty_proxy_means_direct_connection():
+    """置空 `OKX_PROXY` ⇒ 直连（服务器上常需要），不能被当成"用空代理"。"""
+    import subprocess
+    code = (
+        "import sys; sys.path.insert(0, %r);"
+        "from crypto_ls_research.data.okx_client import DEFAULT_PROXY;"
+        "print(repr(DEFAULT_PROXY))" % ROOT
+    )
+    env = {k: v for k, v in os.environ.items() if not k.startswith("OKX_")}
+    env["OKX_PROXY"] = ""          # 显式空
+    r = subprocess.run([sys.executable, "-c", code], cwd=ROOT, env=env,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stderr[-300:]
+    assert r.stdout.strip() == "''", (
+        f"OKX_PROXY='' 应得到空代理（→ 直连），实得 {r.stdout.strip()}")

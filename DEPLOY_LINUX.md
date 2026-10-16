@@ -49,6 +49,33 @@ pip install numpy pandas scipy matplotlib seaborn pytest
 **不会**自作主张 pip install（新机器上 venv / conda / 系统包管理器都可能有，
 猜错了会污染环境）。
 
+### 🔴 代理：换机器必看
+
+三个客户端（`okx_client` / `binance_client` / `okx_private`）都从**同一个**环境变量
+读代理：
+
+```bash
+export OKX_PROXY=http://127.0.0.1:7890      # 换成你的端口
+```
+
+**默认是 `http://127.0.0.1:7897`** —— 那是开发机的端口。换台机器代理端口不同
+（常见 **7890**）就会在到达交易所**之前**被本机代理拒掉：
+
+```
+RuntimeError: GET /api/v5/public/instruments failed after 4:
+  URLError: <urlopen error [Errno 111] Connection refused>
+```
+
+⚠️ 这个错**看不出是代理问题**，只像"网络不通"。脚本里有一步**代理体检**会
+在下载前就报出来，并告诉你怎么改。想直连（服务器上常需要）：
+
+```bash
+OKX_PROXY= ./scripts/init_linux.sh
+```
+
+> `DEFAULT_PROXY` 是**模块导入时**读一次的，所以必须先 `export` 再启动进程 ——
+> 进程起来之后再设没用。
+
 ---
 
 ## 2) 凭据（研究可跳过）
@@ -184,6 +211,7 @@ python -m webapp.server 8790
 ## 附：不用脚本的手工版
 
 ```bash
+export OKX_PROXY=http://127.0.0.1:7890          # ⚠️ 别忘了这行（见上）
 END="$(date -u -d tomorrow +%Y-%m-%d)"
 
 python -m crypto_ls_research.data.download --bars 1h 15m 5m --end "$END"
