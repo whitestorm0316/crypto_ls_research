@@ -670,102 +670,6 @@ python scripts/binance_backtest.py --selectivity
   ⇒ **误差与信号同量级**。`min_nav_usd` 默认 **$50** ⇒ $70 **不会被风控拦住**。
   产物 `scripts/plan_report.py --mode demo`。
 
-## 失效归因（Q41 细节）——5 段最大回撤，**只诊断不优化**
-
-**跑法**：`python scripts/drawdown_attribution.py`（约 26 s + 5 次单因子回测；`--no-ablations` 跳过后者）。
-产物 `artifacts/drawdown_attribution/`；报告 `artifacts/FAILURE_ATTRIBUTION.md`；
-结论摘要 `artifacts/FINDINGS.md` Q41。守卫 `tests/test_failure_attribution.py`（29 条）。
-
-### 基线复现（做任何统计之前先钉死这一步）
-
-`load_panels(bar, start, end, insts=res.insts)` 会把网格**延伸到缓存里最新的一根** ⇒ 直接重跑不可复现。
-必须把 8 个字段全部 `reindex(res.bars.index)` 截回存档网格，再用 `ACCEPTED_OVERRIDES` 跑。
-**实测 9 个损益列 `max|Δ| = 0`、equity 6.65719182 两条路一致、2,068 个调仓点。**
-`ACCEPTED_OVERRIDES` 从 `config.settings.ACCEPTED_*` 读，**不写字面量**。
-
-### 窗口几何：用户给的 5 个窗口**不是同一套边界约定**
-
-| 窗口 | 用户给 | 深度（实测） | 真实 cummax 峰 | 真实谷底 | 真实恢复 | 边界约定 |
-|---|---|---|---|---|---|---|
-| W1 | 2024-07-05 → 2024-11-01 | −13.3149% | 2024-07-05 | 2024-11-01 | 2024-11-20 | 峰→谷 ✓ |
-| W2 | 2023-11-09 → 2024-03-03 | −10.8184% | 2023-11-09 | **2023-12-18** | 2024-03-03 | 峰→**恢复** |
-| W3 | **2023-02-22** → 2023-05-03 | −9.9832% | **2023-01-25** | 2023-05-03 | 2023-06-30 | **局部高点**→谷 |
-| W4 | 2021-02-01 → 2021-04-10 | −9.5922% | 2021-02-01 | 2021-04-10 | 2021-06-21 | 峰→谷 ✓ |
-| W5 | 2022-08-04 → 2022-09-21 | −9.4229% | 2022-08-04 | 2022-09-21 | 2022-10-29 | 峰→谷 ✓ |
-
-5 个深度**逐位吻合**（`max|Δdepth| < 1e-4`）⇒ 同一批事件，但 **W2 的第二数是恢复日、
-W3 的第一数是回撤内部的局部高点**。⇒ **两种切片都报**：
-
-* `stated` = 用户原样（**日历日，双端含**，`window_mask` 加 1 天做开区间上界）。
-* `episode` = 真实 cummax 峰→谷，**bar 级**（`res.bars.index >= peak & <= trough`），
-  与 `leg_attribution(mode="episode")` 的 P&L **同一段**（有测试钉住）。
-
-⚠️ **`episode` 的时间戳对由 `fa.episode_windows(bars)` 唯一给出**（落盘在 `69b_episode_windows.csv`）。
-**不要再造第三套边界**（例如给 episode 用日历日）—— 那会让「空腿亏了多少」和「当期 IC 是多少」
-落在两段不同的 bar 上，放同一行不可比。
-
-⚠️ **W2 的 `stated` 净收益是 +0.0188（正的）**，`episode` 才是 −0.1087。**−10.82% 是峰→谷深度，
-不是那 116 天的损益。**
-
-### 报告 §二 那张表的数据源
-
-`tables/69_window_table.csv` = 11 行（5 窗口 × 2 切片 + 正常期）× 11 列
-（`dd/net_pnl/gross_pnl/long_pnl/short_pnl/momentum_ic/dispersion/rank_turnover/universe/funding/cost`），
-**由脚本一步生成，报告逐字抄它**，并已用脚本逐格核对（0 处不符）。
-正常期 = 不落在任何**用户窗口**内的 1,643 个调仓点 / 40,136 根 bar。
-
-* P&L / funding / cost ← `61/61b_leg_attribution_*.csv`
-* Momentum IC（stated）← `63_factor_ic_by_window.csv`；episode 由 `episode_windows` 掩码同一份逐点 IC
-* Dispersion / Rank Turnover / Universe（stated）← `65b_rotation_table.csv`；
-  episode = 把 `65` 的**逐点**表按 `retag_episode` 重新打标再汇总（**不重算指标**）
-* 正常期 P&L ← `summary.json.normal_period`；正常期 IC ← `63` 的 `NORMAL` 行；
-  正常期 dispersion/turnover/universe ← `65b` 的 `NORMAL` 行
-
-### 结论表（数字全在 `FINDINGS.md` Q41）
-
-| 候选 | 判定 |
-|---|---|
-| A 动量反转 | 支持（**同期描述，无预测力**）：回撤期 IC −0.0378 vs +0.0088，块置换 p = 0.0095 |
-| B `flow` 失效 | 支持且更稳健：p = 0.0080（最显著）；单因子 Sharpe 0.50 / MDD −23.73%（都是最差） |
-| C 空腿崩跌式反弹 | 部分支持；**机制证据不足 / 无法确认** |
-| D 流动性压缩 | 伴随现象 / 放大器：4/5 窗口宇宙更窄（W4 仅 7.4 名），但 `binding_adv` 恒为 0 |
-| E 交易成本 | **排除**：5/5 窗口毛收益本身为负，成本只占毛亏损 6.7%–23.0% |
-
-分腿（`episode`）：**3/5 空腿驱动**（W1/W2/W4）、1/5 多腿（W5）、1/5 两腿同亏（W3）。
-⇒ **存在两类不同失效模式，不能用一个根因解释。**
-
-### regime 与动量标签（最容易做错的一处）
-
-`regime_frame` **签名里没有 `windows`** ⇒ 结构上不可能按窗口调阈值（阈值取全样本分位）。
-默认动量标签是 **`mom_ic_5d_trailing` = `ic_mom.rolling(5).mean().shift(1)`**。
-`ic_mom[t]` 由第 t 期未来收益算出 ⇒ **同期**；用同期标签分类 = 「拿结果解释结果」：
-**同一批 386 天**，同期 Sharpe **−4.97** / 滞后 **+3.01**（年化 −69.3% → +41.1%），**符号翻转**。
-同期口径只能作为**显式对照**产出（`ic_col="mom_ic_5d_contemp"` 会**整条优先级链重算**；
-早期版本只覆盖 `regime` 列 ⇒ 得到的是两者**并集**，把对照稀释掉了）。
-
-窗口构成：W1/W3/W5 是 MomentumReversal 超配（26.7% / 35.2% / 44.9% vs 正常 17.2%）；
-**W4 是 HighVol 事件（79.7%）**、**W2 是 StrongTrend 事件（53.4%）**。
-⚠️ 但 HighVol 长期 Sharpe 是 **+1.00**（正）⇒ **W4 的成因「证据不足 / 无法确认」**。
-
-### 本轮修掉的三个既有缺陷
-
-1. `analysis/ic.py::ic_series` 把「第 i 个**非 NaN** 值」贴到「第 i 个时刻」⇒ 中段 NaN（实测 152 个）
-   使其后全部错位（最大误差 1.66）。已记 `series_pos` 按位置重索引。该函数**此前无调用点**（已核实）。
-2. `momentum_reversal` 要求池 ≥20 名 ⇒ 5 个回撤窗口（宇宙 7.4–21.1）**全被丢掉** ⇒ 假结论。
-   已改为 Rank IC ≥8 名即可 + 尺度无关三分位价差，并同时报 `n`/`n_top10`/`mean_pool`。
-3. **`rotation_table` / `liquidity_table` 的 `windows` 参数被接受但完全不生效**（写死遍历
-   `WINDOW_LABELS`）⇒ 传 episode 窗口**静默返回空表**。已由 `_window_labels(windows)` 派生。
-   ⚠️ **「签名里有、实现里不用」是本项目反复出现的一类缺陷**（另见 `risk.atr_days`、
-   `_apply_leverage` 被 `set_leverage=None` 门控、`td_mode` 无主人）——**新函数收参数就要有断言钉住它生效。**
-
-### 变异测试记录（本轮 5 个，全被抓）
-
-`_window_labels` 退回常量 / `episode_windows` 改成日历日 / `retag_episode` 的 `REST` 改成 `NORMAL` /
-尾部价差 `top−bot` 反过来 / `tail_spread_table` 默认不出 `FULL` 行。
-脚本一次性（`finally` 还原 + 首尾 sha 核对），**跑完移出仓库**。
-
----
-
 ## 事前宽度检验（Q42 细节）——「宇宙变窄」到底有没有用
 
 **跑法**：`python scripts/exante_width.py`（约 20 s，纯只读，**不需要重建面板**）。
@@ -935,16 +839,6 @@ mw_ret_names = pool_mean + excess_select + excess_weight
 
 ---
 
-## 定时器 / 实盘 opt-in（2026-10-09）
-- `scheduled_tick.py` 曾硬编码 `allow_live=False` ⇒ 实盘永远起不来；安装器 `LABEL` 写死 demo
-  ⇒ 装 live **静默顶掉** demo 而 `--status` 仍显「已注册」。现 `LABELS/UNITS` 按模式分开，
-  实盘缺 `--allow-live` **拒绝且不写盘**（安装器 2 / tick 3）；**禁 `allow_live=False` 字面量**。
-- ⚠️ 守卫须早于第一次 `auto_ctl.` **调用**。断言别用 `src.index("auto_ctl.")` —— import 行含
-  该子串 ⇒ 恒假。**`launchctl` 不能从沙箱注册**（最小 plist 也 `error 5`）⇒ 用户双击。
-  守卫 `test_live_scheduler.py`（8/5）。
-
----
-
 ## 定时器 / 实盘 opt-in
 🔴 **细节整节在 `RULES-OPS.md`**（`allow_live=False` 硬编码导致实盘起不来、`LABELS/UNITS` 按模式分开、**`launchctl` 不能从沙箱注册**、守卫须早于第一次 `auto_ctl.` 调用）。**2026-10-10 起执行者改为控制台自身**（见下节）。
 
@@ -1005,53 +899,6 @@ mw_ret_names = pool_mean + excess_select + excess_weight
   **1.494**）⇒ **1.94 至少部分是 (OKX 数据, 这个阈值) 的组合属性**（**关掉门槛 1.93 → 0.07**）。
   **"同一份标的清单" ≠ "同一段历史"**（91/131 币安上市更晚）。复现 `binance_backtest.py --selectivity`；
   ⚠️ 同时持两个场所的 panel 会 OOM ⇒ **用完即 `del` + `gc.collect()`**。
-
----
-
-## 无人值守 + 通知（Q49–Q51）——**细节整节在 `RULES-OPS.md`**
-- 🔴 **执行者是控制台自己**（双重 fork + `setsid()` ⇒ 长期活着），`webapp/auto_schedule.py`，
-  **启动时自恢复**；**必须走和网页按钮同一个作业队列**。到点判定是**窗口**不是阈值
-  （`at <= now <= at+10min`，错过**不补**）；幂等账**成功后才写**；`enabled`/`running` 是两个
-  量、派生 `will_trade`（⚠️ 测试覆盖**四种组合**、mock 打**对对象**）。
-- 🔴 **通知必须和「执行」一起搬**：`notify_for()` 原本只在 `auto_trader` 里 ⇒ 搬到控制台后
-  **没人发通知**。且 `execute()` 的 `action` 恒为 `"rebalance"`、`notify_on` 认
-  `traded`/`blocked`/`error` ⇒ **必须翻译**；拦截原因填 **`blocked_by`**。
-- 🔴 **`execute()` 返回是嵌套的**（`record`/`summary`/`target`），而格式化器读**扁平**键
-  ⇒ 直接把外层喂进去会让每个字段都 `None`、消息里**全是「—」**（实测）。必须摊平；
-  ⚠️ `n_ok`/`n_fail` 只在 `record` 里。**报数字前先看格式化器读什么键。**
-- ⚠️ **两个毛敞口差一个 NAV 倍**：`target.gross` 是**倍数**（1.36），
-  `record["gross_target"]` 是**USDT 名义额**（226.8）。混用会印出「226.799× NAV」
-  ⇒ **同一句话里出现大得离谱的倍数时，先怀疑单位**。通知带净值/保证金/可用（三行分开）。
-- 🔴 **沙箱代理只在工具调用期间存活**：控制台继承 `HTTP_PROXY=127.0.0.1:<端口>` ⇒ 11:00 无
-  工具调用 ⇒ 端口已关 ⇒ `urlopen` 报 **`Errno 61`**。**订单照下**（走交易所 SDK）⇒
-  "交易成功、通知静默"。修法 `build_opener(ProxyHandler({}))`；⚠️ 断言写「**没有**
-  ProxyHandler」（空的会被扔掉）。
-- ⚠️ **通知结果要落进 `runs.jsonl`**（`runs()` 最新在前 ⇒ 写回要 `reversed()`）；**自检端点
-  必须由控制台进程自己发**（另起进程会走那次调用的代理，掩盖问题）。- 🔴 **模块重复加载**：`import live_api`（顶层名）与 `from webapp import live_api`（包名）
-  是**两个模块对象** ⇒ 线程建在 A、HTTP 读 B。**统一用包路径导入**。
-- **`enabled`/`running` 是两个量**，派生 `will_trade`；⚠️ 测试覆盖**四种组合**、mock 打
-  **对对象**（`_REGISTRY`）。守卫 `test_auto_schedule/test_auto_notify.py`。
-
----
-
-## 无人值守 + 通知（Q49–Q53）——**细节整节在 `RULES-OPS.md`**
-- 🔴 **开关默认关、必须 `is True`**（`resolve_auto_enabled`；`"false"` 在 Python 里是**真值**，
-  `bool()` 会**静默打开**它）。⚠️ **`Store` 目录是常量 `LIVE_DIR`、无 env** ⇒ 测试须
-  monkeypatch，否则**改到真实账户上**。⚠️ **保证金 ≠ 持仓名义**（`isoEq` vs `Σ notionalUsd`）。
-- 🔴 **执行者是控制台自己**（`webapp/auto_schedule.py`，**启动时自恢复**）；**必须走和网页
-  按钮同一个作业队列**。到点判定是**窗口**不是阈值、错过**不补**；幂等账**成功后才写**。
-  `enabled`/`running` 是两个量、派生 `will_trade`（⚠️ 测试覆盖**四种组合**、mock 打**对对象**）。
-- 🔴 **通知要和「执行」一起搬**，且**翻译** `stage`→`action`（`execute()` 的 `action` 恒为
-  `"rebalance"`）；拦截原因填 **`blocked_by`**。⚠️ **`execute()` 返回是嵌套的**而格式化器读
-  **扁平**键 ⇒ 直接喂外层会让消息**全是「—」**（实测）。**报数字前先看格式化器读什么键。**
-- ⚠️ **两个毛敞口差一个 NAV 倍**：`target.gross` 是**倍数**、`record["gross_target"]` 是**USDT**。
-  混用印出「226.799× NAV」⇒ **倍数大得离谱时先怀疑单位**。（通知带净值/保证金/可用，三行分开）
-- 🔴 **沙箱代理只在工具调用期间存活**：控制台继承 `HTTP_PROXY` ⇒ 11:00 无工具调用时 `urlopen`
-  报 **`Errno 61`**，而**订单照下**（走交易所 SDK）⇒ "交易成功、通知静默"。修法
-  `build_opener(ProxyHandler({}))`。⚠️ **通知结果落进 `runs.jsonl`**（写回要 `reversed()`）。
-- 🔴 **模块重复加载**：`import live_api`（顶层名）与 `from webapp import live_api`（包名）是
-  **两个模块对象** ⇒ 线程建在 A、HTTP 读 B。**统一用包路径导入**；**自检端点须由控制台
-  进程自己发**。
 
 ---
 
@@ -1156,11 +1003,26 @@ mw_ret_names = pool_mean + excess_select + excess_weight
 
 ---
 
-## 订单方向（Q44 细节）
-
 ## 订单方向（踩过最贵的一脚）
 - `long_short_mode`：**`posSide` = 动哪个仓、`side` = 方向**。加多 `buy/long`、减多
   `sell/long`、**加空 `sell/short`、减空 `buy/short`**；flip = 两腿。
 - `_orders_for_instrument` 曾用 `abs(tgt)-abs(cur)` 推 `side`，**丢符号** → 加空腿全变买入、**静默**
   （订单被接受、计划正常，仓位反向走）。实测 demo 多头 **92.0%** vs 目标 **47.6%** ⇒
   **成交记录不能当策略演练**。修法 `d = tgt_sz - cur_sz`；守卫 `test_order_sides.py`。
+
+---
+
+## 验收口径 = 1 天网格 + **五因子全选**（`v5_1d_all5`，2026-09-29 起）
+- 唯一来源 `config.settings.ACCEPTED_FACTORS` / `ACCEPTED_REBALANCE_DAYS`，派生到
+  `engine.DEFAULT_SIGNAL`（守护进程）与 `webapp.spec.OPTIMAL_OVERRIDES`（控制台标「最优」）。
+  **都不许写字面量**。
+- **三档必须一起报**（Sharpe/CAGR/MaxDD/回撤天数/年换手/成本）：`v5_1d_all5`
+  **1.9372 / 39.12% / −13.31% / 155.8 / 70.30 / 4.77%**；`v4_1d`
+  **1.8215 / 32.53% / −16.79% / 244.9 / 70.23 / 6.05%**；`v3`
+  **1.758 / 21.24% / −7.57% / 156.4 / 23.90 / 2.59%**。**1 天 ≠ 更优**：拿 **2.22 倍
+  回撤深度**、**2.94 倍换手**换的（回撤天数几乎一样：155.8 vs 156.4）。
+- **门禁数 ≠ 行数**：完整全阶段 = **19 行 = 16 门禁 + 3 条 `pass=None` 信息行**（跳 `mc` 只有 13 门禁）。
+  ⚠️ `OPTIMIZATION_RESULTS.md` 里 3 天时代数字是**数据重建前**的。
+- **「没评估」不许长得像「通过」**：MC 块曾 `if mc:` → 产物不在盘就一行不输出，于是
+  「13/13」是在**唯一可证伪的判据从未跑过**时报出来的。合法两类：`(informational)` 与
+  `未评估`；测试**同时扣掉**这两类，**未声明的变红**。守卫 `test_acceptance_completeness.py`。

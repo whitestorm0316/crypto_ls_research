@@ -25,20 +25,17 @@
 - **实盘/纸面的**（`engine.target()`）**必须先刷新**：它是**用回测引擎在最新缓存上跑一遍**
   ⇒ 缓存不新、目标仓就是旧的（`auto_runner` 的顺序因此是 `refresh → 计划 → 下单`）。
 
-## 验收口径 = 1 天网格 + **五因子全选**（`v5_1d_all5`，2026-09-29 起）
-- 唯一来源 `config.settings.ACCEPTED_FACTORS` / `ACCEPTED_REBALANCE_DAYS`，派生到
-  `engine.DEFAULT_SIGNAL`（守护进程）与 `webapp.spec.OPTIMAL_OVERRIDES`（控制台标「最优」）。
-  **都不许写字面量**。
-- **三档必须一起报**（Sharpe/CAGR/MaxDD/回撤天数/年换手/成本）：`v5_1d_all5`
-  **1.9372 / 39.12% / −13.31% / 155.8 / 70.30 / 4.77%**；`v4_1d`
-  **1.8215 / 32.53% / −16.79% / 244.9 / 70.23 / 6.05%**；`v3`
-  **1.758 / 21.24% / −7.57% / 156.4 / 23.90 / 2.59%**。**1 天 ≠ 更优**：拿 **2.22 倍
-  回撤深度**、**2.94 倍换手**换的（回撤天数几乎一样：155.8 vs 156.4）。
-- **门禁数 ≠ 行数**：完整全阶段 = **19 行 = 16 门禁 + 3 条 `pass=None` 信息行**（跳 `mc` 只有 13 门禁）。
-  ⚠️ `OPTIMIZATION_RESULTS.md` 里 3 天时代数字是**数据重建前**的。
-- **「没评估」不许长得像「通过」**：MC 块曾 `if mc:` → 产物不在盘就一行不输出，于是
-  「13/13」是在**唯一可证伪的判据从未跑过**时报出来的。合法两类：`(informational)` 与
-  `未评估`；测试**同时扣掉**这两类，**未声明的变红**。守卫 `test_acceptance_completeness.py`。
+## 验收口径 = 1 天网格 + **五因子全选**（`v5_1d_all5`）——**数字在 `FINDINGS.md`**
+- 唯一来源 `settings.ACCEPTED_FACTORS` / `ACCEPTED_REBALANCE_DAYS`，派生到 `engine.DEFAULT_SIGNAL`
+  （守护进程）与 `webapp.spec.OPTIMAL_OVERRIDES`（控制台标「最优」）。**都不许写字面量**。
+- **三档必须一起报**（Sharpe/CAGR/MaxDD/回撤天数/年换手/成本）：`v5_1d_all5` **1.9372 / 39.12% /
+  −13.31% / 155.8 / 70.30 / 4.77%**；`v4_1d` **1.8215 / 32.53% / −16.79% / 244.9 / 70.23 / 6.05%**；
+  `v3` **1.758 / 21.24% / −7.57% / 156.4 / 23.90 / 2.59%**。**1 天 ≠ 更优**：拿 **2.22 倍回撤
+  深度**、**2.94 倍换手**换的（回撤天数几乎一样：155.8 vs 156.4）。
+- **门禁数 ≠ 行数**：完整全阶段 = **19 行 = 16 门禁 + 3 条 `pass=None` 信息行**（跳 `mc` 只有 13）。
+  ⚠️ `OPTIMIZATION_RESULTS.md` 的 3 天时代数字是**数据重建前**的。**「没评估」不许长得像
+  「通过」**：MC 块曾 `if mc:` → 产物不在盘就一行不输出 ⇒ 「13/13」是在**唯一可证伪的判据从未
+  跑过**时报出来的。守卫 `test_acceptance_completeness.py`。
 
 ## 网格 / 因子集：唯一来源
 - `ACCEPTED_REBALANCE_DAYS`（`1.0`）**五处引用、不许写字面量**：`engine.DEFAULT_SIGNAL`、`auto_ctl.start`
@@ -69,24 +66,19 @@
 - 🔴 **Q44（只诊断未修）：`account()` 的 `cur_sz` 跨模式求和** ⇒ 引擎按两腿之和下单、
   订单只动一种腿 ⇒ 另一种腿**永久冻结**、`tgt < 该腿量` 时**被拒单**，永不收敛。改它需授权。
 
-## 展示层：每个数字都要追到产物
-- **禁止**在 `app.js`/`spec.py` 写死指标，**禁止前端留最优参数集拷贝**（模式**显示标签**也写死过）：
-  唯一来源 `/api/spec` 的四个 headline 字段；引用旧指标须带 `spec.RECORDED_NOTE`。
-  **页面提到一个控件就必须真有那个控件**；`smoke_live.js` 须**逐字段镜像 `boot()`**。
-- **判据坏了不许靠改判据变绿**（资金费那条 FAIL 继续报，旁边加 `pass=None` 信息行、不计门禁）；
+## 展示层 / 控制台（Q39）——**细节在 `RULES-OPS.md`**
+- **禁止**在 `app.js`/`spec.py` 写死指标、**禁止前端留最优参数集拷贝**（模式**显示标签**也写死过）：
+  唯一来源 `/api/spec` 四个 headline 字段；引用旧指标须带 `spec.RECORDED_NOTE`。**页面提到一个
+  控件就必须真有那个控件**；`smoke_live.js` 须**逐字段镜像 `boot()`**。
+- **判据坏了不许靠改判据变绿**（资金费那条 FAIL 继续报，旁边加 `pass=None` 行、不计门禁）；
   `check_traps` 的 `rev_short` **错过两次** ⇒ **警告的理由必须和用户做的事是同一件事**；
-  **禁止「整文件不含某字符串」**→切定义块再查；**相邻对断言**优于「包含某数」
-  （`1.937` 是 `1.9375` 的子串）。纪律见 `dashboard-data-consistency`。
-
-## 控制台 / 启动脚本（Q39）——**细节在 `RULES-OPS.md`**
+  **禁止「整文件不含某字符串」**→切定义块再查；**相邻对断言**优于「包含某数」。纪律见
+  `dashboard-data-consistency`。
 - ⚠️ **`/api/` 错误必须是 JSON**：`BaseHTTPRequestHandler` 对**没实现的方法**回 `501 + HTML`
-  ⇒ 前端 `resp.json()` 抛 `Unexpected token '<'`，**根因全被藏住**。`server.py::send_error()`
-  已覆盖（**只**对 `/api/`）。⚠️ 旧进程 `GET` 全正常，**只有新方法回 501**。
-  守卫 `test_console_api_contract.py`。
-- **`fmt.dol` 两位小数**，例外是**真·亚分钱**（`|v|<0.005` 用有效数字）；⚠️ **负号在 `$` 前**
-  （`-$1,234.50`）⇒ 先排绝对值再补符号；`-0` 仍是 `$0.00`。
-- ⚠️ 写启动/变异脚本三坑：`.command` 选解释器要验**能 import numpy/pandas**；bash
-  **`$VAR（` 吞全角括号** ⇒ 紧跟非 ASCII 写 `${VAR}`；**变异脚本还原放 `finally`** + 打 sha。
+  ⇒ 前端 `resp.json()` 抛 `Unexpected token '<'`、**根因全藏住**。⚠️ 旧进程 `GET` 全正常、
+  **只有新方法回 501**。**`fmt.dol` 两位小数**（例外：真·亚分钱用有效数字）；**负号在 `$` 前**。
+- ⚠️ 写启动/变异脚本三坑：`.command` 选解释器要验**能 import numpy/pandas**；bash **`$VAR（`
+  吞全角括号** ⇒ 紧跟非 ASCII 写 `${VAR}`；**变异脚本还原放 `finally`**+打 sha。
 
 ## 数据源可切换 / 换交易所（Q40）——**表格全在 `RULES-OPS.md`**
 - **缓存目录唯一来源 = `settings.CACHE_DIR`**（读 `CRYPTO_CACHE_DIR`）；`store.CACHE` 与
@@ -123,46 +115,53 @@
   **没有 leverage 参数**）。**唯一有效旋钮 = `execution.max_daily_turnover`**，但放开节流**会打坏策略**
   （Sharpe 1.82→1.10→0.46）。**杠杆唯一作用是保证金**（$70 在 5× 下缓冲 $0 ⇒ **18.4% 反向波动即亏光**）。
 
-## 无人值守开关（2026-10-10/12）
-- 🔴 **执行者是控制台自己**（双重 fork + `setsid()` ⇒ 长期活着），`webapp/auto_schedule.py`，
-  **启动时自恢复**。**必须走和网页按钮同一个作业队列**（`live_api._submit`）。
-- 🔴 **到点判定是「窗口」不是「阈值」**：`at <= now <= at+10min`，错过**不补**
-  （实测：第一版 `now>=at`，15:25 重启时立刻拿过期信号跑了一次）。幂等账**成功后才写**。
-- **`enabled`/`running` 是两个量**，派生 `will_trade`。⚠️ 测试覆盖**四种组合**
-  （只测 `(False,False)` ⇒ 断言恒真）；⚠️ mock 打**对对象**（`_REGISTRY`）。
-- 🔴 **细节（`is True` 不能真值测试、`LIVE_DIR` 无 env、保证金只读）在 `RULES-OPS.md`。**
-
 ## 无人值守 + 通知（Q49–Q53）——**细节整节在 `RULES-OPS.md`**
-- 🔴 **执行者是控制台自己**（`webapp/auto_schedule.py`，**启动时自恢复**），**走和网页按钮
-  同一个作业队列**。到点判定是**窗口**不是阈值、错过**不补**；`enabled`/`running` 是两个量、
-  派生 `will_trade`（⚠️ 测试覆盖**四种组合**、mock 打**对对象**）。
+- 🔴 **执行者是控制台自己**（双重 fork + `setsid()` ⇒ 长期活着；`webapp/auto_schedule.py`，
+  **启动时自恢复**），**走和网页按钮同一队列**（`live_api._submit`）。到点判定是**窗口**不是
+  阈值（`at <= now <= at+10min`）、错过**不补**；幂等账**成功后才写**。`enabled`/`running`
+  是两个量、派生 `will_trade`（⚠️ 测试覆盖**四种组合**、mock 打**对对象** `_REGISTRY`）。
+  ⚠️ **`is True` 不能真值测试**、**`LIVE_DIR` 无 env**、保证金只读。
 - 🔴 **通知要和「执行」一起搬**；`execute()` 的 `action` 恒为 `"rebalance"` ⇒ **必须翻译**；
-  拦截原因填 **`blocked_by`**。⚠️ **返回是嵌套的**而格式化器读**扁平**键 ⇒ 消息**全是「—」**。
-- ⚠️ **两个毛敞口差一个 NAV 倍** ⇒ **倍数大得离谱时先怀疑单位**；通知带净值/保证金/可用。
+  拦截原因填 **`blocked_by`**。⚠️ **返回是嵌套的**（`record`/`summary`/`target`）而格式化器
+  读**扁平**键 ⇒ 直接喂外层会让消息**全是「—」**。**报数字前先看格式化器读什么键。**
+- ⚠️ **两个毛敞口差一个 NAV 倍**（倍数 vs USDT）⇒ **倍数大得离谱时先怀疑单位**。
 - 🔴 **沙箱代理只在工具调用期间存活**（控制台继承 `HTTP_PROXY`）⇒ 11:00 `urlopen` 报
-  **`Errno 61`**，而**订单照下** ⇒ "交易成功、通知静默"。修法 `build_opener(ProxyHandler({}))`。
-- ⚠️ **通知结果落进 `runs.jsonl`**（写回要 `reversed()`）；**自检端点须由控制台进程自己发**。
-- 🔴 **模块重复加载**（顶层名 vs 包名是两个对象）⇒ 线程建在 A、HTTP 读 B。**统一用包路径导入**。
+  **`Errno 61`**，而**订单照下**（交易所 SDK）⇒ "交易成功、通知静默"。修法
+  `build_opener(ProxyHandler({}))`。⚠️ **通知结果落进 `runs.jsonl`**（写回要 `reversed()`）。
+- 🔴 **模块重复加载**（`import live_api` vs `from webapp import live_api` 是两个对象）
+  ⇒ 线程建在 A、HTTP 读 B。**统一用包路径导入**。
 
-## 鉴权 / 二重认证 / 外网（Q54）——**细节整节在 `RULES-OPS.md`**
-- 🔴 **闸门在唯一入口**（`do_GET/POST/DELETE` 开头一行 `_gate()`），**不散在各端点**；
+## 鉴权 / 二重认证 / 外网（Q54–Q57）——**细节整节在 `RULES-OPS.md`**
+- 🔴 **闸门在唯一入口**（`_gate()` 挂在 `do_GET/POST/DELETE` 开头），**不散在各端点**；
   `_PUBLIC_API` 是**白名单**（新端点默认要登录）。未登录回 **JSON 401**（不是 302）；闸门须在
-  **路由之前** ⇒ 未登录时「存在/不存在」的路径回**同一个** 401（否则是枚举通道）。
-- 🔴 **白名单别手写文件名**（我写 `/app.js`，页面请求 `/static/app.js` ⇒ CSS/JS 被 401
-  挡掉只剩空壳，**日志一切正常**）⇒ 静态资源用**前缀** `/static/`；守卫**从 `index.html`
-  抓 `src=`/`href=`** 逐个断言，不在测试里再抄一份。
-- 🔴 **同一条规则写两遍就会不一致**：`_gate` 的「未建账号」分支曾**又抄一遍**白名单
-  （只认文件名不认前缀）⇒ 首次使用时 `/static/app.js` 401 ⇒ **连「创建账号」按钮都没有**。
-  只留 `_needs_auth` 一处定义 + "`_gate` 代码行不许出现 `_PUBLIC_STATIC`" 守卫。
-- 🔴 **前端改动必须真渲染再断言**：我连续两轮 grep/裸 socket "验证通过"而用户看到空白页。
-  headless Chrome：`"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-  --headless --disable-gpu --no-sandbox --dump-dom <url>`（或 `--screenshot=`）。
-- 🔴 **`ROOT` 从别的文件抄会多爬一级**：`crypto_ls_research/execution/*` 在根下**两层**、`webapp/*`
-  **一层** ⇒ 照搬会让凭据落到**仓库外面**（`.gitignore` 管不到、删也删不掉）。
-- 🔴 **`==` 与 `compare_digest` 行为完全相同** ⇒ 只验 True/False 的测试**抓不到**替换，
-  必须**断言语义**并精确到那一处（文件里可能有多处）。
-- **明文绑非本机 ⇒ 拒绝启动**；Cookie 的 `Secure` **只在 TLS 下加**（明文加它浏览器丢
-  Cookie、本机永远登不上）。守卫 `test_auth.py`（36 条 / 变异 10/10）。
+  **路由之前** ⇒ 未登录时「存在/不存在」路径回**同一个** 401（否则是枚举通道）。
+- 🔴 **白名单别手写文件名**（写 `/app.js` 而页面请求 `/static/app.js` ⇒ 只剩空壳、**日志一切
+  正常**）⇒ 用**前缀**；守卫**从 `index.html` 抓 `src=`/`href=`**。🔴 **同一条规则写两遍就会
+  不一致**（`_gate` 的「未建账号」分支曾又抄一遍 ⇒ **连「创建账号」按钮都没有**）。
+- 🔴 **前端改动必须真渲染再断言**（我两轮 grep/裸 socket "验证通过"、用户看到空白页）：
+  headless Chrome `--dump-dom`。🔴 **`ROOT` 从别的文件抄会多爬一级**（`webapp/*` 一层、
+  `execution/*` 两层）⇒ 凭据落到**仓库外**。
+- 🔴 **`==` 与 `compare_digest` 行为相同** ⇒ 只验 True/False 的测试**抓不到**替换，断言**语义**。
+- **明文绑非本机 ⇒ 拒绝启动**；⚠️ Cookie 的 `Secure` **跟「浏览器那一段」的协议**（本进程 TLS
+  **或** `X-Forwarded-Proto: https` **且来自本机**；转发头**只信本机来源**）。
+- 🔴 **隧道（ngrok）≠ TLS 已解决**（只加密公网那一段）⇒ **正确形态是明文绑 `127.0.0.1`**。
+  🔴 **Host 头要校验**（本机 + 声明的隧道域名，回 **421**）⇒ 防 **DNS rebinding**；⚠️ 白名单
+  用**后缀**匹配（子串会放进 `evilngrok-free.app`）。
+- 🔴 **门禁测试两个方向都要验**：只测「该挡的挡住了」⇒ 白名单恒 `False` 也不红；只测「不是
+  200」⇒ 整段删掉也不红。**断言具体状态码**。⚠️ **变异 `-k` 选错 ⇒ 0 selected 会被当成
+  「抓到」**：必须解析 `N failed`。
+
+## 新机器初始化数据（Q58）——**`scripts/init_linux.sh` + `DEPLOY_LINUX.md`**
+- 入口 `scripts/init_linux.sh`（幂等）→ `data.download` → `data.asset_class --build` →
+  `data.funding_build`。依赖只有 **numpy/pandas/scipy/matplotlib/seaborn/pytest**（**无交易所
+  SDK**）。⚠️ **`data_cache*/`、`artifacts/**`、凭据全被 gitignore** ⇒ 新机器上空的。
+- 🔴 **`--end` 默认是硬编码 `2026-09-26` 且为排他上界** ⇒ 照默认跑**静静少二十来天、不报错**。
+  必须显式给 `$(date -u -d tomorrow +%Y-%m-%d)`（macOS 是 `-v+1d`）。
+- 🔴 **候选池从「今天的实时挂单」建**（本机 160 只）⇒ 新机器重建的那份与本机**不是同一宇宙**、
+  **跨机器回测数字不可直接比**；要可比连 `meta/` 一起拷。⚠️ **`CRYPTO_CACHE_DIR` 设了就必须
+  两端指同一个**，否则"下的和读的不是一份"。
+- ⚠️ **OKX 的 USDT 永续约六成是代币化股票/商品**（实测 crypto 283 / equity 186 / commodity 8）
+  ⇒ `asset_class --build` 不能省。
 
 ## 测试约定
 - 期望值必须**从 fixture 派生**，别写死；断言用**页面同一格式化器**推导（时区一改就红）。
