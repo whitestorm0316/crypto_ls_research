@@ -167,6 +167,50 @@ python -m crypto_ls_research.data.download --bars 1h --end "$END"
 
 ---
 
+## 3b) 控制台页头显示「基线数据缺失」？
+
+**这是预期的** —— `artifacts/` 被 gitignore，所以新机器上那份产物不存在。
+页头的每一个数字都读自：
+
+```
+artifacts/v5_1d_all5/tables/01_headline_metrics.json
+```
+
+重建它**只要 10 秒**（`run.research` 的 `base` 阶段就够，页头只读这一个文件）：
+
+```bash
+python scripts/rebuild_optimal_baseline.py
+```
+
+`init_linux.sh` 的第 5b 步会自动做这件事。脚本的参数**从 `webapp/spec.py` 的
+`OPTIMAL_CLI` / `OPTIMAL_OVERRIDES` 派生**（不写字面量），所以它跑的就是
+验收时那套配置。
+
+> ⚠️ 重建出来的数字会带**今天的**区间与候选池，与历史记录的
+> `Sharpe 1.9372` **不会完全相同**。原因是两条**机制**（不是配置错）：
+>
+> 1. **`--end` 会被忽略**：`store.load_panels()` 刻意把网格延伸到缓存里最新
+>    那根 bar（注释写明是为了"不截断样本尾部"）⇒ 传 `--end 2026-09-29`
+>    没用，区间总是到"今天"。
+> 2. **候选池是「今天的实时挂单」**：2026-09-29 → 10-16 之间新上市的合约
+>    会进池并被选中，改变组合权重。
+>
+> 🔴 **所以这个脚本默认拒绝覆盖已有的基线** —— `v5_1d_all5` 的数字被
+> `FINDINGS.md`、`spec.py` 注释、以及 `test_failure_attribution.py` 的
+> 5 个回撤窗口引用，重跑它们会立刻失效，而且**换不回来**
+> （`baseline.pkl` 33MB 且 `artifacts/` 被 gitignore）。
+> 真要重跑：先 `cp -r artifacts/v5_1d_all5 /tmp/backup`，再 `--force`。
+>
+> 实测对照（同一台机器，2026-10-16）：
+>
+> | | 记录值（2026-09-29） | 重建值（2026-10-16） |
+> |---|---|---|
+> | 宇宙 | 140 只 | 154 只 |
+> | Sharpe | 1.9372 | 1.9688 |
+> | 最大回撤 | −13.31% | −13.31% |
+>
+> 宇宙从 140 → 154 是因为多了 14 个**新上市**合约（`CT`/`QUANT`/`MEGA`…）。
+
 ## 4) 验证装好了
 
 ```bash

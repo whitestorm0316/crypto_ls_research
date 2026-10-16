@@ -7,7 +7,7 @@
 ## 环境 / 沙箱 / 进程
 - Python：`~/.workbuddy-ai/binaries/python/envs/default/bin/python`。
 - `grep '\|'` **静默返 0 行** → 用 `grep -E`；`--include=*.py` zsh 报错 → 用 Grep 工具。
-  **无 `timeout`**；`ps` 禁 → 探活 `kill -0 $(cat <pidfile>)`；**禁 `rm -rf`**。
+  **无 `timeout`**；`ps` 禁 → 探活 `kill -0 $(cat <pidfile>)`。
 - ⚠️ **`/tmp` 在两次工具调用间被清空** → pidfile/log **放仓库内**。
 - 控制台 **8790**；`server.py::main()` 默认 **8770**（隔壁 a-stock 在用）→ **必须位置参数传**
   `python -m webapp.server 8790`。漏掉 = `OSError: [Errno 48]`，`lsof` **查不到**。
@@ -37,17 +37,13 @@
   「通过」**：MC 块曾 `if mc:` → 产物不在盘就一行不输出 ⇒ 「13/13」是在**唯一可证伪的判据从未
   跑过**时报出来的。守卫 `test_acceptance_completeness.py`。
 
-## 网格 / 因子集：唯一来源
-- `ACCEPTED_REBALANCE_DAYS`（`1.0`）**五处引用、不许写字面量**：`engine.DEFAULT_SIGNAL`、`auto_ctl.start`
-  签名默认、`auto_trader`/`run_live` argparse 默认、`webapp.spec.OPTIMAL_CLI`、`scripts/auto_demo.py`。
-- 守卫 `test_accepted_grid.py`（13 条 / **9 变异全抓**）断言**一致**而非数值。CLI 默认必须**过
-  `main()` 实测**（签名默认与 CLI 兜底是两条路径）；`engine.py` 3 处 `check_plan(` 里第 3 处永不 warn
-  → 只要求能 warn 的 2 处；文案从 `engine.grid_days()` 派生。
-- **换口径时最先坏掉的是前端那份拷贝**（`OPT.cli` 曾硬编码 `rebalance_days: 3` → 页面「偏离最优」、
-  横幅走「有差异」分支、**连 Sharpe 都不印**）⇒ 现由 `diffFromOptimal()`/`gridDaysText()` 收口。
-  `PRESETS` 里**两个 id 不许是同一配置**。
-- **比因子集之前先查两侧选名中位数**；**把「差异」叫「不成立」之前先算 σ**。`deflated_haircut`
-  **按 tag 读**（跨 tag 比是错的）。
+## 网格 / 因子集：唯一来源——**细节整节在 `RULES-OPS.md`**
+- `ACCEPTED_REBALANCE_DAYS`（`1.0`）**五处引用、不许写字面量**（`engine.DEFAULT_SIGNAL`、
+  `auto_ctl.start`、`auto_trader`/`run_live` argparse、`webapp.spec.OPTIMAL_CLI`、
+  `scripts/auto_demo.py`）。守卫 `test_accepted_grid.py`（13 条 / **9 变异全抓**）。
+- **换口径时最先坏的是前端那份拷贝**（`OPT.cli` 曾硬编码 `rebalance_days: 3` ⇒ **连 Sharpe
+  都不印**）⇒ 由 `diffFromOptimal()`/`gridDaysText()` 收口。**比因子集前先查两侧选名中位数**；
+  **叫「不成立」前先算 σ**；`deflated_haircut` **按 tag 读**。
 
 ## 已完成检验的结论（Q32–Q35）——**推导/数字在 `FINDINGS.md`**
 - **Q33**：**自写估计量必须先验证再信**（`_ols_nw` 曾把 HAC meat 多除一个 n ⇒ t 虚高 ~45
@@ -133,41 +129,44 @@
 
 ## 鉴权 / 二重认证 / 外网（Q54–Q57）——**细节整节在 `RULES-OPS.md`**
 - 🔴 **闸门在唯一入口**（`_gate()` 挂在 `do_GET/POST/DELETE` 开头），**不散在各端点**；
-  `_PUBLIC_API` 是**白名单**（新端点默认要登录）。未登录回 **JSON 401**（不是 302）；闸门须在
-  **路由之前** ⇒ 未登录时「存在/不存在」路径回**同一个** 401（否则是枚举通道）。
-- 🔴 **白名单别手写文件名**（写 `/app.js` 而页面请求 `/static/app.js` ⇒ 只剩空壳、**日志一切
-  正常**）⇒ 用**前缀**；守卫**从 `index.html` 抓 `src=`/`href=`**。🔴 **同一条规则写两遍就会
-  不一致**（`_gate` 的「未建账号」分支曾又抄一遍 ⇒ **连「创建账号」按钮都没有**）。
-- 🔴 **前端改动必须真渲染再断言**（我两轮 grep/裸 socket "验证通过"、用户看到空白页）：
-  headless Chrome `--dump-dom`。🔴 **`ROOT` 从别的文件抄会多爬一级**（`webapp/*` 一层、
-  `execution/*` 两层）⇒ 凭据落到**仓库外**。
-- 🔴 **`==` 与 `compare_digest` 行为相同** ⇒ 只验 True/False 的测试**抓不到**替换，断言**语义**。
-- **明文绑非本机 ⇒ 拒绝启动**；⚠️ Cookie 的 `Secure` **跟「浏览器那一段」的协议**（本进程 TLS
-  **或** `X-Forwarded-Proto: https` **且来自本机**；转发头**只信本机来源**）。
-- 🔴 **隧道（ngrok）≠ TLS 已解决**（只加密公网那一段）⇒ **正确形态是明文绑 `127.0.0.1`**。
-  🔴 **Host 头要校验**（本机 + 声明的隧道域名，回 **421**）⇒ 防 **DNS rebinding**；⚠️ 白名单
-  用**后缀**匹配（子串会放进 `evilngrok-free.app`）。
-- 🔴 **门禁测试两个方向都要验**：只测「该挡的挡住了」⇒ 白名单恒 `False` 也不红；只测「不是
-  200」⇒ 整段删掉也不红。**断言具体状态码**。⚠️ **变异 `-k` 选错 ⇒ 0 selected 会被当成
-  「抓到」**：必须解析 `N failed`。
+  `_PUBLIC_API` 是**白名单**。未登录回 **JSON 401**（不是 302）；闸门须在**路由之前** ⇒
+  未登录时「存在/不存在」路径回**同一个** 401（否则是枚举通道）。
+- 🔴 **白名单别手写文件名**（写 `/app.js` 而页面请求 `/static/app.js` ⇒ 只剩空壳、**日志
+  一切正常**）⇒ 用**前缀**；守卫**从 `index.html` 抓 `src=`/`href=`**。🔴 **同一条规则写
+  两遍就会不一致**（`_gate` 的「未建账号」分支又抄一遍 ⇒ **连「创建账号」按钮都没有**）。
+- 🔴 **前端改动必须真渲染再断言**（我两轮 grep/裸 socket "验证通过"、用户看到空白页）。
+  🔴 **`ROOT` 从别的文件抄会多爬一级**（`webapp/*` 一层、`execution/*` 两层）。
+- 🔴 **`==` 与 `compare_digest` 行为相同** ⇒ 只验 True/False 的测试**抓不到**替换。
+- **明文绑非本机 ⇒ 拒绝启动**；⚠️ `Secure` 跟**「浏览器那一段」的协议**（本进程 TLS **或**
+  `X-Forwarded-Proto: https` **且来自本机**）。🔴 **隧道 ≠ TLS 已解决** ⇒ **明文绑
+  `127.0.0.1`**；🔴 **Host 头要校验**（回 **421**）⇒ 防 DNS rebinding；⚠️ 用**后缀**匹配。
+- 🔴 **门禁测试两个方向都要验**（只测「该挡的挡住」⇒ 白名单恒 `False` 也不红）。
+  ⚠️ **变异 `-k` 选错 ⇒ 0 selected 会被当成「抓到」**。
 
-## 新机器初始化数据（Q58）——**`scripts/init_linux.sh` + `DEPLOY_LINUX.md`**
-- 入口 `scripts/init_linux.sh`（幂等）→ `data.download` → `data.asset_class --build` →
-  `data.funding_build`。依赖只有 **numpy/pandas/scipy/matplotlib/seaborn/pytest**（**无交易所
-  SDK**）。⚠️ **`data_cache*/`、`artifacts/**`、凭据全被 gitignore** ⇒ 新机器上空的。
+## 新机器初始化数据（Q58–Q60）——**`init_linux.sh` + `DEPLOY_LINUX.md`**
+- 入口 `scripts/init_linux.sh`（幂等）→ `download` → `asset_class --build` → `funding_build`
+  → **5b 重建基线产物**。依赖只有 **numpy/pandas/scipy/matplotlib/seaborn/pytest**。
+  ⚠️ **`data_cache*/`、`artifacts/**`、凭据全被 gitignore** ⇒ 新机器上空的。
+- 🔴 **代理端口写在默认值里**：三个客户端（`okx_client`/`binance_client`/`okx_private`）读同一个
+  `OKX_PROXY`，**默认 `127.0.0.1:7897`**（开发机端口）⇒ 换机器报 **`[Errno 111] Connection
+  refused`**（**看不出是代理问题**）。修法只需 `export OKX_PROXY=...`，**不用改代码**；
+  `OKX_PROXY=`（空）⇒ 直连。⚠️ `DEFAULT_PROXY` 是**模块导入时**求值 ⇒ **必须 export 再起进程**。
+  脚本有**代理体检**（下载前，不通就 exit 1）。
 - 🔴 **`--end` 默认是硬编码 `2026-09-26` 且为排他上界** ⇒ 照默认跑**静静少二十来天、不报错**。
   必须显式给 `$(date -u -d tomorrow +%Y-%m-%d)`（macOS 是 `-v+1d`）。
-- 🔴 **候选池从「今天的实时挂单」建**（本机 160 只）⇒ 新机器重建的那份与本机**不是同一宇宙**、
-  **跨机器回测数字不可直接比**；要可比连 `meta/` 一起拷。⚠️ **`CRYPTO_CACHE_DIR` 设了就必须
-  两端指同一个**，否则"下的和读的不是一份"。
-- ⚠️ **OKX 的 USDT 永续约六成是代币化股票/商品**（实测 crypto 283 / equity 186 / commodity 8）
-  ⇒ `asset_class --build` 不能省。
-- 🔴 **代理端口写在默认值里**：三个客户端（`okx_client`/`binance_client`/`okx_private`）
-  都读同一个 `OKX_PROXY`，**默认 `127.0.0.1:7897`**（开发机的端口）⇒ 换机器报
-  **`[Errno 111] Connection refused`**（**看不出是代理问题**，只像"网络不通"）。
-  修法只需 `export OKX_PROXY=...`，**不用改代码**；`OKX_PROXY=`（空）⇒ 直连。
-  ⚠️ `DEFAULT_PROXY` 是**模块导入时**求值 ⇒ **必须 export 再起进程**。脚本有**代理体检**
-  （排在下载之前，不通就 exit 1 并说清改哪里）。
+- 🔴 **`artifacts/` 被 gitignore ⇒ 新机器页头必显示「基线数据缺失」**（只追踪 6 个 .md）。
+  重建 **10 秒**：`scripts/rebuild_optimal_baseline.py`（只跑 `base`；参数**从 `webapp/spec.py`
+  派生**）。⚠️ **`--override` 走 `json.loads`** ⇒ 列表必须写成 **JSON 数组**（逗号串会被
+  **逐字符**解析成 36 个因子）。⚠️ `asset_class` 缺新合约 **fail-loud 退出**（不是警告）。
+- 🔴 **重建的数字 ≠ 记录值，且不可修复**（两条机制）：① **`--end` 被 `load_panels` 刻意
+  忽略**（网格总延伸到缓存最新 bar，"不截断样本尾部"）⇒ 区间总是到"今天"；② 候选池从
+  「今天的实时挂单」建 ⇒ 新上市合约进池。实测 9-29→10-16：宇宙 **140→154**、
+  Sharpe **1.9372→1.9688**（用基线 140 只后 **1.9258**，残差来自区间）。**记录值只是
+  某时点快照。**
+- 🔴 **别覆盖已验收基线**：`baseline.pkl`(33MB) + `tables/` 是**同一 tag 的两半**，只
+  `cp -r tables` 等于没备份。实测覆盖后 5 个回撤窗口立刻失效（W2 −0.1082→−0.1131）且
+  **换不回来** ⇒ `rebuild_optimal_baseline.py` **默认拒绝覆盖**（要 `--force`）。
+- ⚠️ **`CRYPTO_CACHE_DIR` 设了就必须两端指同一个**；要两边可比就连 `meta/` 一起拷。
 
 ## 测试约定
 - 期望值必须**从 fixture 派生**，别写死；断言用**页面同一格式化器**推导（时区一改就红）。

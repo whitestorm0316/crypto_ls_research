@@ -162,7 +162,7 @@ else
   #    默认值是硬编码的 `2026-09-26`，而它是**排他上界**。照默认跑会比今天
   #    少二十来天的 bar，而且不报错 —— 后续回测静静地在旧数据上出结论。
   END="$(date -u -d tomorrow +%Y-%m-%d 2>/dev/null || date -u -v+1d +%Y-%m-%d)"
-  echo "  bars=$BARS   end=$END（明天 UTC，排他上界）"
+  echo "  bars=$BARS   end=${END}（明天 UTC，排他上界）"
   echo "  规模参考（160 标的全量）：1h≈2.7万请求 / 15m≈1.3万 / 5m≈0.35万 / funding≈1万"
   echo "  首次全量约 1–2 小时；中断了直接重跑（已下的会跳过）。"
   echo
@@ -250,6 +250,41 @@ if worst and worst[1] > 30:
 else:
     print("  ✓ 数据看起来是齐的")
 PYCHK
+
+# ---------------------------------------------------------------------------
+step "5b/6  重建控制台页头要读的基线产物"
+# ---------------------------------------------------------------------------
+# 🔴 不跑这一步，控制台页头会显示
+#    「基线数据缺失（未找到已验收配置的产物）」
+# —— 因为 `artifacts/` 被 gitignore，新机器上那份产物不存在。
+#
+# 好消息：页头只读 `artifacts/<TAG>/tables/01_headline_metrics.json`，
+# 而它是 `run.research` 的 **base 阶段**产出的 ⇒ 只跑一个阶段、**约 10 秒**。
+# ⚠️ 但花的这 10 秒值得 —— 否则你要点开页面才知道少东西。
+if [ "$CHECK_ONLY" = "1" ]; then
+  echo "  （--check：跳过）"
+else
+  # 存在性判断交给 Python（它才知道 OPTIMAL_TAG 是什么，别在 bash 里再抄一遍）
+  HAS_HEAD="$("$PY" - <<'PYCHK' 2>/dev/null || true
+import os, sys
+sys.path.insert(0, "webapp")
+from spec import OPTIMAL_TAG
+print("yes" if os.path.isfile(
+    os.path.join("artifacts", OPTIMAL_TAG, "tables", "01_headline_metrics.json")
+) else "no")
+PYCHK
+)"
+  if [ "$HAS_HEAD" = "yes" ]; then
+    ok "基线产物已存在（页头有数字）"
+  else
+    echo "  页头那份 JSON 不在盘上 —— 用 base 阶段重建（约 10 秒）"
+    echo "  ⚠️ 它产出的数字会带**今天的**区间与候选池，与历史记录里的"
+    echo "     1.9372 **不会完全相同**（新上市合约会进池、区间往后延）——"
+    echo "     这是时点差异，不是配置错。脚本会把这条再提醒一次。"
+    "$PY" scripts/rebuild_optimal_baseline.py || \
+      warn "重建失败 —— 控制台页头仍会显示「基线数据缺失」，其余功能不受影响"
+  fi
+fi
 
 # ---------------------------------------------------------------------------
 step "6/6  跑一次冒烟（可选）"

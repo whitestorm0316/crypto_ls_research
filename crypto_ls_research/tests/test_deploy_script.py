@@ -221,3 +221,138 @@ def test_empty_proxy_means_direct_connection():
     assert r.returncode == 0, r.stderr[-300:]
     assert r.stdout.strip() == "''", (
         f"OKX_PROXY='' 应得到空代理（→ 直连），实得 {r.stdout.strip()}")
+
+
+# ---------------------------------------------------------------------------
+# 重建基线产物（页头读的那份）
+# ---------------------------------------------------------------------------
+def test_rebuild_script_derives_its_config_from_spec():
+    """🔴 `rebuild_optimal_baseline.py` 的参数必须**从 `webapp/spec.py` 派生**。
+
+    `artifacts/` 被 gitignore ⇒ 换机器后页头必然显示「基线数据缺失」。
+    要重建就得用**和验收时完全一样**的配置（`OPTIMAL_CLI` + `OPTIMAL_OVERRIDES`）。
+
+    ⚠️ 如果这个脚本自己写一份字面量（`--bar 1h --asset-class all ...`），
+    改口径时就会漏改这里 —— 而它产出的正是页头宣称的那几个数，
+    错了会让页面报一个**从未被验收过**的 Sharpe。本仓库反复踩过这个坑
+    （`rebalance_days` 曾在五处各写一遍）。
+    """
+    import pathlib
+    p = pathlib.Path(ROOT) / "scripts" / "rebuild_optimal_baseline.py"
+    assert p.exists(), "缺少 rebuild_optimal_baseline.py"
+    src = p.read_text(encoding="utf-8")
+    assert "from spec import" in src, "没有从 webapp.spec 导入配置"
+    for name in ("OPTIMAL_CLI", "OPTIMAL_OVERRIDES", "OPTIMAL_TAG"):
+        assert name in src, f"没有用到 {name} —— 配置可能被写死了"
+    # 不许出现写死的因子名（那说明抄了一份而不是派生）。
+    # ⚠️ **只看非注释行** —— 脚本的注释里会举 `factors.subset=["momentum",...]`
+    # 作为"该长什么样"的例子，扫全文本会命中那段说明（第一版就误报了）。
+    code = "\n".join(ln for ln in src.splitlines()
+                     if not ln.lstrip().startswith("#"))
+    for lit in ("momentum", "rev_short", "range_pos"):
+        assert lit not in code, (
+            f"脚本的**代码**里出现了写死的因子名 {lit!r} —— 应当从 ACCEPTED_FACTORS 派生")
+
+
+def test_rebuild_script_serialises_overrides_as_json():
+    """⚠️ `--override` 的值走 `json.loads` ⇒ 列表必须写成 **JSON 数组**。
+
+    写 `factors.subset=momentum,flow,...` 会被当成字符串、逐字符解析成
+    36 个"因子"，报 `unknown factor(s): ['m','o','m',...]`（实测踩过）。
+    所以脚本里必须有 `json.dumps`。
+    """
+    import pathlib
+    src = (pathlib.Path(ROOT) / "scripts" / "rebuild_optimal_baseline.py"
+           ).read_text(encoding="utf-8")
+    assert "json.dumps" in src, (
+        "--override 的值没有走 json.dumps ⇒ 列表会被逐字符解析")
+
+
+def test_rebuild_defaults_to_base_only():
+    """默认**只跑 base** —— 页头只需要它（约 10 秒），全套要很久。
+
+    断言默认值是 `["base"]`：跑全套是 30+ 分钟且会覆盖 charts 等产物。
+    """
+    import re as _re
+    import pathlib
+    src = (pathlib.Path(ROOT) / "scripts" / "rebuild_optimal_baseline.py"
+           ).read_text(encoding="utf-8")
+    m = _re.search(r'add_argument\("--stages".*?default=(\[[^\]]*\])', src, _re.S)
+    assert m, "没找到 --stages 的默认值"
+    assert m.group(1).replace(" ", "") == '["base"]', (
+        f"--stages 默认值是 {m.group(1)}，应当是 [\"base\"]")
+
+
+# ---------------------------------------------------------------------------
+# shell 语法陷阱（真的炸过一次）
+# ---------------------------------------------------------------------------
+def test_no_bare_variable_before_non_ascii():
+    """🔴 `$VAR（` 会被 bash 当成变量名 `VAR（`（含全角括号）⇒ **unbound variable**。
+
+    实测：`echo "end=$END（明天 UTC）"` 在 `set -u` 下直接
+    `line 165: END（: unbound variable` 退出。
+
+    ⚠️ **`bash -n` 检查不出来** —— 它只做语法分析，这个错要真的执行到那一行
+    才炸。所以必须在这里静态扫。修法是写 `${VAR}`，用花括号界定边界。
+
+    这条属于本项目已经记过的坑（`$VAR（` 吞全角括号），这里是它在
+    部署脚本里的复现。
+    """
+    src = _script_text()
+    bad = []
+    for i, ln in enumerate(src.split("\n"), 1):
+        if re.search(r"\$[A-Za-z_][A-Za-z0-9_]*(?=[^\x00-\x7f])", ln):
+            bad.append(f"    第 {i} 行: {ln.strip()[:90]}")
+    assert not bad, (
+        "这些行里 `$VAR` 紧接着非 ASCII 字符，bash 会把它并进变量名：\n"
+        + "\n".join(bad) + "\n  ⇒ 改成 `${VAR}`")
+
+
+def test_script_fails_loudly_on_a_fresh_tree():
+    """🔴 脚本在**没有产物**的树上必须能跑到最后，不能中途 unbound 退出。
+
+    这条只做静态检查（跑真的会花 1 小时）：确认关键变量都有默认值、
+    且 `set -u` 下不会因为某个分支没赋值而炸。
+    """
+    src = _script_text()
+    # 在 `set -euo pipefail` 下，任何可能未赋值的展开都是地雷
+    for v in ("END", "BARS", "PROBE", "HAS_HEAD"):
+        # 要么有默认值赋值，要么出现在 ${V-...} / ${V:-...} 形式里
+        has_assign = re.search(rf'^\s*{v}=', src, re.M)
+        has_default = re.search(rf'\$\{{{v}[-:]', src)
+        assert has_assign or has_default, (
+            f"`{v}` 在 `set -u` 下可能未赋值就被展开 ⇒ 中途 unbound 退出")
+
+
+def test_rebuild_refuses_to_overwrite_an_existing_baseline():
+    """🔴 `rebuild_optimal_baseline.py` **默认不许覆盖已有基线**。
+
+    2026-10-16 我自己踩的：以为在清探测产物，实际那次「实跑」用的是真的
+    `OPTIMAL_TAG` ⇒ 覆盖了 `baseline.pkl`（33MB）+ `tables/` 里 10 个文件。
+    后果是 `test_failure_attribution.py` 的 5 个回撤窗口立刻失效
+    （实测 W2 从 −0.1082 变 −0.1131），而且**换不回来** ——
+    `artifacts/**` 被 gitignore、pkl 又没备份。
+
+    所以这个脚本必须：
+      * 有 `--force` 开关；
+      * 没给 `--force` 且产物已存在时**退出**（不是警告后继续）。
+    """
+    import pathlib
+    import subprocess
+    src = (pathlib.Path(ROOT) / "scripts" / "rebuild_optimal_baseline.py"
+           ).read_text(encoding="utf-8")
+    assert "--force" in src, "没有 --force 开关"
+    assert "拒绝覆盖" in src or "refus" in src.lower(), "没有拒绝覆盖的分支"
+
+    # 真跑一次：产物存在时**必须**非零退出
+    head = (pathlib.Path(ROOT) / "artifacts" / "v5_1d_all5" / "tables"
+            / "01_headline_metrics.json")
+    if not head.exists():
+        pytest.skip("本机没有基线产物，跳过行为断言")
+    r = subprocess.run([sys.executable,
+                        str(pathlib.Path(ROOT) / "scripts" / "rebuild_optimal_baseline.py")],
+                       cwd=ROOT, capture_output=True, text=True, timeout=120)
+    assert r.returncode != 0, (
+        "产物已存在时脚本竟然正常退出了 —— 它会静默覆盖已验收基线")
+    assert "拒绝覆盖" in (r.stdout + r.stderr), (
+        f"没有说清为什么拒绝：(r.stdout+r.stderr)[-300:]")
