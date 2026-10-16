@@ -230,6 +230,40 @@ meta/inst_category.json  OK
 
 ---
 
+## 4b) 回测失败了，日志在哪？
+
+**`logs/` 目录，文件名形如 `research-<tag>-<时间戳>.log`。**
+
+```bash
+# 看最新那份
+ls -t logs/research-*.log | head -1 | xargs tail -50
+
+# 只看错误
+grep -nE "!! stage|Traceback|FAILED stages" logs/research-*.log
+```
+
+⚠️ **这个日志是 2026-10-16 才加的**，之前回测**只在终端打印、不写任何文件** ——
+窗口一关、或 ssh 断线，失败原因就没了。如果你在旧版上跑，只能靠终端回滚。
+
+### 想让输出一边打终端一边落盘（旧版也能用的办法）
+
+```bash
+python -m crypto_ls_research.run.research --stages base 2>&1 | tee logs/my_run.log
+```
+
+⚠️ 用 `tee`，**不要**用 `> logs/x.log`：后者会让终端**一片空白**，
+你会以为卡死了（回测要跑几十分钟）。
+
+### 回测失败时，日志会告诉你什么
+
+1. **`!! stage <名字> failed: <异常>`** —— 哪个阶段挂了；
+2. **完整 traceback** —— 出错的文件与行号；
+3. 结尾的 **`### FAILED stages: [...]`** —— 失败清单；
+4. **进程退出码非零** —— 所以 `cmd && next` 的写法不会再误判成功。
+
+> ⚠️ 注意「阶段失败」与「整体成功」是两回事：某个阶段挂了，
+> **前面的阶段产物仍然在盘上**，但它们**不完整**。日志最后会写明这一点。
+
 ## 5) 日常使用
 
 ```bash

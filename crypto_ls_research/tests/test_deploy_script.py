@@ -356,3 +356,70 @@ def test_rebuild_refuses_to_overwrite_an_existing_baseline():
         "产物已存在时脚本竟然正常退出了 —— 它会静默覆盖已验收基线")
     assert "拒绝覆盖" in (r.stdout + r.stderr), (
         f"没有说清为什么拒绝：(r.stdout+r.stderr)[-300:]")
+
+
+# ---------------------------------------------------------------------------
+# 回测日志 + 失败退出码（2026-10-16：用户问「运行回测失败去哪看日志」）
+# ---------------------------------------------------------------------------
+def test_research_writes_a_log_file():
+    """🔴 `run.research` 必须**自己**把输出写进日志文件。
+
+    原先它 76 个 `print()` 全去 stdout ⇒ **没有任何日志文件**。
+    于是「回测失败了去哪看日志」的答案是"没有地方" —— 而回测跑几十分钟，
+    窗口一关、或 ssh 断线，失败原因就永远找不回来了。
+    （`logs/` 里那几份 9-29 的 `research_*.log` 是我**手工 `> logs/...`**
+      重定向出来的，不是代码功能 —— 所以别人重跑时并没有日志。）
+    """
+    import pathlib
+    import subprocess
+    src = (pathlib.Path(ROOT) / "crypto_ls_research" / "run" / "research.py"
+           ).read_text(encoding="utf-8")
+    assert '"--log"' in src, "没有 --log 开关"
+    assert 'default="auto"' in src, "日志不是**默认开启**的 —— 用户不会记得加参数"
+    assert "_tee_to" in src, "没有把输出分到文件（tee）的实现"
+
+    # 真跑一次（--quick + 只跑 base，几秒），确认文件真的产生
+    import glob
+    before = set(glob.glob(os.path.join(ROOT, "logs", "research-*-*.log")))
+    r = subprocess.run(
+        [sys.executable, "-m", "crypto_ls_research.run.research",
+         "--stages", "base", "--tag", "__logtest", "--quick"],
+        cwd=ROOT, capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, f"回测没跑通：{r.stdout[-300:]}\n{r.stderr[-300:]}"
+    after = set(glob.glob(os.path.join(ROOT, "logs", "research-*-*.log")))
+    new = after - before
+    assert new, "跑了回测但 logs/ 里没有新的 research 日志"
+    body = open(sorted(new)[-1], encoding="utf-8").read()
+    assert "research run:" in body, f"日志里没有运行信息：{body[:200]}"
+    # 清理
+    for p in new:
+        os.remove(p)
+    import shutil
+    shutil.rmtree(os.path.join(ROOT, "artifacts", "__logtest"), ignore_errors=True)
+
+
+def test_a_failed_stage_makes_the_process_exit_nonzero():
+    """🔴 **阶段失败必须非零退出。** 原先它只打印 traceback 然后**退出码 0**。
+
+    后果很具体：`init_linux.sh` / CI / 任何 `.sh` 里 `cmd && next` 的写法
+    都会把一次**失败**的回测当成成功，继续往下走；
+    而产物只写了一半，下一个读的人无从判断它是完整还是残缺。
+    （实测过：故意传一个不存在的因子，老代码退出码是 0。）
+    """
+    import subprocess
+    r = subprocess.run(
+        [sys.executable, "-m", "crypto_ls_research.run.research",
+         "--stages", "base", "--tag", "__failtest",
+         "--override", 'factors.subset=["nope"]'],
+        cwd=ROOT, capture_output=True, text=True, timeout=300)
+    assert r.returncode != 0, (
+        "回测失败了但退出码是 0 —— 调用者会以为成功")
+    combined = r.stdout + r.stderr
+    assert "FAILED stages" in combined, (
+        f"没有明确说哪些阶段失败：{combined[-300:]}")
+    assert "不完整" in combined, "没提醒产物是不完整的"
+    import glob
+    for p in glob.glob(os.path.join(ROOT, "logs", "research-__failtest-*.log")):
+        os.remove(p)
+    import shutil
+    shutil.rmtree(os.path.join(ROOT, "artifacts", "__failtest"), ignore_errors=True)

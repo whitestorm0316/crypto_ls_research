@@ -1026,3 +1026,32 @@ mw_ret_names = pool_mean + excess_select + excess_weight
 - **「没评估」不许长得像「通过」**：MC 块曾 `if mc:` → 产物不在盘就一行不输出，于是
   「13/13」是在**唯一可证伪的判据从未跑过**时报出来的。合法两类：`(informational)` 与
   `未评估`；测试**同时扣掉**这两类，**未声明的变红**。守卫 `test_acceptance_completeness.py`。
+
+---
+
+## 新机器初始化数据（Q58–Q60 细节）
+
+## 新机器初始化数据（Q58–Q60）——**`init_linux.sh` + `DEPLOY_LINUX.md`**
+- 入口 `scripts/init_linux.sh`（幂等）→ `download` → `asset_class --build` → `funding_build`
+  → **5b 重建基线产物**。依赖只有 **numpy/pandas/scipy/matplotlib/seaborn/pytest**。
+  ⚠️ **`data_cache*/`、`artifacts/**`、凭据全被 gitignore** ⇒ 新机器上空的。
+- 🔴 **代理端口写在默认值里**：三个客户端（`okx_client`/`binance_client`/`okx_private`）读同一个
+  `OKX_PROXY`，**默认 `127.0.0.1:7897`**（开发机端口）⇒ 换机器报 **`[Errno 111] Connection
+  refused`**（**看不出是代理问题**）。修法只需 `export OKX_PROXY=...`，**不用改代码**；
+  `OKX_PROXY=`（空）⇒ 直连。⚠️ `DEFAULT_PROXY` 是**模块导入时**求值 ⇒ **必须 export 再起进程**。
+  脚本有**代理体检**（下载前，不通就 exit 1）。
+- 🔴 **`--end` 默认是硬编码 `2026-09-26` 且为排他上界** ⇒ 照默认跑**静静少二十来天、不报错**。
+  必须显式给 `$(date -u -d tomorrow +%Y-%m-%d)`（macOS 是 `-v+1d`）。
+- 🔴 **`artifacts/` 被 gitignore ⇒ 新机器页头必显示「基线数据缺失」**（只追踪 6 个 .md）。
+  重建 **10 秒**：`scripts/rebuild_optimal_baseline.py`（只跑 `base`；参数**从 `webapp/spec.py`
+  派生**）。⚠️ **`--override` 走 `json.loads`** ⇒ 列表必须写成 **JSON 数组**（逗号串会被
+  **逐字符**解析成 36 个因子）。⚠️ `asset_class` 缺新合约 **fail-loud 退出**（不是警告）。
+- 🔴 **重建的数字 ≠ 记录值，且不可修复**（两条机制）：① **`--end` 被 `load_panels` 刻意
+  忽略**（网格总延伸到缓存最新 bar，"不截断样本尾部"）⇒ 区间总是到"今天"；② 候选池从
+  「今天的实时挂单」建 ⇒ 新上市合约进池。实测 9-29→10-16：宇宙 **140→154**、
+  Sharpe **1.9372→1.9688**（用基线 140 只后 **1.9258**，残差来自区间）。**记录值只是
+  某时点快照。**
+- 🔴 **别覆盖已验收基线**：`baseline.pkl`(33MB) + `tables/` 是**同一 tag 的两半**，只
+  `cp -r tables` 等于没备份。实测覆盖后 5 个回撤窗口立刻失效（W2 −0.1082→−0.1131）且
+  **换不回来** ⇒ `rebuild_optimal_baseline.py` **默认拒绝覆盖**（要 `--force`）。
+- ⚠️ **`CRYPTO_CACHE_DIR` 设了就必须两端指同一个**；要两边可比就连 `meta/` 一起拷。

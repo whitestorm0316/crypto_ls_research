@@ -740,6 +740,73 @@ def _inst_list(insts):
     return "all", insts
 
 
+def _open_log(spec: str, tag: str) -> Optional[str]:
+    """决定日志落到哪；返回路径（失败返回 None，**不因为写不了日志就中断回测**）。"""
+    if spec == "auto":
+        repo = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                            "..", ".."))
+        d = os.path.join(repo, "logs")
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        # tag 常含下划线（`v5_1d_all5`），直接拼会出 `research__v5_1d_all5_...`。
+        # 用 `-` 把两段隔开，文件名一眼能看出哪段是 tag。
+        spec = os.path.join(d, f"research-{tag or 'default'}-{stamp}.log")
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(spec)), exist_ok=True)
+        open(spec, "a", encoding="utf-8").close()      # 立刻探测可写性
+    except OSError as e:
+        print(f"[log] WARNING: 写不了日志 {spec}: {e}（回测继续，只是没有日志）",
+              flush=True)
+        return None
+    return spec
+
+
+def _tee_to(path: str) -> None:
+    """把 stdout/stderr 分出一份到 `path`，同时保留终端输出。
+
+    ⚠️ 用**类**而不是 `contextlib.redirect_stdout`：回测跑很久，且
+    `stage_*` 里可能 spawn 子进程；用类包住 `write` 最不容易漏。
+    ⚠️ 必须**同时**写终端 —— 只写文件的话你在终端看不到进度，会以为卡死了。
+    """
+    logf = open(path, "a", encoding="utf-8")
+
+    class _Tee:
+        def __init__(self, stream):
+            self.stream = stream
+
+        def write(self, data):
+            self.stream.write(data)
+            try:
+                logf.write(data)
+                logf.flush()                # 崩了也要能看到最后一行
+            except Exception:               # noqa: BLE001
+                pass
+            return len(data)
+
+        def flush(self):
+            try:
+                self.stream.flush()
+                logf.flush()
+            except Exception:               # noqa: BLE001
+                pass
+
+        def isatty(self):
+            return getattr(self.stream, "isatty", lambda: False)()
+
+    sys.stdout = _Tee(sys.stdout)
+    sys.stderr = _Tee(sys.stderr)
+
+    import atexit
+
+    def _close():
+        try:
+            logf.close()
+        except Exception:                   # noqa: BLE001
+            pass
+    atexit.register(_close)
+
+    print(f"### 日志同时写入 {path}", flush=True)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--bar", default="1h")
@@ -759,7 +826,23 @@ def main() -> None:
     ap.add_argument("--stages", nargs="*", default=[
         "base", "exec", "beta", "funding", "freq", "turnover", "ablation", "ic",
         "sens", "wf", "mc", "capacity", "bias", "charts"])
+    ap.add_argument("--log", nargs="?", const="auto", default="auto",
+                    metavar="PATH",
+                    help="输出同时写进日志文件。**默认就开**（logs/research_<tag>_<时间>.log）"
+                         "—— 回测往往跑几十分钟，而原先它**只在终端打印**，窗口一关"
+                         "就查不到「为什么失败」。给 PATH 就写那里；"
+                         "`--log ''`（空）可关掉")
     a = ap.parse_args()
+
+    # 🔴 **回测原先不写任何日志文件**（76 个 `print()` 全去 stdout）。
+    #    于是「回测失败了去哪里看日志」的答案是"没有地方" —— 窗口一关就没了。
+    #    这里在**跑之前**就把 stdout/stderr 分出一份到文件，并且把
+    #    **异常也写进去**（不然日志里只有半截输出，看不出为什么停）。
+    log_path = None
+    if a.log:                                  # `--log ''` ⇒ 空串 ⇒ 关掉
+        log_path = _open_log(a.log, a.tag)
+        if log_path:
+            _tee_to(log_path)
 
     set_tag(a.tag)
     for o in a.override:
@@ -800,6 +883,7 @@ def main() -> None:
           f"({a.rebalance_days}d) window={a.start}..{a.end} jobs={a.n_jobs}", flush=True)
 
     summary = {}
+    failed: List[str] = []          # 失败的阶段名（收尾时非零退出）
     for s in a.stages:
         fn = {
             "base": stage_base, "exec": stage_exec, "beta": stage_beta,
@@ -812,17 +896,32 @@ def main() -> None:
         }.get(s)
         if fn is None:
             print(f"  unknown stage: {s}", flush=True)
+            failed.append(s)                 # 拼错的阶段名也算失败
             continue
         st = time.time()
         try:
             summary[s] = fn(a.bar, rebal, a.start, a.end, insts, a.n_jobs, a.quick)
         except Exception as e:                                # noqa: BLE001
             import traceback
+            # 🔴 **失败必须记下来**。原先只 `print` + `traceback`，然后
+            #    **正常走到结尾、退出码 0** —— 于是"回测失败"在调用者眼里是成功：
+            #      * `init_linux.sh` / CI 会当成通过；
+            #      * 产物只写了一半，下一次读的人无从判断它是完整的还是残缺的。
+            #    （实测：故意传一个不存在的因子，退出码是 0。）
+            failed.append(s)
             print(f"  !! stage {s} failed: {type(e).__name__}: {e}", flush=True)
             traceback.print_exc()
         print(f"  [{s}] {time.time()-st:.0f}s", flush=True)
 
     print(f"\n### total {time.time()-t0:.0f}s", flush=True)
+    if failed:
+        # 非零退出，并在最后一行说清「哪些阶段失败了、产物不完整」。
+        print(f"\n### FAILED stages: {failed}\n"
+              f"### 上面的产物是**不完整**的 —— 别把它当成一次成功的回测。",
+              flush=True)
+        sys.exit(1)
+    if log_path:
+        print(f"### 日志：{log_path}", flush=True)
 
 
 if __name__ == "__main__":
