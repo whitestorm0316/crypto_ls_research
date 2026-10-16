@@ -67,14 +67,12 @@
   唯一来源 `/api/spec` 四个 headline 字段；引用旧指标须带 `spec.RECORDED_NOTE`。**页面提到一个
   控件就必须真有那个控件**；`smoke_live.js` 须**逐字段镜像 `boot()`**。
 - **判据坏了不许靠改判据变绿**（资金费那条 FAIL 继续报，旁边加 `pass=None` 行、不计门禁）；
-  `check_traps` 的 `rev_short` **错过两次** ⇒ **警告的理由必须和用户做的事是同一件事**；
-  **禁止「整文件不含某字符串」**→切定义块再查；**相邻对断言**优于「包含某数」。纪律见
-  `dashboard-data-consistency`。
+  **警告的理由必须和用户做的事是同一件事**；**禁止「整文件不含某字符串」**→切定义块再查；
+  **相邻对断言**优于「包含某数」。纪律见 `dashboard-data-consistency`。
 - ⚠️ **`/api/` 错误必须是 JSON**：`BaseHTTPRequestHandler` 对**没实现的方法**回 `501 + HTML`
-  ⇒ 前端 `resp.json()` 抛 `Unexpected token '<'`、**根因全藏住**。⚠️ 旧进程 `GET` 全正常、
-  **只有新方法回 501**。**`fmt.dol` 两位小数**（例外：真·亚分钱用有效数字）；**负号在 `$` 前**。
-- ⚠️ 写启动/变异脚本三坑：`.command` 选解释器要验**能 import numpy/pandas**；bash **`$VAR（`
-  吞全角括号** ⇒ 紧跟非 ASCII 写 `${VAR}`；**变异脚本还原放 `finally`**+打 sha。
+  ⇒ 前端 `resp.json()` 抛 `Unexpected token '<'`、**根因全藏住**。**`fmt.dol` 两位小数**；
+  **负号在 `$` 前**。⚠️ 写启动/变异脚本三坑：解释器要验**能 import numpy/pandas**；
+  bash **`$VAR（` 吞全角括号** ⇒ 写 `${VAR}`；**变异脚本还原放 `finally`**。
 
 ## 数据源可切换 / 换交易所（Q40）——**表格全在 `RULES-OPS.md`**
 - **缓存目录唯一来源 = `settings.CACHE_DIR`**（读 `CRYPTO_CACHE_DIR`）；`store.CACHE` 与
@@ -112,32 +110,30 @@
   （Sharpe 1.82→1.10→0.46）。**杠杆唯一作用是保证金**（$70 在 5× 下缓冲 $0 ⇒ **18.4% 反向波动即亏光**）。
 
 ## 无人值守 + 通知（Q49–Q53）——**细节整节在 `RULES-OPS.md`**
-- 🔴 **执行者是控制台自己**（双重 fork + `setsid()`；`webapp/auto_schedule.py`，**启动时自恢复**），
-  **走和网页按钮同一队列**。到点判定是**窗口**不是阈值、错过**不补**；`enabled`/`running`
-  是两个量、派生 `will_trade`（⚠️ 测试覆盖**四种组合**、mock 打**对对象**）。
+- 🔴 **执行者是控制台自己**（`webapp/auto_schedule.py`，**启动时自恢复**），**走和网页按钮
+  同一队列**。到点判定是**窗口**不是阈值、错过**不补**；`enabled`/`running` 是两个量、
+  派生 `will_trade`（⚠️ 测试覆盖**四种组合**、mock 打**对对象**）。
 - 🔴 **通知要和「执行」一起搬**；`execute()` 的 `action` 恒为 `"rebalance"` ⇒ **必须翻译**；
   拦截原因填 **`blocked_by`**。⚠️ **返回是嵌套的**而格式化器读**扁平**键 ⇒ 消息**全是「—」**。
-- ⚠️ **两个毛敞口差一个 NAV 倍**（倍数 vs USDT）⇒ **倍数大得离谱时先怀疑单位**。
+- ⚠️ **两个毛敞口差一个 NAV 倍** ⇒ **倍数大得离谱时先怀疑单位**。
 - 🔴 **沙箱代理只在工具调用期间存活**（控制台继承 `HTTP_PROXY`）⇒ 11:00 `urlopen` 报
   **`Errno 61`**，而**订单照下** ⇒ "交易成功、通知静默"。修法 `build_opener(ProxyHandler({}))`。
   ⚠️ **通知结果落进 `runs.jsonl`**（写回要 `reversed()`）；**自检端点须由控制台进程自己发**。
-- 🔴 **模块重复加载**（`import live_api` vs `from webapp import live_api` 是两个对象）
-  ⇒ 线程建在 A、HTTP 读 B。**统一用包路径导入**。
+- 🔴 **模块重复加载**（`import live_api` vs `from webapp import live_api` 是两个对象）⇒
+  线程建在 A、HTTP 读 B。**统一用包路径导入**。
 
 ## 鉴权 / 二重认证 / 外网（Q54–Q57）——**细节整节在 `RULES-OPS.md`**
 - 🔴 **闸门在唯一入口**（`_gate()` 挂在 `do_GET/POST/DELETE` 开头），**不散在各端点**；
   `_PUBLIC_API` 是**白名单**。未登录回 **JSON 401**（不是 302）；闸门须在**路由之前** ⇒
   未登录时「存在/不存在」路径回**同一个** 401（否则是枚举通道）。
-- 🔴 **白名单别手写文件名**（写 `/app.js` 而页面请求 `/static/app.js` ⇒ 只剩空壳、**日志一切
-  正常**）⇒ 用**前缀**；守卫**从 `index.html` 抓 `src=`/`href=`**。🔴 **同一条规则写两遍就
-  会不一致**（`_gate` 的「未建账号」分支又抄一遍 ⇒ **连「创建账号」按钮都没有**）。
-- 🔴 **前端改动必须真渲染再断言**（我两轮 grep/裸 socket "验证通过"、用户看到空白页）。
+- 🔴 **白名单别手写文件名**（写 `/app.js` 页面请求 `/static/app.js` ⇒ 只剩空壳、**日志正常**）
+  ⇒ 用**前缀**；守卫**从 `index.html` 抓 `src=`/`href=`**。🔴 **同一条规则写两遍就会不一致**。
+- 🔴 **前端改动必须真渲染再断言**（我两轮 grep/裸 socket "通过"、用户看到空白页）。
   🔴 **`ROOT` 从别的文件抄会多爬一级**（`webapp/*` 一层、`execution/*` 两层）。
 - 🔴 **`==` 与 `compare_digest` 行为相同** ⇒ 只验 True/False 的测试**抓不到**替换。
-- **明文绑非本机 ⇒ 拒绝启动**；⚠️ `Secure` 跟**「浏览器那一段」的协议**（本进程 TLS **或**
-  `X-Forwarded-Proto: https` **且来自本机**）。🔴 **隧道 ≠ TLS 已解决** ⇒ 明文绑 `127.0.0.1`；
-  🔴 **Host 头要校验**（回 **421**）⇒ 防 DNS rebinding；⚠️ 用**后缀**匹配。
-- 🔴 **门禁测试两个方向都要验**。⚠️ **变异 `-k` 选错 ⇒ 0 selected 会被当成「抓到」**。
+- **明文绑非本机 ⇒ 拒绝启动**；⚠️ `Secure` 跟**「浏览器那一段」的协议**。🔴 **隧道 ≠
+  TLS 已解决** ⇒ 明文绑 `127.0.0.1`；🔴 **Host 头要校验**（回 **421**）⇒ 防 rebinding。
+- 🔴 **门禁测试两个方向都要验**。⚠️ **变异 `-k` 选错 ⇒ 0 selected 被当成「抓到」**。
 
 ## 新机器 / 产物初始化（Q58–Q60）——**`init_linux.sh` + `DEPLOY_LINUX.md`**
 - 入口 `scripts/init_linux.sh`（幂等）→ `download` → `asset_class --build` → `funding_build`
@@ -145,31 +141,37 @@
   ⚠️ **`data_cache*/`、`artifacts/**`、凭据全被 gitignore** ⇒ 新机器上空的。
 - 🔴 **代理端口写在默认值里**：三个客户端读同一个 `OKX_PROXY`，**默认 `127.0.0.1:7897`**
   （开发机端口）⇒ 换机器报 **`[Errno 111] Connection refused`**（**看不出是代理问题**）。
-  修法只需 `export OKX_PROXY=...`，**不用改代码**；空 ⇒ 直连。⚠️ `DEFAULT_PROXY` 是
-  **模块导入时**求值 ⇒ **必须 export 再起进程**。脚本有**代理体检**。
+  修法只需 `export OKX_PROXY=...`；空 ⇒ 直连。⚠️ 是**模块导入时**求值 ⇒ **必须 export
+  再起进程**。脚本有**代理体检**。
 - 🔴 **`--end` 默认硬编码 `2026-09-26` 且为排他上界** ⇒ 照默认跑**静静少二十来天、不报错**。
-  必须显式给 `$(date -u -d tomorrow +%Y-%m-%d)`（macOS 是 `-v+1d`）。
 - 🔴 **页头「基线数据缺失」是必然**（`artifacts/` 不在 git）。重建 **10 秒**：
   `rebuild_optimal_baseline.py`（只跑 `base`；参数**从 `webapp/spec.py` 派生**）。
-  ⚠️ **`--override` 走 `json.loads`** ⇒ 列表必须写成 **JSON 数组**（逗号串会被**逐字符**解析）。
-  ⚠️ `asset_class` 缺新合约 **fail-loud 退出**。
+  ⚠️ **`--override` 走 `json.loads`** ⇒ 列表须写 **JSON 数组**；`asset_class` 缺新合约
+  **fail-loud 退出**。
 - 🔴 **重建的数字 ≠ 记录值，不可修复**：① `--end` 被 `load_panels` **刻意忽略**（区间总到
-  "今天"）；② 候选池从「今天的实时挂单」建。实测 9-29→10-16：宇宙 **140→154**、
-  Sharpe **1.9372→1.9688**（用基线 140 只后 **1.9258**）。**记录值只是某时点快照。**
-- 🔴 **别覆盖已验收基线**：`baseline.pkl`(33MB) + `tables/` 是**同一 tag 的两半** ⇒
+  "今天"）；② 候选池从「今天的实时挂单」建 ⇒ 9-29→10-16 宇宙 **140→154**、Sharpe
+  **1.9372→1.9688**（用基线 140 只后 **1.9258**）。**记录值只是某时点快照。**
+- 🔴 **别覆盖已验收基线**：`baseline.pkl`(33MB)+`tables/` 是**同一 tag 的两半** ⇒
   `rebuild_optimal_baseline.py` **默认拒绝覆盖**（要 `--force`）。
 
-## 回测日志 / 失败退出码（Q61）
-- 🔴 **`run.research` 原先不写任何日志文件**（76 个 `print()` 全去 stdout）⇒
-  「回测失败了去哪看日志」**没有答案**（窗口一关就没了）。`logs/` 里那几份
-  `research_*.log` 是**手工 `> logs/...`** 重定向的，**不是代码功能**。
-  现在 `--log` **默认开**（`logs/research-<tag>-<时间戳>.log`），`--log ''` 关。
-- 🔴 **阶段失败原先退出码是 0**（`except` 里只 print+traceback）⇒
-  `init_linux.sh` / CI / `cmd && next` 会把**失败当成功**，而产物只写了一半。
-  现在收集 `failed` 列表、收尾 `sys.exit(1)`，并打印 `### FAILED stages: [...]`
-  + 「产物是**不完整**的」。
+## 内存：2GB 机器跑全量回测会被 OOM（Q62）
+- 🔴 **退出码 `-9` = SIGKILL = OOM killer**，**不是代码报错** ⇒ 日志里**没有 traceback**
+  （进程被外部杀）。「**停在某行 + 无 traceback**」本身就是诊断。
+- **实测**（154 只 × 50.7k bars）：`load_panels` 后 **1.24 GB**、峰值 **2.19 GB** ⇒ **2GB
+  机器必然 OOM**。40 只约 0.8 GB、60 只约 1.0 GB。
+- ✅ **降内存（已做，不改变数值）**：`_read_one(downcast=True)` 读进来就转 **float32**
+  （单只 3.25→1.83 MB）；宽表建完 `del raw`。峰值 **2193→1977 MB**。⚠️ 安全的原因：
+  `wide()` 最后本来就 `astype("float32")`，只是把转换**提前**。守卫**真跑两次逐位比**。
+- ✅ **2GB 机器加 swap（4G）而不要缩宇宙** —— 缩宇宙会让 Sharpe 与验收基线不可比，
+  而页头会把它当"当前最优"显示（**谎报**）。`init_linux.sh` 有**内存体检**。
+
+## 回测日志 / 失败退出码（Q61）——细节在 `DEPLOY_LINUX.md`
+- 🔴 **原先不写任何日志文件**（76 个 `print()` 全去 stdout）⇒「失败了去哪看日志」
+  **没有答案**。⭐ 现在 `--log` **默认开**（`logs/research-<tag>-<时间戳>.log`）。
+- 🔴 **阶段失败原先退出码是 0** ⇒ `init_linux.sh`/CI/`cmd && next` 把**失败当成功**，
+  而产物只写了一半。现在收集 `failed` 列表、收尾 `sys.exit(1)` + `### FAILED stages`。
 - ⚠️ **改完 `.py` 第一件事是 `ast.parse`**（我 Edit 时把两行粘成一行，靠它抓到）。
-- ⚠️ 临时看日志用 `... 2>&1 | tee logs/x.log`（**必须 tee**：`>` 会让终端一片空白）。
+- ⚠️ 临时看日志用 `... 2>&1 | tee logs/x.log`（**必须 tee**）。
 
 ## 测试约定
 - 期望值必须**从 fixture 派生**，别写死；断言用**页面同一格式化器**推导（时区一改就红）。

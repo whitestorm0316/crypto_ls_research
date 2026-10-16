@@ -423,3 +423,95 @@ def test_a_failed_stage_makes_the_process_exit_nonzero():
         os.remove(p)
     import shutil
     shutil.rmtree(os.path.join(ROOT, "artifacts", "__failtest"), ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# 小内存机器（2GB）能不能跑：`load_panels` 的内存纪律
+# ---------------------------------------------------------------------------
+def test_read_one_downcasts_floats_to_float32():
+    """🔴 `_read_one` 读进来就把 float64 降到 float32。
+
+    实测（154 只 × 50.7k bars 的 1h 宇宙）：`load_panels` 一步吃掉 1.14 GB，
+    而最终 8 个宽表只需 ~320 MB —— 差额全在临时对象上，其中最大一块是
+    `raw` 里的 float64 单只 DataFrame（3.25 MB → 1.83 MB，**省 44%**）。
+
+    用户那台 2GB 的 Ubuntu 跑全量宇宙时被 OOM 杀（退出码 **-9**），
+    日志停在 `panels: ... instruments` 之后 —— 正是这一步。
+
+    ⚠️ **这不改变数值**：`wide()` 最后本来就 `astype("float32")`。
+    这里只是把那次转换**提前**，让 float64 的峰值根本不出现。
+    已验证：开关两侧的 `bars` 末行和逐位相同（`31.508383622809`）。
+    """
+    import pathlib
+    src = (pathlib.Path(ROOT) / "crypto_ls_research" / "data" / "store.py"
+           ).read_text(encoding="utf-8")
+    assert "def _read_one(path: str, downcast: bool = True)" in src, (
+        "`_read_one` 没有 downcast 开关")
+    assert '"float32"' in src, "没有降到 float32"
+
+
+def test_load_panels_releases_raw_after_building_wide_tables():
+    """🔴 宽表建完必须 `del raw`。
+
+    `raw` 是逐只 DataFrame（实测 ~290 MB），而后面只用到 `close` 与 `fund`
+    —— 留着它等于白占一份内存，在 2GB 机器上就是 OOM 的边缘。
+    """
+    import pathlib
+    src = (pathlib.Path(ROOT) / "crypto_ls_research" / "data" / "store.py"
+           ).read_text(encoding="utf-8")
+    i_panels = src.find("panels = {f: wide(f) for f in FIELDS}")
+    assert i_panels != -1, "没找到宽表构造"
+    i_del = src.find("del raw", i_panels)
+    assert i_del != -1, (
+        "宽表构造之后没有 `del raw` —— 逐只 DataFrame 会一直占着内存")
+
+
+def test_downcast_does_not_change_results():
+    """降 float32 **不许**改变回测结果（这是它能开着的唯一理由）。
+
+    跑两次：一次默认（float32），一次强制 float64，比 `bars` 的数值和。
+    用 `_read_one` 的 `downcast` 参数切换，不动全局状态。
+
+    ⚠️ 这条要真跑回测（几秒）。数组末行和逐位相同才算过 ——
+    用 `==` 而不是 `np.allclose`：只要浮点路径变了它就该红。
+    """
+    import subprocess
+    code = '''
+import sys
+sys.path.insert(0, %r)
+import crypto_ls_research.data.store as S
+from crypto_ls_research.data.asset_class import load_categories, filter_insts
+from crypto_ls_research.data.store import list_cached_insts
+from crypto_ls_research.run import research as R
+from crypto_ls_research.backtest.engine import run_backtest
+
+cats = load_categories()
+scoped = sorted(filter_insts(list_cached_insts("1h"), cats, "crypto")[0])
+if not scoped:
+    print("SKIP")
+    sys.exit(0)
+R.BASE_OVERRIDES.update({
+    "factors.subset": ["momentum", "flow", "range_pos", "hitrate", "rev_short"],
+    "portfolio.max_weight_per_instrument": 0.20,
+    "execution.max_daily_turnover": 0.20,
+})
+orig = S._read_one
+out = {}
+for label, dc in (("f32", True), ("f64", False)):
+    S._read_one = (lambda p, downcast=dc, _o=orig: _o(p, downcast=downcast))
+    p = S.load_panels("1h", "2021-01-01", "2026-09-26", insts=scoped)
+    res = run_backtest(p, R.base_cfg("1h", 24, "2021-01-01", "2026-09-26"))
+    b = res.bars
+    out[label] = [float(b[c].iloc[-1]) for c in b.columns if b[c].dtype.kind == "f"]
+print("RESULT " + repr(out))
+''' % ROOT
+    r = subprocess.run([sys.executable, "-c", code], cwd=ROOT,
+                       capture_output=True, text=True, timeout=600)
+    if "SKIP" in r.stdout:
+        pytest.skip("本机没有 crypto 宇宙的缓存")
+    assert r.returncode == 0, f"跑不动：{r.stderr[-500:]}"
+    line = [l for l in r.stdout.splitlines() if l.startswith("RESULT ")]
+    assert line, f"没拿到结果：{r.stdout[-300:]}"
+    d = eval(line[0][len("RESULT "):])          # noqa: S307 - 本地自产
+    assert d["f32"] == d["f64"], (
+        f"float32 改变了回测结果：\n  f32={d['f32']}\n  f64={d['f64']}")

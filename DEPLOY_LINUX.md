@@ -230,6 +230,61 @@ meta/inst_category.json  OK
 
 ---
 
+## 4a) ⚠️ 小内存机器（2GB 及以下）：先加 swap
+
+**症状**：回测跑到 `panels: ... bars x ... instruments` 之后**戛然而止**，
+`scripts/rebuild_optimal_baseline.py` 报 **`★ 回测失败（退出码 -9）`**。
+
+**`-9` = SIGKILL = 被 OOM killer 杀了**（不是代码报错）。用 `dmesg` 确认：
+
+```bash
+dmesg | grep -i -E "killed process|out of memory" | tail -5
+```
+
+### 内存需求是实测出来的
+
+| 宇宙 | `load_panels` 后 | 回测峰值 |
+|---|---|---|
+| 154 只（crypto，全量） | 1.0 GB | **2.0 GB** |
+| 60 只 | 0.6 GB | 1.0 GB |
+| 40 只 | 0.5 GB | 0.8 GB |
+
+**2GB 机器跑全量宇宙会压线**（峰值 2.0GB vs 物理 2GB），必须加 swap：
+
+```bash
+# 建一个 4G 的 swap 文件（一次性，几分钟）
+sudo fallocate -l 4G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=4096
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+
+# 开机自动挂
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+
+# 确认
+free -h && swapon --show
+```
+
+> ⚠️ 用 `fallocate` 在有些文件系统（如某些 overlayfs）上会失败，
+> 那就用 `dd`（慢但一定能成）。见上面的 `||` 分支。
+
+加完 swap 后重跑即可 —— **宇宙不变，所以数字仍与验收基线同口径**
+（只是跑到 swap 时会慢一些）。
+
+### 不想加 swap？那就缩小宇宙（但数字不可比）
+
+```bash
+python -m crypto_ls_research.run.research --stages base --tag v5_1d_all5 \
+  --bar 1h --rebalance-days 1.0 --asset-class crypto \
+  --max-insts 40 \
+  --override 'factors.subset=["momentum","flow","range_pos","hitrate","rev_short"]' \
+  --override 'portfolio.max_weight_per_instrument=0.20' \
+  --override 'execution.max_daily_turnover=0.20'
+```
+
+⚠️ 但宇宙从 154 只变 40 只 ⇒ **Sharpe 会明显不同、且与验收基线不可比**。
+页头会显示这个新数字，而它**不是**验收的那个配置。
+
 ## 4b) 回测失败了，日志在哪？
 
 **`logs/` 目录，文件名形如 `research-<tag>-<时间戳>.log`。**

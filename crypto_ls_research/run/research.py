@@ -828,7 +828,7 @@ def main() -> None:
         "sens", "wf", "mc", "capacity", "bias", "charts"])
     ap.add_argument("--log", nargs="?", const="auto", default="auto",
                     metavar="PATH",
-                    help="输出同时写进日志文件。**默认就开**（logs/research_<tag>_<时间>.log）"
+                    help="输出同时写进日志文件。**默认就开**（logs/research-<tag>-<时间>.log）"
                          "—— 回测往往跑几十分钟，而原先它**只在终端打印**，窗口一关"
                          "就查不到「为什么失败」。给 PATH 就写那里；"
                          "`--log ''`（空）可关掉")

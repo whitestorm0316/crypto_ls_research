@@ -53,11 +53,30 @@ class Panels:
         return v.where(np.isfinite(v))
 
 
-def _read_one(path: str) -> Optional[pd.DataFrame]:
+def _read_one(path: str, downcast: bool = True) -> Optional[pd.DataFrame]:
+    """Read one cached parquet.
+
+    🔴 `downcast=True` 把浮点列降到 **float32**。这不是微优化，是**能不能在
+    2GB 机器上跑起来**的区别：
+
+    实测（154 只 × 50.7k bars 的 1h 宇宙）`load_panels` 一步就吃掉 1.14 GB，
+    而最终 8 个宽表只需要 ~320 MB —— 差额全在**临时对象**上，其中最大的一块
+    就是 `raw` 里的 float64 单只 DataFrame（**3.25 MB → 1.83 MB，省 44%**）。
+
+    ⚠️ 这**不改变任何数值**：`wide()` 最后本来就 `astype("float32")`
+    （旁边那段注释解释了为什么 float32 的 ~1e-7 相对精度足够）。
+    所以这里只是把那次转换**提前**，让 float64 的峰值根本不出现。
+    """
     if not os.path.exists(path):
         return None
     df = pd.read_parquet(path)
-    return df if len(df) else None
+    if not len(df):
+        return None
+    if downcast:
+        fcols = df.select_dtypes(include=["float64"]).columns
+        if len(fcols):
+            df = df.astype({c: "float32" for c in fcols})
+    return df
 
 
 def list_cached_insts(bar: str, cache: str = CACHE) -> List[str]:
@@ -146,6 +165,10 @@ def load_panels(bar: str, start: str, end: str, insts: Optional[List[str]] = Non
         return w.astype("float32")
 
     panels = {f: wide(f) for f in FIELDS}
+    # 🔴 **宽表建完立刻丢 raw**。raw 是 195 只逐帧 DataFrame（实测 ~290 MB），
+    #    而下面只用到 `close` 与 `fund` —— 留着它等于白占一份内存，
+    #    在 2GB 机器上就是 OOM 的边缘。
+    del raw
     close = panels["close"]
 
     # ---- funding, aggregated into the bar it settles in ---------------------

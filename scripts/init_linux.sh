@@ -300,6 +300,60 @@ else
   echo "  这是刻意的 —— 每次跑前拉网 = 每次在**不同的**历史上下结论，基线就不可比了。"
 fi
 
+# ---------------------------------------------------------------------------
+step "体检：内存够不够跑回测（2GB 机器必看）"
+# ---------------------------------------------------------------------------
+# 🔴 实测内存需求（154 只 × 50.7k bars 的 1h 宇宙）：
+#      load_panels 后 1.0 GB → 回测峰值 **2.0 GB**
+#    ⇒ **2GB 机器会压线**，症状是回测跑到 `panels: ... instruments` 之后
+#      戛然而止、退出码 **-9**（SIGKILL = OOM killer），日志里没有 traceback。
+#      用户就是在腾讯云 2GB 机器上撞的这个。
+MEM_MB="$("$PY" - <<'PYCHK' 2>/dev/null || echo "0"
+import os
+try:
+    with open("/proc/meminfo") as f:
+        for ln in f:
+            if ln.startswith("MemTotal:"):
+                print(int(ln.split()[1]) // 1024); break
+        else:
+            print(0)
+except OSError:
+    print(0)
+PYCHK
+)"
+SWAP_MB="$("$PY" - <<'PYCHK' 2>/dev/null || echo "0"
+import os
+try:
+    with open("/proc/meminfo") as f:
+        for ln in f:
+            if ln.startswith("SwapTotal:"):
+                print(int(ln.split()[1]) // 1024); break
+        else:
+            print(0)
+except OSError:
+    print(0)
+PYCHK
+)"
+if [ "$MEM_MB" = "0" ]; then
+  echo "  （读不到 /proc/meminfo，跳过）"
+else
+  echo "  物理内存 ${MEM_MB} MB，swap ${SWAP_MB} MB"
+  if [ "$MEM_MB" -lt 3000 ] && [ "$SWAP_MB" -lt 2000 ]; then
+    warn "内存偏小且**没有 swap** —— 全量回测大概率会被 OOM 杀掉（退出码 -9）"
+    echo "     回测实测峰值约 **2.0 GB**（154 只宇宙）。加个 swap 就行："
+    echo "       sudo fallocate -l 4G /swapfile || sudo dd if=/dev/zero of=/swapfile bs=1M count=4096"
+    echo "       sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile"
+    echo "       echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab"
+    echo "     或者缩小宇宙（约 40 只 → 0.8 GB，但数字与验收基线不可比）："
+    echo "       ... --max-insts 40"
+    echo "     详见 DEPLOY_LINUX.md 的「4a) 小内存机器」"
+  elif [ "$MEM_MB" -lt 3000 ] && [ "$SWAP_MB" -ge 2000 ]; then
+    ok "内存偏小但有 swap（${SWAP_MB} MB）—— 能跑，跑到换页时会慢一些"
+  else
+    ok "内存看起来够（峰值约 2.0 GB）"
+  fi
+fi
+
 step "完成"
 cat <<'EOF'
   日常维护（在已初始化的机器上）：
