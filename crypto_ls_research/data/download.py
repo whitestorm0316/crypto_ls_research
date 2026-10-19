@@ -33,7 +33,7 @@ from typing import Dict, List
 
 import pandas as pd
 
-from ..config.settings import CACHE_DIR
+from ..config.settings import CACHE_DIR, default_end
 from ..data.binance_client import (KLINES_SAFE_RATE_PER_SEC, BinanceClient,
                                    okx_base)
 from ..data.okx_client import OKXClient
@@ -339,7 +339,7 @@ def main() -> None:
     ap.add_argument("--reuse-pool", action="store_true",
                     help="reuse the existing candidate_pool.json / instruments.parquet "
                          "instead of rebuilding the pool from today's live listings")
-    ap.add_argument("--end", default="2026-09-26")
+    ap.add_argument("--end", default=default_end())
     ap.add_argument("--rate", type=float, default=11.0)
     ap.add_argument("--workers", type=int, default=12)
     ap.add_argument("--source", choices=("okx", "binance"), default="okx",

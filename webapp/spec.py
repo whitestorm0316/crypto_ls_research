@@ -24,7 +24,8 @@ from __future__ import annotations
 # compared the two.  The factor set had the same exposure with no guard at all --
 # see `tests/test_accepted_factor_set.py`.)
 from crypto_ls_research.config.settings import (ACCEPTED_FACTORS,
-                                                ACCEPTED_REBALANCE_DAYS)
+                                                ACCEPTED_REBALANCE_DAYS,
+                                                default_end)
 
 # ---------------------------------------------------------------------------
 # the verified optimum (artifacts/OPTIMIZATION_RESULTS.md, tag `v5_1d_all5`)
@@ -354,7 +355,11 @@ SPEC: dict = {
         {"key": "_cli.start", "label": "起始日期", "type": "text",
          "default": "2021-01-01", "level": "core"},
         {"key": "_cli.end", "label": "结束日期", "type": "text",
-         "default": "2026-09-26", "level": "core"},
+         # 默认值跟"今天"走（`settings.default_end()`）。写死过一个 `2026-09-26`
+         # —— 那是**验收窗口**的上界，不是新跑的默认上界：照默认跑会静静少
+         # 二十来天且不报错。⚠️ 本模块在长跑的控制台里只 import 一次，所以
+         # `server.py::_spec_payload` 每次请求都会把这个 default 重算一遍。
+         "default": default_end(), "level": "core"},
         {"key": "_cli.capital", "label": "初始资金（USD）", "type": "number",
          "default": 100000.0, "min": 10000.0, "max": 100_000_000.0,
          "step": 10000.0, "level": "adv",
@@ -607,7 +612,7 @@ def build_run_args(ov: dict, cli: dict, stages: list, tag: str, n_jobs: int = 4)
         "--rebalance-days", str(cli.get("rebalance_days", OPTIMAL_CLI["rebalance_days"])),
         "--asset-class", str(cli.get("asset_class", "crypto")),
         "--start", str(cli.get("start", "2021-01-01")),
-        "--end", str(cli.get("end", "2026-09-26")),
+        "--end", str(cli.get("end") or default_end()),
         "--capital", str(cli.get("capital", 100000.0)),
         "--n-jobs", str(int(n_jobs)),
         "--stages", *stages,

@@ -47,7 +47,8 @@ from ..analysis import sensitivity as sens_mod
 from ..analysis import walkforward as wf_mod
 from ..analysis.sweep import run_sweep, sweep_table
 from ..backtest.engine import run_backtest
-from ..config.settings import BARS_PER_DAY, BacktestConfig, default_config
+from ..config.settings import (BARS_PER_DAY, BacktestConfig, default_config,
+                               default_end)
 from ..data.asset_class import ASSET_CLASSES, filter_insts, load_categories, scope_summary
 from ..data.store import CACHE, list_cached_insts, load_panels
 from ..factors.engine import FACTOR_NAMES
@@ -103,6 +104,24 @@ def save_json(obj, name: str) -> None:
     with open(p, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=1, default=str)
     print(f"    -> {os.path.relpath(p, ART)}", flush=True)
+
+
+def load_frozen_insts(path: str, bar: str) -> tuple[list, list]:
+    """读一份冻结横截面，返回 (缓存里有的, 缓存里缺的)。
+
+    为什么单独拎出来：`--insts-from` 的全部价值在于**同一个横截面能被复现**，
+    所以"清单与缓存求交"这件事必须能被单独断言 —— 埋在 `main()` 里就只能靠
+    跑一次完整回测去验，而那种验证在本仓库付过 1.8 GB 的代价。
+
+    接受三种形状：`{"insts": [...]}`（本仓库 `00c_universe_insts.json`）、
+    `{"kept_insts": [...]}`（`00b_universe_scope.json`）、或裸 JSON 数组。
+    """
+    with open(path, encoding="utf-8") as f:
+        frozen = json.load(f)
+    if isinstance(frozen, dict):
+        frozen = frozen.get("insts") or frozen.get("kept_insts") or []
+    cached = set(list_cached_insts(bar))
+    return [i for i in frozen if i in cached], [i for i in frozen if i not in cached]
 
 
 def base_cfg(bar: str, rebal: int, start: str, end: str, capital: float = 100_000.0,
@@ -812,10 +831,15 @@ def main() -> None:
     ap.add_argument("--bar", default="1h")
     ap.add_argument("--rebalance-days", type=float, default=1.0)
     ap.add_argument("--start", default="2021-01-01")
-    ap.add_argument("--end", default="2026-09-26")
+    ap.add_argument("--end", default=default_end())
     ap.add_argument("--capital", type=float, default=100_000.0)
     ap.add_argument("--n-jobs", type=int, default=4)
     ap.add_argument("--max-insts", type=int, default=0)
+    ap.add_argument("--insts-from", default=None, metavar="PATH",
+                    help="冻结横截面：读一份 00c_universe_insts.json（或任何 "
+                         '{"insts": [...]} / JSON 数组），只跑这些标的。'
+                         "用来复现同一份横截面 —— 缓存是增量累积的，"
+                         "不冻结的话隔几周再跑就是另一个宽度。")
     ap.add_argument("--asset-class", default="all", choices=list(ASSET_CLASSES),
                     help="scope the traded pool; 'crypto' drops OKX's tokenised "
                          "equity/ETF and commodity perps (instCategory 3/4)")
@@ -854,12 +878,28 @@ def main() -> None:
     from ..config.settings import BARS_PER_DAY as _BPD
     rebal = max(1, int(round(a.rebalance_days * _BPD[a.bar])))
     insts = None
-    if a.max_insts:
+    scope_source = "cache"          # 这份横截面是怎么来的（落进 00c 供复现）
+    if a.insts_from:
+        # 🔴 **冻结清单优先**：给定文件就是"这次要跑的标的集合"，不再按资产类
+        #    过滤 —— 那个过滤是**建清单时**做的事，重复做一次只会让"复现"变成
+        #    "复现+再筛一遍"。
+        insts, missing = load_frozen_insts(a.insts_from, a.bar)
+        print(f"### insts-from {a.insts_from}: {len(insts) + len(missing)} 个冻结标的 -> "
+              f"{len(insts)} 个在缓存里"
+              + (f"（缺 {len(missing)} 个：{missing[:5]}"
+                 f"{'...' if len(missing) > 5 else ''}）" if missing else ""),
+              flush=True)
+        if not insts:
+            raise SystemExit(
+                f"[insts-from] {a.insts_from} 与 data_cache/candles/{a.bar} 没有交集 "
+                f"—— 检查 bar 是否一致、或先把那些标的下载下来。")
+        scope_source = f"insts_from:{os.path.basename(a.insts_from)}"
+    elif a.max_insts:
         p = os.path.join(CACHE, "meta", "candidate_pool.json")
         with open(p) as f:
             insts = sorted(set(json.load(f)["by_volume"][: a.max_insts] + ["BTC-USDT-SWAP",
                                                                           "ETH-USDT-SWAP"]))
-    if a.asset_class != "all":
+    if a.asset_class != "all" and scope_source == "cache":
         cats = load_categories()
         pool = insts if insts is not None else list_cached_insts(a.bar)
         scoped, unknown = filter_insts(pool, cats, a.asset_class)
@@ -878,6 +918,22 @@ def main() -> None:
                    "dropped_by_class": detail, "kept_insts": scoped},
                   "00b_universe_scope")
         insts = scoped
+        scope_source = f"asset_class:{a.asset_class}"
+
+    # ---- 把横截面**显式化并落盘** -------------------------------------------
+    # `load_panels(insts=None)` 读的是**整个缓存目录**，而缓存是增量累积的：
+    # 下过什么就永远在里面，越用越宽。于是同一份代码 + 同一组参数，隔几周再跑
+    # 就是另一个横截面 —— 2026-10-19 实测：缓存 161 个标的时 Sharpe 1.696，
+    # 补到 205 个之后 2.014，差 0.32，而日志里**一个字都没有**。
+    # 现在每次运行都把实际参与的那份清单写进 `00c_universe_insts.json`，
+    # 下次 `--insts-from` 指回来就能复现同一个横截面。
+    if insts is None:
+        insts = list_cached_insts(a.bar)
+        scope_source = "cache(全部缓存标的)"
+    save_json({"bar": a.bar, "n": len(insts), "source": scope_source,
+               "insts": insts}, "00c_universe_insts")
+    print(f"### universe: {len(insts)} 个标的（source={scope_source}）"
+          f" -> tables/00c_universe_insts.json", flush=True)
     t0 = time.time()
     print(f"### research run: bar={a.bar} rebalance={rebal} bars "
           f"({a.rebalance_days}d) window={a.start}..{a.end} jobs={a.n_jobs}", flush=True)

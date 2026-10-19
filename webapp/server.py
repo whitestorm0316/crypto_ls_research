@@ -8,6 +8,7 @@ Run:  python webapp/server.py 8770
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
@@ -29,6 +30,7 @@ from spec import (  # noqa: E402
     OPTIMAL_CLI, OPTIMAL_HEADLINE, OPTIMAL_TAG, PRESETS, SPEC, STAGE_BUNDLES,
     build_run_args, check_traps,
 )
+from crypto_ls_research.config.settings import CACHE_DIR, default_end  # noqa: E402
 import trades  # noqa: E402
 import auth  # noqa: E402
 
@@ -835,8 +837,9 @@ class Handler(BaseHTTPRequestHandler):
                 base = self._baseline()
                 hl = self._headline(base)
                 return self._json({
-                    "spec": SPEC, "presets": self._presets(hl),
+                    "spec": self._spec_payload(), "presets": self._presets(hl),
                     "bundles": STAGE_BUNDLES,
+                    "data": self._data_status(),
                     "optimal_tag": OPTIMAL_TAG,
                     # The accepted revision's *grid*, so the page can say which
                     # configuration the acceptance actually describes instead of
@@ -1100,6 +1103,89 @@ class Handler(BaseHTTPRequestHandler):
             if os.path.isfile(os.path.join(d, "01_headline_metrics.json")):
                 out.append(n)
         return out
+
+    # -- readiness ---------------------------------------------------------
+    def _spec_payload(self):
+        """`SPEC` with the window defaults recomputed **for this request**.
+
+        `SPEC` is module state, built once at import.  A console left running for
+        a week would otherwise keep offering the date it booted with as the
+        default `--end` -- which is the same failure as the hard-coded
+        `2026-09-26` it replaced, only slower and harder to notice.
+
+        Deep copy, because `check_traps`/`build_run_args` also read `SPEC`; the
+        project has already been bitten once by mutating module state in place.
+        """
+        spec = copy.deepcopy(SPEC)
+
+        def walk(node):
+            """`SPEC` 是 {"groups": [...], "global": [...]}，字段散在两层里 ——
+            按固定路径找会漏（第一版就是 `spec.get("fields")`，什么都找不到，
+            于是"跟今天走"的默认值根本没生效，而且**看起来一切正常**）。"""
+            if isinstance(node, dict):
+                if node.get("key") == "_cli.end":
+                    node["default"] = default_end()
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+
+        walk(spec)
+        return spec
+
+    def _data_status(self):
+        """Is there anything to backtest on?
+
+        On a fresh clone `data_cache/` is **empty** -- data is gitignored -- and
+        the console used to know nothing about it: page fine, buttons fine, and
+        the first sign of trouble was a `FileNotFoundError` from the run you
+        just queued.  Whatever is missing, and the command that fixes it, has to
+        be visible *before* the button is pressed.
+
+        Deliberately stdlib-only: reading the last bar would need pandas, and
+        this process is already the memory-sensitive one (see the OOM notes in
+        MEMORY.md).  `cache_mtime` is labelled for what it is -- the newest write
+        to the cache, not the last bar's timestamp.
+        """
+        cdir = os.path.join(CACHE_DIR, "candles", "1h")
+        files = ([f for f in os.listdir(cdir) if f.endswith(".parquet")]
+                 if os.path.isdir(cdir) else [])
+        mtime = None
+        if files:
+            try:
+                newest = max(files, key=lambda f: os.path.getmtime(os.path.join(cdir, f)))
+                mtime = time.strftime("%Y-%m-%d %H:%M",
+                                      time.localtime(os.path.getmtime(
+                                          os.path.join(cdir, newest))))
+            except OSError:
+                mtime = None
+
+        missing = []
+        if not files:
+            missing.append({
+                "what": "K 线缓存（data_cache/candles/1h 是空的）",
+                "fix": "./scripts/init_macos.command",
+            })
+        if not os.path.isfile(os.path.join(CACHE_DIR, "meta", "inst_category.json")):
+            missing.append({
+                "what": "资产分类快照 data_cache/meta/inst_category.json",
+                "fix": "python -m crypto_ls_research.data.asset_class --build",
+            })
+        if not os.path.isdir(os.path.join(CACHE_DIR, "funding_hyb")) and \
+                not os.path.isdir(os.path.join(CACHE_DIR, "funding")):
+            missing.append({
+                "what": "资金费序列（funding/ 与 funding_hyb/ 都不存在，净收益会虚高）",
+                "fix": "python -m crypto_ls_research.data.funding_build",
+            })
+
+        return {
+            "ok": not missing,
+            "candles": len(files),
+            "cache_mtime": mtime,
+            "has_baseline": self._baseline() is not None,
+            "missing": missing,
+        }
 
     def _run_brief(self, r):
         return {

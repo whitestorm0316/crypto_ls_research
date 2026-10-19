@@ -95,6 +95,10 @@ function optOv() {
 const S = {
   spec: null, presets: [], bundles: [], lib: {}, baseline: null,
   acceptance: null, headline: null,
+  /* 数据就绪状态（/api/spec 的 `data`）：`ok:false` 时页面必须先说清楚缺什么。
+   * 数据与产物都被 .gitignore 排除，新 clone 下来必然是空的 —— 而这件事以前
+   * 只在「点了运行回测」之后以 FileNotFoundError 的形式出现。 */
+  data: null,
   cli: {}, ov: {}, stages: ['base', 'charts'], bundleId: 'fast', preset: 'custom',
   warnings: [], runs: [], active: null, queued: [],
   selected: null, detail: null, logOffset: 0, logTimer: null, logRunId: null, chartTimer: null,
@@ -182,6 +186,7 @@ async function boot() {
     const d = await r.json();
     S.spec = d.spec; S.presets = d.presets; S.bundles = d.bundles;
     S.lib = d.lib_defaults || {}; S.baseline = d.baseline; S.optimalTag = d.optimal_tag;
+    S.data = d.data || null;
     S.optimalCli = d.optimal_cli || {};
     S.acceptance = d.acceptance || null; S.headline = d.optimal_headline || null;
   } catch (e) {
@@ -525,6 +530,11 @@ function renderContent() {
   el.classList.toggle('live', S.tab === 'live');
   let h = `<div class="banners">`;
 
+  // 数据/产物没就绪时**先于一切**说清楚。放在最前面是因为下面那条「当前参数 =
+  // 已验收最优配置」会一本正经地报告一组指标（或说「基线数据缺失」），而真正的
+  // 原因在更上一层：盘上根本没有 K 线。用户点「运行回测」只会拿到一个 traceback。
+  if (S.data && S.data.ok === false) h += dataBanner();
+
   const diffs = diffFromOptimal();
   if (!diffs.length) {
     const bh = baselineHeadline();
@@ -778,6 +788,26 @@ const statusText = (s) => ({
 function banner(cls, ico, title, body) {
   return `<div class="banner ${cls}"><div class="ico">${ico}</div>
     <div><b>${esc(title)}</b><p>${body}</p></div></div>`;
+}
+
+/* 数据没初始化时的横幅。缺什么、该跑哪条命令，都由 `/api/spec` 的 `data` 字段
+ * 给（`server.py::_data_status`），**不在前端写死** —— 这里只负责排版。
+ * 不写死清单的理由和别处一样：同一条规则写两遍，两遍就会不一致。 */
+function dataBanner() {
+  const d = S.data || {};
+  const n = (d.candles == null ? 0 : d.candles);
+  const items = (d.missing || []).map((m) =>
+    `<li>${esc(m.what)}<br><span class="mono muted">${esc(m.fix)}</span></li>`).join('');
+  return banner('danger', '!', '行情数据没初始化 —— 现在点「运行回测」会立刻失败',
+    // ⚠️ 正文里**不要用 `<b>`**：`.banner b { display: block }` 会让它单独占一行，
+    //    一句话被切成三段（"缓存里有 / 0 / 个 1h 标的"）。要强调就用 `.mono`。
+    `缓存里有 <span class="mono">${esc(String(n))}</span> 个 1h 标的`
+    + `${d.cache_mtime ? `（最新写入 ${esc(d.cache_mtime)}）` : ''}，缺：`
+    + `<ul style="margin:6px 0 0 18px;padding-left:6px">${items}</ul>`
+    + `<div style="margin-top:8px" class="muted">数据与产物都不入库`
+    + `（它们在 .gitignore 里），所以新 clone 必然是空的，这一步不会自动发生。`
+    + `先双击 <span class="mono">scripts/init_macos.command</span>`
+    + `（Linux 上 <span class="mono">scripts/init_linux.sh --quick</span>），约 40–60 分钟。</div>`);
 }
 
 /* ============================== 交易记录 ============================== */

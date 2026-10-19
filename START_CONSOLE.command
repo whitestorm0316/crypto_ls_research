@@ -80,6 +80,21 @@ echo "  本窗口请保持打开（关掉窗口 = 中台停止）。"
 echo "  在这个中台里点「启动自动任务」才能生效。"
 echo
 
+# 🔴 **先看数据在不在**，别等用户点了「运行回测」才从 FileNotFoundError 里猜。
+#    数据与产物都被 `.gitignore` 排除 ⇒ 新 clone 下来 data_cache/ 是空的，
+#    此时控制台**能起、能看页面**，但任何回测都会在第一个阶段退出。这条检查
+#    不阻止启动（页面本身还有用），只把「缺什么、该跑哪条命令」说在前面。
+CANDLES="$ROOT/data_cache/candles/1h"
+if [ ! -d "$CANDLES" ] || [ -z "$(ls -A "$CANDLES" 2>/dev/null)" ]; then
+  echo "  ⚠️  data_cache/ 是空的（数据不入库，新 clone 必然如此）。"
+  echo "      现在起控制台，点「运行回测」会立刻失败："
+  echo "        FileNotFoundError: data_cache/meta/inst_category.json"
+  echo "      先初始化行情数据（双击，约 40–60 分钟）："
+  echo "        scripts/init_macos.command"
+  echo "      控制台仍会启动，可以看页面、改参数，但跑不了回测。"
+  echo
+fi
+
 "$PY" "$ROOT/webapp/server.py" 8790
 rc=$?
 

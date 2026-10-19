@@ -10,7 +10,41 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, asdict
+from datetime import date, datetime, timedelta, timezone
 from typing import Dict, List, Tuple
+
+
+# ----------------------------------------------------------------------------
+# the default end of a *new* run's window
+# ----------------------------------------------------------------------------
+def default_end(today: date | None = None) -> str:
+    """Default upper bound for `--end`: **tomorrow's UTC date** (exclusive).
+
+    Why this is a function and not the literal it used to be
+    -------------------------------------------------------
+    `2026-09-26` was the upper bound of the *acceptance window*, and it got
+    hard-coded as the default of `--end` in four places (research CLI, download
+    CLI, the console's form default, and the run-arg builder).  The consequence
+    on a fresh machine was silent and expensive:
+
+        run `data.download` with no `--end`  -> cache stops at 2026-09-26
+        run `run.research` with no `--end`   -> window stops at 2026-09-26
+        neither prints anything              -> "the backtest just has fewer bars"
+
+    Measured on 2026-10-19: 23 missing days / 23 missing rebalances, and the
+    headline read 1.696 instead of 2.014 -- with no error anywhere.
+
+    So the default now tracks today, and the frozen date survives only where it
+    *means* something: the acceptance window (`walkforward.LOCKED_OOS`, the
+    per-year slices, the `exp_*` scripts that reproduce a recorded number).
+    A frozen constant is a *record*; a frozen default is a trap.
+
+    Exclusive bound => tomorrow, not today: bars up to and including today's
+    partial day stay inside the window.
+    """
+    d = today or datetime.now(timezone.utc).date()
+    return (d + timedelta(days=1)).isoformat()
+
 
 # ----------------------------------------------------------------------------
 # data cache root
@@ -323,6 +357,10 @@ class ExecutionConfig:
 class BacktestConfig:
     bar: str = "15m"
     start: str = "2021-01-01"
+    # ⚠️ 这是**验收窗口的纪录**，不是"新跑的默认上界"。真正决定窗口的是
+    # `base_cfg(bar, rebal, start, end)` 的显式参数与 CLI 的 `--end`
+    # （默认 `default_end()` = 明天 UTC）。别把本字段当成默认值来读：
+    # 历史上正是因为把 2026-09-26 当成默认值，新机器上照默认跑会静静少二十来天。
     end: str = "2026-09-26"
     rebalance_bars: int = 96          # = 1 day @15m by default
     initial_capital: float = 100_000.0

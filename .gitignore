@@ -44,6 +44,12 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 logs/
+# pid 文件（控制台/下载/初始化链路的进程号）。放仓库内是因为 /tmp 在两次工具
+# 调用之间会被清空，而 pidfile 放外面就"探活探不到"。
+# ⚠️ 必须写成 `/run/`（带前导斜杠 = 只匹配仓库根）：写成 `run/` 会**同时匹配
+#    `crypto_ls_research/run/`**（源码包！）⇒ `git add` 直接拒绝，改动的
+#    `run/research.py` 静默不进提交。
+/run/
 _pyprocs.txt
 .empty_netrc
 *.log
