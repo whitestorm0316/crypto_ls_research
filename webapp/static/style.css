@@ -94,6 +94,9 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
   background: var(--panel); border-bottom: 1px solid var(--border); z-index: 5;
 }
 .brand { display: flex; align-items: baseline; gap: 9px; min-width: 0; }
+/* 页头标识。`.brand` 是 baseline 对齐（h1 与副标题对齐），而 SVG 的基线是它的
+   底边 —— 直接放进去会沉到文字底下，所以单独把它居中。 */
+.brand .logo { width: 22px; height: 22px; align-self: center; flex: 0 0 auto; border-radius: 6px; }
 .brand h1 { margin: 0; font-size: 15px; font-weight: 650; letter-spacing: -.2px; white-space: nowrap; }
 .brand span { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .spacer { flex: 1; }

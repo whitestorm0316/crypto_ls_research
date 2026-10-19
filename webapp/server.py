@@ -830,7 +830,10 @@ class Handler(BaseHTTPRequestHandler):
                 name = os.path.basename(p)
                 ctype = {"css": "text/css; charset=utf-8",
                          "js": "application/javascript; charset=utf-8",
-                         "html": "text/html; charset=utf-8"}.get(
+                         "html": "text/html; charset=utf-8",
+                         # favicon 必须是这个 MIME：回 octet-stream 时 Chrome
+                         # 会**静默不显示**（不报错，标签页就是没有图标）。
+                         "svg": "image/svg+xml"}.get(
                     name.rsplit(".", 1)[-1], "application/octet-stream")
                 return self._file(os.path.join(STATIC, name), ctype)
             if p == "/api/spec":
