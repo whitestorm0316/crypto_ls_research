@@ -2040,6 +2040,43 @@ function liveBarHtml() {
     ${plan ? `<button class="btn sm ${L.mode === 'live' ? 'danger' : 'primary'}" id="liveBarGo" ${blocked || !plan.n_orders ? 'disabled' : ''}>${L.mode === 'live' ? '确认下单' : (L.mode === 'demo' ? '模拟盘下单' : '执行调仓')}</button>` : ''}`;
 }
 
+/* 宇宙体检（Q66）：自动交易读的是盘上 parquet，不是交易所实时清单——
+ * 新合约不进、退市不剔、缺分类会直接打断调仓。这行是唯一能「看见漂移」的地方，
+ * 数据来自 /api/live/status 的 universe_drift（服务端 6h TTL 缓存 + 永不抛）。
+ * 只读展示：这里没有任何按钮，动作（重建池/分类/规格）属于月度例行，见提示文案。 */
+function liveDriftHtml() {
+  const L = S.live;
+  const d = L.status && L.status.universe_drift;
+  if (!d) return '';
+  const usdM = (v) => (v == null ? '?' : '$' + (v / 1e6).toFixed(1) + 'M');
+  const ageTxt = (d.age_hours != null && d.age_hours > 0.01)
+    ? `（${d.age_hours >= 1 ? Math.round(d.age_hours) + ' 小时' : Math.round(d.age_hours * 60) + ' 分钟'}前体检）`
+    : '';
+  if (!d.ok) {
+    const retry = d.retry_in_min != null ? `，${Math.max(0, Math.round(d.retry_in_min))} 分钟后自动重试` : '';
+    return `<div class="banner warn" style="margin-top:10px"><div class="ico">!</div><div>
+      <b>宇宙体检不可用${esc(retry)}</b>
+      <p>${esc(d.error || '未知错误')}${d.stale && d.summary ? ` —— 以下是 ${d.age_hours != null ? Math.round(d.age_hours) + ' 小时' : ''}前的结果：` : ''}</p>
+      ${d.stale && d.summary ? `<p class="mono" style="margin:4px 0 0">${esc(d.summary)}</p>` : ''}
+    </div></div>`;
+  }
+  const clean = !d.n_new && !d.n_dead && !d.n_unclassified && !d.n_missing_specs;
+  if (clean) {
+    return `<p class="desc" style="margin:8px 0 0;color:var(--ok)">✓ 宇宙体检：${esc(d.summary)}${esc(ageTxt)}</p>`;
+  }
+  const rows = [];
+  if (d.n_unclassified) rows.push(`<b style="color:var(--danger)">缺分类 ${d.n_unclassified}</b>（会让调仓直接失败：${esc((d.unclassified || []).slice(0, 5).join('、'))}${d.n_unclassified > 5 ? '…' : ''}）`);
+  if (d.n_dead) rows.push(`退市残留 ${d.n_dead}（${esc((d.dead || []).slice(0, 5).join('、'))}${d.n_dead > 5 ? '…' : ''}）`);
+  if (d.n_missing_specs) rows.push(`缺规格 ${d.n_missing_specs}（新仓会被跳过：${esc((d.missing_specs || []).slice(0, 5).join('、'))}${d.n_missing_specs > 5 ? '…' : ''}）`);
+  if (d.n_new) rows.push(`新达标 ${d.n_new}，其中超 ADV 线 ${d.n_new_above_cut}（例：${(d.new || []).slice(0, 3).map((r) => `${r.inst} ${usdM(r.adv_usd)}`).join('、')}）`);
+  return `<div class="banner warn" style="margin-top:10px"><div class="ico">!</div><div>
+    <b>宇宙有漂移</b> — ${esc(d.summary)}${esc(ageTxt)}
+    <p style="margin:4px 0 0">${rows.join('；')}</p>
+    <p class="desc" style="margin:4px 0 0">跟进要三件一起：重建候选池（download 不带 --reuse-pool）→ <span class="mono">asset_class --build</span> →
+    <span class="mono">specs.refresh_specs()</span>，然后重算信号。宇宙变了 = 策略变了，数字要重新验收。</p>
+  </div></div>`;
+}
+
 function liveSkeleton() {
   const L = S.live;
   const note = L.statusErr
@@ -2048,6 +2085,7 @@ function liveSkeleton() {
   return `${note}
   <h2 class="sec">交易台 <small>信号与回测同源 · 下单前必过风控闸门</small></h2>
   <div class="livebar" id="liveBar">${liveBarHtml()}</div>
+  <div id="liveDrift">${liveDriftHtml()}</div>
   <div class="grid2">
     <div class="panel"><div class="head"><h3>账户与连接</h3><span class="spacer"></span>
       <button class="btn sm ghost" id="liveAcctRefresh" title="重新读取净值与持仓，并记一个净值点（不下单、也不对账）">↻ 刷新账户</button>
@@ -2282,6 +2320,7 @@ function livePaintAll() {
     put('liveJob', liveJobHtml());
     put('liveHist', liveHistHtml());
     put('liveBar', liveBarHtml());
+    put('liveDrift', liveDriftHtml());
     /* 子标签高亮必须在这里同步。以前它只出现在 liveSkeleton() 里，而
      * livePaintAll() 只重绘 #liveHist —— 于是点「成交」表格换了、按钮还亮在
      * 「订单」上，看起来就是"切不过去"。 */

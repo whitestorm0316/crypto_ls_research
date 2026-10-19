@@ -32,6 +32,7 @@ from crypto_ls_research.execution.credentials import (
 from crypto_ls_research.execution.engine import DEFAULT_SIGNAL, LiveEngine
 from crypto_ls_research.execution.limits import LiveLimits, live_confirm_phrase
 from crypto_ls_research.execution.store import Store, archives, reset_mode
+from crypto_ls_research.execution.universe_drift import drift_report
 from crypto_ls_research.execution import auto_ctl
 from crypto_ls_research.execution import navhist
 from crypto_ls_research.execution.auto_trader import (
@@ -544,6 +545,10 @@ def route_get(path: str, q: dict) -> Optional[Tuple[dict, int]]:
         st["jobs"] = _recent_jobs(8)
         st["has_preview"] = mode in _LAST
         st["archives"] = archives(mode)
+        # 宇宙体检（Q66）：调仓引擎读的是**盘上 parquet**，新合约不进、退市不剔、
+        # 缺分类会 fail-loud。这里只读地报差距；模块自带 TTL 缓存 + 永不抛，
+        # 所以挂在每轮状态轮询上是安全的。
+        st["universe_drift"] = drift_report()
         # `record=1` comes from the explicit 「刷新账户」 button, never from the
         # automatic poll -- see `record_nav_mark`.  Read-only callers get a
         # read-only endpoint: they simply omit the flag.
@@ -707,6 +712,9 @@ def route_post(path: str, body: dict) -> Optional[Tuple[dict, int]]:
 
         def run(log):
             payload = eng.preview(force_signal=fresh, only=only, progress=log)
+            # 计划里也带一份宇宙体检（TTL 内几乎免费）：调仓前最后一眼
+            # 「这次决策的宇宙和交易所现状差多远」。
+            payload["universe_drift"] = drift_report()
             _LAST[mode] = payload
             return payload
 
