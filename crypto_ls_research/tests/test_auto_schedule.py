@@ -245,3 +245,29 @@ def test_scheduler_calls_the_same_path_as_the_button(tmp_path, monkeypatch):
     assert kinds == ["refresh", "auto"], (
         f"调度器没有走两次提交（刷新 → 下单）：{kinds}")
     assert out == {"id": "j1"}
+
+
+def test_a_scope_systemexit_does_not_kill_the_scheduler(tmp_path):
+    """🔴 `resolve_insts()` 的 fail-loud 是 `SystemExit`，`except Exception` 接不住。
+
+    于是控制台的调度线程会**死掉**，而 `threading` 把线程里的 `SystemExit`
+    静默吞掉 ⇒ 界面上只有「调度器不在运行」，没有任何原因。
+    同时幂等账也不能写 —— 重建分类快照后，同一个窗口还应该能重试成功。
+
+    触发场景：全量下载把新上市合约拉进了缓存，而 `inst_category.json` 没重建。
+    """
+    def boom(mode):
+        raise SystemExit(
+            "asset-class scope 'crypto' cannot classify 1 cached "
+            "instrument(s): ['CT-USDT-SWAP']")
+
+    s, _, state = _mk(tmp_path, enabled=True, runner=boom)
+    s._maybe_run()
+    assert s.last.get("ok") is False, "SystemExit 没被这一轮接住 —— 线程会死"
+    assert "宇宙分类失败" in (s.last.get("error") or ""), (
+        f"错误信息没指认根因：{s.last.get('error')!r}")
+    assert not state.exists(), "失败却写了幂等账 —— 当天不会再有第二次机会"
+    # 恢复后同一窗口内仍可成功：说明"死"的只是这一轮，不是这个调度器
+    s._runner = lambda mode: {"ok": True}
+    s._maybe_run()
+    assert json.loads(state.read_text())["last_run_day"] == auto_schedule._today()

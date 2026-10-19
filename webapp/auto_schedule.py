@@ -201,6 +201,25 @@ class Scheduler:
         t0 = time.time()
         try:
             res = self._runner(self.mode) or {}
+        except SystemExit as e:
+            # 🔴 和 `auto_trader.once()` 同一个坑：`signal.resolve_insts()` 的
+            #    fail-loud 是 `raise SystemExit`（CLI 里是对的 —— 退出码 1），
+            #    但 **`SystemExit` 不是 `Exception` 的子类** ⇒ 下面那个
+            #    `except Exception` 接不住它 ⇒ 这个调度线程会死，
+            #    而 `threading` 把线程里的 SystemExit **静默吞掉**。
+            #    界面上只看到「调度器不在运行 / 今天没动静」，没有任何原因。
+            #
+            #    触发场景：有人全量下载（不带 `--reuse-pool`）把新合约拉进缓存，
+            #    而 `inst_category.json` 还没重建。
+            self.last = {
+                "ok": False,
+                "error": f"宇宙分类失败：{e} —— "
+                         f"重建后同一窗口会自动重试："
+                         f"python -m crypto_ls_research.data.asset_class --build",
+                "ts": time.time()}
+            self._log(f"[auto] {self.mode} 宇宙分类失败（不写幂等账，"
+                      f"下一轮重试）：{e}")
+            return
         except Exception as e:                                   # noqa: BLE001
             # 例外只记在状态里、**不写幂等账** —— 没成功就该允许在同一窗口内
             # 重试（下一次 tick 会再进来），否则一次网络抖动就等于当天不交易。

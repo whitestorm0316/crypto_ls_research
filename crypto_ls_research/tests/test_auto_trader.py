@@ -581,3 +581,112 @@ def test_an_error_in_the_loop_is_recorded_and_the_loop_keeps_going(tmp_live, mon
     lines = [json.loads(x) for x in
              open(bot.log_path(), encoding="utf-8").read().splitlines() if x.strip()]
     assert any(x["action"] == "error" for x in lines)
+
+
+# ---------------------------------------------------------------------------
+# `SystemExit` 会杀死守护进程（2026-10-19）
+# ---------------------------------------------------------------------------
+def test_once_converts_scope_systemexit_to_runtime_error(tmp_live):
+    """🔴 `once()` 必须把 `SystemExit` 降级成 `RuntimeError`。
+
+    `signal.resolve_insts()` 在「有缓存合约没有分类」时 `raise SystemExit`
+    （fail-loud —— CLI 里是对的）。但 `SystemExit` **不是 `Exception` 的子类**，
+    所以 `loop()` 的 `except Exception` 抓不到它 ⇒ **整个守护进程退出**，
+    只留下 stderr 一行，心跳 / 通知 / 审计里什么都没有。
+
+    触发场景：有人做了一次**全量下载**（不带 `--reuse-pool`），
+    新上市合约有了 parquet，而 `inst_category.json` 还没重建。
+
+    **这是无人值守最坏的失败形态**：进程没了，而控制台上只看得到"没动静"。
+    """
+    from crypto_ls_research.execution.auto_trader import AutoTrader
+
+    eng = FakeEngine(due=False, stale=False, bar_age=0.5)
+
+    def _boom(self, force_signal=False):
+        # ⚠️ 必须先 `calls.append("target")` 再抛 —— 否则断言"走到了 target"
+        #    永远为假（桩替掉了原方法，原方法里那句 append 就不会执行了）。
+        self.calls.append("target")
+        raise SystemExit(
+            "cannot classify 1 cached instrument(s): ['CT-USDT-SWAP']")
+
+    eng.target = _boom.__get__(eng, type(eng))
+    bot = AutoTrader(mode="paper", engine=eng)
+    with pytest.raises(RuntimeError, match="宇宙分类失败"):
+        bot.once()
+    # 降级后的异常必须**能被 loop() 的 except Exception 抓到**
+    # （否则这个修复就等于没做 —— 见 `test_loop_survives_a_scope_failure`）。
+    eng2 = FakeEngine(due=False, stale=False, bar_age=0.5)
+    eng2.target = _boom.__get__(eng2, type(eng2))
+    bot2 = AutoTrader(mode="paper", engine=eng2)
+    try:
+        bot2.once()
+    except RuntimeError:                     # noqa: BLE001
+        pass                                # ← loop() 正是这样接住的
+    else:
+        pytest.fail("once() 抛出的不是 RuntimeError ⇒ loop() 接不住它")
+    assert bot2.stats["checks"] == 0         # 没有伪造成"检查过"
+
+
+def test_loop_survives_a_scope_failure(tmp_live, monkeypatch):
+    """同一条守则的行为版：跑**真的** `loop()`，确认它没被 SystemExit 杀死。
+
+    只测 `once()` 的返回类型是不够的 —— 那证明不了 `except Exception`
+    真的接得住（`SystemExit` 逃逸就是这条规则存在的理由）。
+    这里让 `loop()` 在第一个 tick 之后自己退出，只断言"它活过了第一轮"。
+    """
+    eng = FakeEngine(due=False, stale=False, bar_age=0.5)
+
+    def _boom(self, force_signal=False):
+        # ⚠️ 必须先 `calls.append("target")` 再抛 —— 否则断言"走到了 target"
+        #    永远为假（桩替掉了原方法，原方法里那句 append 就不会执行了）。
+        self.calls.append("target")
+        raise SystemExit(
+            "cannot classify 1 cached instrument(s): ['CT-USDT-SWAP']")
+
+    eng.target = _boom.__get__(eng, type(eng))
+    stop = threading.Event()
+    bot = AutoTrader(mode="paper", engine=eng)
+    orig_once = bot.once
+
+    def _once():
+        try:
+            orig_once()
+        finally:
+            # 在第一个 tick 内就置位：`loop()` 的 sleep 是 5s 切片、每片都查
+            # `stop.is_set()`，所以第一轮结束就退。要断言的是"**第一轮没有
+            # 杀死循环**"，不是它多久退出。
+            stop.set()
+
+    monkeypatch.setattr(bot, "once", _once)
+    t0 = time.time()
+    bot.loop(stop=stop)
+    assert time.time() - t0 < 60, "loop 没有在第一个 tick 后退出"
+    assert bot.stats["errors"] >= 1, "这一轮没被记成 error"
+    # 走到了 target、且**没有**走到 execute：失败发生在算目标仓那一刻，
+    # 下单永远不该被尝试（一个跑不通的宇宙比一次被拒的单严重得多）。
+    assert "target" in eng.calls, f"连 target 都没走到：{eng.calls[:4]}"
+    assert not any(c and (c[0] if isinstance(c, tuple) else c) == "execute"
+                   for c in eng.calls), (
+        f"scope 失败后竟然还去下单了：{eng.calls}")
+
+
+def test_target_call_is_guarded_against_system_exit():
+    """静态守卫：`once()` 里那个 `try/except SystemExit` 必须还在。
+
+    行为测试（上面两条）只在**当前的代码**上成立。而这条防的是回归：
+    有人把 `try` 去掉、改成 `target = self.engine.target(...)` 一行时，
+    行为测试会重新变红 —— 但那时候已经没有这条 if 了，红的是守护进程本身。
+
+    ⚠️ 只扫 `execution/auto_trader.py`，`resolve_insts` 里的 `raise SystemExit`
+    保持原样（CLI 的非零退出靠它，那是**对的**）。
+    """
+    import re as _re
+    import pathlib
+    src = (pathlib.Path(os.path.dirname(__file__)) / ".." / "execution"
+           / "auto_trader.py").read_text(encoding="utf-8")
+    m = _re.search(r"\.target\(force_signal=False\)\s*\n\s*except\s+SystemExit",
+                   src)
+    assert m, ("`once()` 里 `self.engine.target(...)` 没有被 "
+               "`except SystemExit` 包住 ⇒ 分类失败会把守护进程杀掉")
+    assert "宇宙分类失败" in src, "降级后的错误信息要能指认根因，不要只说'本轮出错'"

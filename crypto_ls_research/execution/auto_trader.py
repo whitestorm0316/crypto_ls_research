@@ -544,7 +544,29 @@ class AutoTrader:
         if st.get("stale"):
             return self._finish(out, "skip", "data_stale", t0)
 
-        target = self.engine.target(force_signal=False)
+        try:
+            target = self.engine.target(force_signal=False)
+        except SystemExit as e:
+            # 🔴 `signal.resolve_insts()` 在「有缓存合约没有分类」时是
+            #    `raise SystemExit(...)` —— fail-loud，**在 CLI 里是对的**
+            #    （退出码 1，不静默缩小宇宙）。
+            #
+            #    但 `SystemExit` **不是 `Exception` 的子类** ⇒ 下面
+            #    `loop()` 里那个 `except Exception` 抓不到它 ⇒
+            #    **整个守护进程会退出**，只在 stderr 留一行，
+            #    心跳 / 通知 / 审计里什么都没有（实测：Python 直接 exit 1）。
+            #
+            #    触发场景很具体：**有人做了一次全量下载**（`download` 不带
+            #    `--reuse-pool` ⇒ `build_candidate_pool()` 只问**今天**的挂单，
+            #    新上市合约于是有了 parquet），而 `inst_category.json` 还没重建。
+            #    这正是"要不要把新合约算进来"这个问题的下一步。
+            #    下一次 tick 就会把无人值守交易打死，而界面上看起来"好好地"。
+            #
+            #    在守护进程里它必须降级成"这一轮失败"：记日志、发 error 通知、
+            #    下一轮继续 —— 而不是让进程消失。
+            raise RuntimeError(
+                f"宇宙分类失败：{e} —— 重建分类快照后下一轮自动恢复："
+                f"python -m crypto_ls_research.data.asset_class --build") from None
         out["decision_ts"] = target.decision_ts
         out["next_decision_ts"] = target.next_decision_ts
         out["rebalance_due"] = bool(target.rebalance_due)
