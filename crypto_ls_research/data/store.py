@@ -156,20 +156,21 @@ def load_panels(bar: str, start: str, end: str, insts: Optional[List[str]] = Non
 
     def wide(field: str) -> pd.DataFrame:
         cols = {i: df[field] for i, df in raw.items() if field in df.columns}
-        w = pd.DataFrame(cols)
-        # ⚠️ 顺序有讲究（**每步都省一份全量拷贝**）：
-        #   1) 先 **reindex 到 float32 的 frame** —— `DataFrame(cols, index=grid)`
-        #      一步到位，省掉"建 float64 再 reindex"那一份；
-        #   2) `astype` 放在 `dtype=` 里由构造器完成，不再单独复制。
-        # 原写法是 `DataFrame(cols) → reindex(grid) → astype("float32")`，
-        # 三次全量分配（float64 → float64 → float32）。50k×154 下每份 62MB，
-        # 8 个字段就是 ~1.5GB 的瞬时峰值 —— 2GB 机器上直接被 OOM 杀。
-        w = pd.DataFrame(cols, index=grid, dtype="float32")
+        # 🔴 **性能红线，2026-10-20 A/B 实测**（同机同缓存，compute_live_target
+        #    全路径）：下面这条链 12.8s；曾替代它的
+        #    `pd.DataFrame(cols, index=grid, dtype="float32")`（一步构造）是
+        #    **逐列对齐**的慢路径，109.8s（**慢 8.6 倍**）、峰值内存反而更高
+        #    （2.19GB vs 2.07GB），且结果逐位相同——那次「省内存」的改动
+        #    整体是倒退，已撤销。守卫 test_wide_uses_the_fast_path 钉死本链。
+        #    快路径：无 index 构造（合并成整块）→ astype（先转 float32，
+        #    把下一步 reindex 的拷贝**减半**）→ reindex（一次向量化 take）。
+        #    先转再对齐数值逐位不变：对齐不改值、NaN 保持 NaN（有对拍守卫）。
+        w = pd.DataFrame(cols).astype("float32")
+        return w.reindex(grid)
         # float32 keeps a 50k x 161 panel at ~32 MB per field.  Relative precision is
         # ~1e-7, five orders of magnitude finer than the return granularity we trade,
         # so it cannot move a backtest result -- but it does halve peak memory, which
         # is what lets the parameter sweeps run 4-wide without swapping.
-        return w
 
     panels = {f: wide(f) for f in FIELDS}
     # 🔴 **宽表建完立刻丢 raw**。raw 是 195 只逐帧 DataFrame（实测 ~290 MB），

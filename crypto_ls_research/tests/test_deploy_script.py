@@ -624,22 +624,20 @@ def test_deploy_doc_covers_the_console_oom_path():
 
 
 # ---------------------------------------------------------------------------
-# 内存：`wide()` 的拷贝次数（2026-10-16：用户 2GB 机器普通回测也 OOM）
+# 内存/性能：`wide()` 的构造路径（2026-10-16 引入、2026-10-20 撤销的教训）
 # ---------------------------------------------------------------------------
-def test_wide_builds_in_one_pass():
-    """🔴 `load_panels().wide()` 必须**一步**建成 float32 宽表。
+def test_wide_uses_the_fast_path():
+    """🔴 `load_panels().wide()` 必须走**合并快路径**，禁止一步构造。
 
-    原写法是三步，每步都分配一份**全量**矩阵：
+    2026-10-20 同机同缓存 A/B 实测（compute_live_target 全路径）：
 
-        pd.DataFrame(cols)      # float64，62 MB
-          .reindex(grid)        # 又一份 float64，62 MB
-          .astype("float32")    # 再一份 float32，31 MB
+        DataFrame(cols).astype("float32").reindex(grid)     12.8s  峰值 2.07GB
+        DataFrame(cols, index=grid, dtype="float32")       109.8s  峰值 2.19GB
 
-    50k × 154 下，8 个字段 × 3 份 ⇒ 瞬时峰值 ~1.5 GB。
-    实测：`load_panels` 之后常驻内存 **973 MB → 555 MB（省 418 MB）**。
-
-    ⚠️ **数值必须逐位不变** —— 已用 40 只 × 50k bars 对拍过
-    （NaN 位置相同、逐位相同、最大差 0.0）。
+    一步构造（`index=` + `dtype=`）走的是**逐列对齐**的慢路径：慢 8.6 倍、
+    峰值反而更高、结果逐位相同——那次「省内存」的改动整体是倒退，已撤销。
+    本守卫双向钉死：快路径的三个要素必须在、慢路径的写法不得回潮。
+    （数值逐位不变的证明见 test_wide_cast_before_reindex_is_bit_identical。）
     """
     import pathlib
     src = (pathlib.Path(ROOT) / "crypto_ls_research" / "data" / "store.py"
@@ -647,17 +645,24 @@ def test_wide_builds_in_one_pass():
     i = src.find("def wide(field: str)")
     assert i != -1, "找不到 wide()"
     body = src[i:i + 1200]
-    # 一步构造：DataFrame(cols, index=grid, dtype="float32")
-    assert "index=grid" in body and 'dtype="float32"' in body, (
-        "wide() 没有一步构造 float32 宽表（仍会做多次全量拷贝）")
-    assert ".reindex(grid)" not in body, (
-        "wide() 里还在 reindex —— 那会多分配一份全量矩阵")
-    assert ".astype(\"float32\")" not in body, (
-        "wide() 里还在单独 astype —— 应由构造器的 dtype= 完成")
+    # 只看非 # 行——注释里引用的慢路径写法（性能红线的说明）不算违规
+    code = "\n".join(l for l in body.splitlines() if not l.lstrip().startswith("#"))
+    # 快路径：无 index 构造（合并成整块）→ 先 astype（把 reindex 拷贝减半）→ reindex
+    assert "pd.DataFrame(cols).astype" in code, (
+        "wide() 没有走合并快路径构造")
+    assert ".reindex(grid)" in code, "wide() 丢了 reindex——面板会对不齐"
+    # 慢路径禁止回潮：构造器里带 index=/dtype= 就是那次 8.6 倍减速的写法
+    assert "index=grid" not in code and 'dtype="float32"' not in code, (
+        "wide() 回到了 DataFrame(cols, index=grid, dtype=...) 一步构造——"
+        "那是实测慢 8.6 倍的逐列对齐路径")
 
 
-def test_wide_one_pass_is_bit_identical():
-    """一步构造与三步构造**逐位相同**（这是它敢开着的唯一理由）。"""
+def test_wide_cast_before_reindex_is_bit_identical():
+    """「先 astype 再 reindex」与原始三步（reindex→astype）**逐位相同**。
+
+    这是新顺序敢替换的唯一理由。对拍基准固定为最初的写法
+    `DataFrame(cols).reindex(grid).astype("float32")`。
+    """
     import subprocess
     code = '''
 import sys, numpy as np, pandas as pd, os
@@ -679,10 +684,10 @@ grid = pd.date_range("2021-01-01", "2026-09-26",
                      freq=pd.Timedelta(seconds=SECONDS_PER_BAR["1h"]),
                      inclusive="left", tz="UTC")
 cols = {i: d["close"] for i, d in raw.items()}
-old = pd.DataFrame(cols).reindex(grid).astype("float32")
-new = pd.DataFrame(cols, index=grid, dtype="float32")
-a = old.fillna(-1).to_numpy(); b = new.fillna(-1).to_numpy()
-print("RESULT", bool((old.isna() == new.isna()).all().all()), bool((a == b).all()))
+ref = pd.DataFrame(cols).reindex(grid).astype("float32")     # 最初的三步
+new = pd.DataFrame(cols).astype("float32").reindex(grid)     # 现在的快路径
+a = ref.fillna(-1).to_numpy(); b = new.fillna(-1).to_numpy()
+print("RESULT", bool((ref.isna() == new.isna()).all().all()), bool((a == b).all()))
 ''' % ROOT
     r = subprocess.run([sys.executable, "-c", code], cwd=ROOT,
                        capture_output=True, text=True, timeout=300)
@@ -696,4 +701,4 @@ print("RESULT", bool((old.isna() == new.isna()).all().all()), bool((a == b).all(
     nan_ok, val_ok = (x == "True" for x in
                       line[0][len("RESULT "):].split())
     assert nan_ok and val_ok, (
-        f"一步构造与三步构造结果不同：NaN 位置相同={nan_ok} 逐位相同={val_ok}")
+        f"先转再对齐与原始三步结果不同：NaN 位置相同={nan_ok} 逐位相同={val_ok}")
