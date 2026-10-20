@@ -2069,11 +2069,17 @@ function liveDriftHtml() {
   if (d.n_dead) rows.push(`退市残留 ${d.n_dead}（${esc((d.dead || []).slice(0, 5).join('、'))}${d.n_dead > 5 ? '…' : ''}）`);
   if (d.n_missing_specs) rows.push(`缺规格 ${d.n_missing_specs}（新仓会被跳过：${esc((d.missing_specs || []).slice(0, 5).join('、'))}${d.n_missing_specs > 5 ? '…' : ''}）`);
   if (d.n_new) rows.push(`新达标 ${d.n_new}，其中超 ADV 线 ${d.n_new_above_cut}（例：${(d.new || []).slice(0, 3).map((r) => `${r.inst} ${usdM(r.adv_usd)}`).join('、')}）`);
+  /* 可修的缺口（新达标/缺分类/缺规格）交给「补齐宇宙」按钮；退市残留无害
+   * （旧 parquet 不会进新仓、有持仓会被市价平掉），不给按钮。 */
+  const fixable = d.n_new + d.n_unclassified + d.n_missing_specs;
   return `<div class="banner warn" style="margin-top:10px"><div class="ico">!</div><div>
     <b>宇宙有漂移</b> — ${esc(d.summary)}${esc(ageTxt)}
     <p style="margin:4px 0 0">${rows.join('；')}</p>
-    <p class="desc" style="margin:4px 0 0">跟进要三件一起：重建候选池（download 不带 --reuse-pool）→ <span class="mono">asset_class --build</span> →
-    <span class="mono">specs.refresh_specs()</span>，然后重算信号。宇宙变了 = 策略变了，数字要重新验收。</p>
+    ${fixable ? `<div class="split" style="margin-top:8px;align-items:center">
+      <button class="btn sm primary" id="liveDriftUpgrade">⚡ 补齐宇宙（重建池 + 快照 + funding）</button>
+      <span class="muted" style="font-size:11.5px">重建候选池 → 分类/规格快照 → funding_hyb，约几分钟；完成后需重算信号、重新验收数字</span>
+    </div>`
+      : `<p class="desc" style="margin:4px 0 0">余下缺口（退市残留）无害：旧 parquet 不会进新仓。重算信号即可。</p>`}
   </div></div>`;
 }
 
@@ -3546,6 +3552,15 @@ function liveBind() {
   if (rd) rd.onclick = liveRefreshData;
   const pp = $('#livePrepareBtn');
   if (pp) pp.onclick = livePrepare;
+  /* 「补齐宇宙」：把体检报出的可修缺口一次跑完（重建池+快照+funding）。
+   * 这是**有副作用**的动作——宇宙因此改变，所以必须确认，且完成后
+   * 用户要自己重算信号、重新验收（服务端故意不自动重建基线）。 */
+  const up = $('#liveDriftUpgrade');
+  if (up) up.onclick = () => {
+    if (!window.confirm('补齐宇宙会重建候选池并下载数据（不带 --reuse-pool）：\n'
+      + '自动交易的宇宙会因此改变，完成后必须重算信号、重新验收数字。\n\n继续？')) return;
+    liveSubmit('/api/live/universe/upgrade', {}, '补齐宇宙（重建池 + 快照 + funding）');
+  };
   const bp = $('#liveBarPrepare');
   if (bp) bp.onclick = livePrepare;
   const bg = $('#liveBarGo');

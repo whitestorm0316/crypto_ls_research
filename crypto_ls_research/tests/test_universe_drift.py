@@ -334,18 +334,29 @@ check('drifted: 显示「宇宙有漂移」', h1.includes('宇宙有漂移'));
 check('drifted: 缺分类计数可见', h1.includes('缺分类 ' + PAYLOAD.drifted.n_unclassified));
 check('drifted: 缺分类点名了具体合约', h1.includes(PAYLOAD.drifted.unclassified[0]));
 check('drifted: 新达标样例可见', h1.includes(PAYLOAD.drifted.new[0].inst));
+check('drifted: 有可修缺口 ⇒ 有「补齐宇宙」按钮',
+  h1.includes('id="liveDriftUpgrade"') && h1.includes('补齐宇宙'));
 { const b = divBalance(h1); check('drifted: div 配平', b.depth === 0 && b.minDepth >= 0,
   `end=${b.depth} min=${b.minDepth}`); }
+
+/* 只有退市残留（无其他缺口）时不给按钮：残留无害，没有可修的东西 */
+T.S.live.status = { universe_drift: PAYLOAD.deadOnly };
+const h1b = T.liveDriftHtml();
+check('deadOnly: 显示漂移但不给按钮',
+  h1b.includes('宇宙有漂移') && !h1b.includes('id="liveDriftUpgrade"'));
+{ const b = divBalance(h1b); check('deadOnly: div 配平', b.depth === 0 && b.minDepth >= 0); }
 
 T.S.live.status = { universe_drift: PAYLOAD.clean };
 const h2 = T.liveDriftHtml();
 check('clean: 绿色一行', h2.includes('✓ 宇宙体检') && h2.includes(PAYLOAD.clean.summary));
+check('clean: 没有补齐按钮', !h2.includes('id="liveDriftUpgrade"'));
 { const b = divBalance(h2); check('clean: div 配平', b.depth === 0 && b.minDepth >= 0); }
 
 T.S.live.status = { universe_drift: PAYLOAD.failed };
 const h3 = T.liveDriftHtml();
 check('failed: 显示「宇宙体检不可用」', h3.includes('宇宙体检不可用'));
 check('failed: stale 摘要可见', h3.includes(PAYLOAD.failed.summary));
+check('failed: 没有补齐按钮', !h3.includes('id="liveDriftUpgrade"'));
 { const b = divBalance(h3); check('failed: div 配平', b.depth === 0 && b.minDepth >= 0); }
 
 /* 状态没回来时必须安静、不许报错 */
@@ -409,6 +420,15 @@ def _drift_payload() -> dict:
                    "error": "RuntimeError: network is down",
                    "summary": "盘上 4 · 实时 3 · 新达标 2（超 ADV 线 2） · "
                               "退市残留 1 · 缺分类 1 · 缺规格 1"},
+        "deadOnly": {"ok": True, "stale": False, "from_cache": False,
+                     "age_hours": 0.0, "error": None,
+                     "summary": "盘上 4 · 实时 4 · 新达标 0（超 ADV 线 0） · "
+                                "退市残留 1 · 缺分类 0 · 缺规格 0",
+                     "n_cached": 4, "n_live": 4, "n_new": 0, "n_new_above_cut": 0,
+                     "n_dead": 1, "n_unclassified": 0, "n_missing_specs": 0,
+                     "new": [], "dead": [DEAD], "unclassified": [],
+                     "missing_specs": [], "pool_cut_adv_usd": 20_000_000.0,
+                     "notes": []},
     }
 
 

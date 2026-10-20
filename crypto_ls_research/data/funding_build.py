@@ -42,6 +42,7 @@ import pandas as pd
 from .binance_client import BinanceClient, okx_base
 from .download import CACHE, ensure_dirs
 from .okx_client import OKXClient
+from ..config.settings import default_end
 
 OUTDIR = os.path.join(CACHE, "funding_hyb")
 EIGHT_H = 8 * 3600 * 1000
@@ -97,10 +98,14 @@ def _load_existing(outdir: str = OUTDIR) -> Dict[str, pd.Series]:
     return out
 
 
-def build(start: str = "2021-01-01", end: str = "2026-09-26",
+def build(start: str = "2021-01-01", end: Optional[str] = None,
           rate: float = 8.0, workers: int = 8, verbose: bool = True,
           retries: int = 12, allow_proxy_fallback: bool = True,
           only_proxy: bool = False) -> dict:
+    # `end` 曾是硬编码的 "2026-09-26"（验收窗口上界）——和 download/research 的
+    # `--end` 是同一个坑：照默认跑，funding_hyb 静静停在那天、不报错。现在
+    # 默认 = 明天 UTC（排他上界），见 settings.default_end。
+    end = end or default_end()
     ensure_dirs()
     os.makedirs(OUTDIR, exist_ok=True)
 
@@ -315,6 +320,9 @@ if __name__ == "__main__":
                     help="re-fetch ONLY the instruments currently on the median proxy")
     ap.add_argument("--no-proxy-fallback", action="store_true",
                     help="fail instead of substituting the cross-sectional median")
+    ap.add_argument("--end", default=None,
+                    help="exclusive upper bound, YYYY-MM-DD (default: tomorrow UTC)")
     a = ap.parse_args()
     build(rate=a.rate, workers=a.workers, retries=a.retries,
-          allow_proxy_fallback=not a.no_proxy_fallback, only_proxy=a.only_proxy)
+          allow_proxy_fallback=not a.no_proxy_fallback, only_proxy=a.only_proxy,
+          end=a.end)

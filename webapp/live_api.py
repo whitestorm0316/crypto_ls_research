@@ -782,6 +782,17 @@ def route_post(path: str, body: dict) -> Optional[Tuple[dict, int]]:
 
         return _submit("refresh", "paper", run, label=f"刷新 {bar} 行情"), 200
 
+    if path == "/api/live/universe/upgrade":
+        # 宇宙补齐（Q67）：体检按钮触发的**有副作用**动作——重建候选池（不带
+        # --reuse-pool）→ 分类快照 → 规格快照 → funding。与只读体检不同，它会
+        # 改变自动交易的宇宙，所以前端要确认、这里走同一个任务队列流式打日志。
+        def run(log):
+            from crypto_ls_research.execution.universe_upgrade import upgrade_universe
+            return upgrade_universe(progress=log)
+
+        return _submit("universe-upgrade", "paper", run,
+                       label="补齐宇宙（重建池 + 快照 + funding）"), 200
+
     if path == "/api/live/auto/start":
         return _auto_start(body)
     if path == "/api/live/auto/stop":
