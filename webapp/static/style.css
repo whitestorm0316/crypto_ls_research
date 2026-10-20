@@ -25,8 +25,40 @@
   --ok: #12805c;
   --ok-soft: #e7f6f0;
   --shadow: 0 1px 2px rgba(16, 24, 40, .05), 0 4px 14px rgba(16, 24, 40, .05);
+  --shadow-pop: 0 2px 6px rgba(16, 24, 40, .07), 0 8px 24px rgba(16, 24, 40, .09);
   --mono: ui-monospace, "SFMono-Regular", "Cascadia Mono", Consolas, monospace;
   --sans: system-ui, -apple-system, "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif;
+  /* 设计刻度：圆角与过渡全场只用这三档 + 胶囊，杜绝 5/6/7/8/9/10 混用 */
+  --r-sm: 7px; --r-md: 8px; --r-lg: 10px;
+  --t: .15s ease;
+  /* 原生控件（滚动条、下拉、日期）跟随主题，暗色下不再突兀 */
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) { color-scheme: dark; }
+}
+:root[data-theme="dark"] { color-scheme: dark; }
+
+/* 全局选区色：跟着 accent 走，明暗两套都成立 */
+::selection { background: color-mix(in srgb, var(--accent) 24%, transparent); }
+
+/* 统一键盘焦点环：鼠标点击不出现，Tab 导航才出现 */
+:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* 全局滚动条：此前只有侧栏和主区两处有，其余（表格、日志、任务日志）都是默认样式 */
+*::-webkit-scrollbar { width: 9px; height: 9px; }
+*::-webkit-scrollbar-thumb { background: var(--border); border-radius: 9px; }
+*::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--muted) 55%, transparent); }
+*::-webkit-scrollbar-track { background: transparent; }
+* { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+/* 尊重系统「减弱动态效果」设置 */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
@@ -51,6 +83,7 @@
     --ok: #34c48a;
     --ok-soft: #10302a;
     --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 6px 20px rgba(0, 0, 0, .28);
+    --shadow-pop: 0 2px 6px rgba(0, 0, 0, .45), 0 8px 24px rgba(0, 0, 0, .38);
   }
 }
 :root[data-theme="dark"] {
@@ -75,6 +108,7 @@
   --ok: #34c48a;
   --ok-soft: #10302a;
   --shadow: 0 1px 2px rgba(0, 0, 0, .4), 0 6px 20px rgba(0, 0, 0, .28);
+  --shadow-pop: 0 2px 6px rgba(0, 0, 0, .45), 0 8px 24px rgba(0, 0, 0, .38);
 }
 
 * { box-sizing: border-box; }
@@ -114,16 +148,24 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 
 .btn {
   display: inline-flex; align-items: center; justify-content: center; gap: 7px;
-  height: 34px; padding: 0 15px; border-radius: 8px; cursor: pointer;
+  height: 34px; padding: 0 15px; border-radius: var(--r-md); cursor: pointer;
   border: 1px solid var(--border); background: var(--panel); color: var(--text);
-  font-weight: 550; transition: background .12s, border-color .12s, opacity .12s;
+  font-weight: 550;
+  transition: background var(--t), border-color var(--t), opacity var(--t), box-shadow var(--t), transform .06s ease;
 }
 .btn:hover { background: var(--panel-2); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
+.btn:active { transform: translateY(1px); }
 .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-.btn.primary:hover { filter: brightness(1.08); }
+.btn.primary:hover {
+  background: color-mix(in srgb, var(--accent) 88%, #000);
+  border-color: color-mix(in srgb, var(--accent) 88%, #000);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--accent) 32%, transparent);
+}
 .btn.ghost { background: transparent; }
 .btn.sm { height: 28px; padding: 0 10px; font-size: 12.5px; }
-.btn:disabled { opacity: .5; cursor: not-allowed; }
+.btn:disabled { opacity: .5; cursor: not-allowed; transform: none; box-shadow: none; }
+.btn.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+.btn.danger:hover { background: color-mix(in srgb, var(--danger) 85%, #000); border-color: color-mix(in srgb, var(--danger) 85%, #000); }
 
 .main { display: grid; grid-template-columns: 412px 1fr; min-height: 0; }
 
@@ -137,11 +179,12 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 .side::-webkit-scrollbar-track { background: transparent; }
 
 .card {
-  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
-  margin-bottom: 12px; overflow: hidden;
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-lg);
+  margin-bottom: 12px; overflow: hidden; box-shadow: var(--shadow);
 }
 .card > .head {
   display: flex; align-items: center; gap: 8px; padding: 11px 13px;
+  background: var(--panel-2);
   border-bottom: 1px solid var(--border-2);
 }
 .card > .head h3 { margin: 0; font-size: 13px; font-weight: 650; }
@@ -152,9 +195,10 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 .presets { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; }
 .preset {
   text-align: left; border: 1px solid var(--border); background: var(--panel);
-  border-radius: 8px; padding: 8px 10px; cursor: pointer; transition: .12s;
+  border-radius: var(--r-md); padding: 8px 10px; cursor: pointer;
+  transition: border-color var(--t), background var(--t), box-shadow var(--t);
 }
-.preset:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.preset:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); box-shadow: var(--shadow); }
 .preset.active { border-color: var(--accent); background: var(--accent-soft); }
 .preset b { display: block; font-size: 12.5px; font-weight: 600; }
 .preset small { display: block; color: var(--muted); font-size: 11px; margin-top: 2px; line-height: 1.45; }
@@ -166,11 +210,17 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 .field label { font-size: 12.5px; color: var(--text-2); display: flex; align-items: center; gap: 5px; }
 .field .flag { font-size: 10.5px; font-weight: 700; color: var(--accent); }
 .field input[type=text], .field input[type=number], .field select {
-  width: 100%; height: 30px; padding: 0 8px; border-radius: 7px;
+  width: 100%; height: 30px; padding: 0 8px; border-radius: var(--r-sm);
   border: 1px solid var(--border); background: var(--panel-2); text-align: right;
+  transition: border-color var(--t), background var(--t), box-shadow var(--t);
 }
+.field input:hover, .field select:hover { border-color: color-mix(in srgb, var(--muted) 45%, var(--border)); }
 .field select { text-align: left; }
-.field input:focus, .field select:focus { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: -1px; }
+.field input:focus, .field select:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+}
 .field.changed input, .field.changed select { border-color: var(--accent); background: var(--accent-soft); }
 .field .help { grid-column: 1 / -1; color: var(--muted); font-size: 11px; margin-top: -1px; padding-left: 1px; }
 .field.trap input, .field.trap select { border-color: var(--danger); }
@@ -179,8 +229,9 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 .facgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 4px; }
 .fac {
   display: flex; align-items: center; gap: 8px; padding: 8px 9px; cursor: pointer;
-  border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
-  font-size: 12.5px; transition: .12s; user-select: none;
+  border: 1px solid var(--border); border-radius: var(--r-md); background: var(--panel);
+  font-size: 12.5px; user-select: none;
+  transition: border-color var(--t), background var(--t), opacity var(--t);
 }
 .fac:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
 .fac.on { border-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
@@ -211,7 +262,7 @@ details.adv > .body { padding: 2px 13px 12px; }
 .content::-webkit-scrollbar-thumb { background: var(--border); border-radius: 10px; }
 
 .banners { display: flex; flex-direction: column; gap: 8px; margin-bottom: 14px; }
-.banner { border-radius: 10px; padding: 11px 13px; border: 1px solid; display: flex; gap: 10px; align-items: flex-start; }
+.banner { border-radius: var(--r-lg); padding: 11px 13px; border: 1px solid; display: flex; gap: 10px; align-items: flex-start; }
 .banner .ico { font-size: 14px; line-height: 1.35; }
 .banner b { display: block; font-size: 13px; margin-bottom: 3px; }
 .banner p { margin: 0; font-size: 12px; color: var(--text-2); line-height: 1.6; }
@@ -230,9 +281,11 @@ h2.sec small { color: var(--muted); font-weight: 400; font-size: 12px; }
 
 .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(146px, 1fr)); gap: 9px; }
 .kpi {
-  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-lg);
   padding: 11px 12px; box-shadow: var(--shadow);
+  transition: border-color var(--t), box-shadow var(--t);
 }
+.kpi:hover { border-color: color-mix(in srgb, var(--accent) 22%, var(--border)); box-shadow: var(--shadow-pop); }
 .kpi .k { color: var(--muted); font-size: 11.5px; display: flex; align-items: center; gap: 5px; }
 .kpi .v { font-size: 21px; font-weight: 650; margin-top: 3px; font-variant-numeric: tabular-nums; letter-spacing: -.4px; }
 .kpi .d { font-size: 11.5px; margin-top: 2px; font-variant-numeric: tabular-nums; }
@@ -240,10 +293,12 @@ h2.sec small { color: var(--muted); font-weight: 400; font-size: 12px; }
 .kpi .d.down { color: var(--down); }
 .kpi .d.flat { color: var(--muted); }
 
-.panel { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; box-shadow: var(--shadow); }
+.panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--r-lg); box-shadow: var(--shadow); }
 .panel > .head {
   display: flex; align-items: center; gap: 10px; padding: 11px 14px;
+  background: var(--panel-2);
   border-bottom: 1px solid var(--border-2);
+  border-radius: var(--r-lg) var(--r-lg) 0 0;
 }
 .panel > .head h3 { margin: 0; font-size: 13px; font-weight: 650; }
 .panel > .head .spacer { flex: 1; }
@@ -252,12 +307,19 @@ h2.sec small { color: var(--muted); font-weight: 400; font-size: 12px; }
 table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
 th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--border-2); font-size: 12.5px; }
 th:first-child, td:first-child { text-align: left; }
-th { color: var(--muted); font-weight: 600; font-size: 11.5px; }
+th {
+  color: var(--muted); font-weight: 600; font-size: 11px;
+  text-transform: uppercase; letter-spacing: .04em;
+  white-space: nowrap;
+}
 tbody tr:last-child td { border-bottom: none; }
+tbody tr { transition: background var(--t); }
+tbody tr:hover { background: var(--panel-2); }
 td.num, th.num { font-family: var(--mono); font-size: 12px; }
 td.up { color: var(--up); }
 td.down { color: var(--down); }
 tr.mark td { background: color-mix(in srgb, var(--accent) 9%, transparent); font-weight: 600; }
+tr.mark:hover td { background: color-mix(in srgb, var(--accent) 14%, transparent); }
 
 canvas.chart { width: 100%; height: 260px; display: block; }
 
@@ -298,10 +360,11 @@ pre.log .stage { color: var(--accent); }
 .runs { display: flex; flex-direction: column; gap: 7px; }
 .runrow {
   display: grid; grid-template-columns: auto 1fr auto auto auto auto; gap: 10px; align-items: center;
-  padding: 9px 11px; border: 1px solid var(--border); border-radius: 8px;
-  background: var(--panel); cursor: pointer; transition: .12s;
+  padding: 9px 11px; border: 1px solid var(--border); border-radius: var(--r-md);
+  background: var(--panel); cursor: pointer;
+  transition: border-color var(--t), background var(--t), box-shadow var(--t);
 }
-.runrow:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.runrow:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); box-shadow: var(--shadow); }
 .runrow.sel { border-color: var(--accent); background: var(--accent-soft); }
 .runrow .lbl { min-width: 0; }
 .runrow .lbl b { font-size: 12.5px; font-weight: 600; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -322,7 +385,10 @@ pre.log .stage { color: var(--accent); }
 
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
 .muted { color: var(--muted); }
-.empty { color: var(--muted); font-size: 12.5px; padding: 18px 4px; text-align: center; }
+.empty {
+  color: var(--muted); font-size: 12.5px; padding: 18px 4px; text-align: center;
+  border: 1px dashed var(--border-2); border-radius: var(--r-md); margin: 4px 0;
+}
 
 /* ============================== 标签页 ============================== */
 .tabs {
@@ -333,6 +399,7 @@ pre.log .stage { color: var(--accent); }
   background: transparent; border: 0; border-bottom: 2px solid transparent;
   padding: 8px 13px; font-size: 13px; font-weight: 600; color: var(--muted);
   cursor: pointer; border-radius: 7px 7px 0 0; display: flex; align-items: center; gap: 7px;
+  transition: color var(--t), background var(--t), border-color var(--t);
 }
 .tab:hover { color: var(--text); background: var(--panel-2); }
 .tab.on { color: var(--accent); border-bottom-color: var(--accent); }
@@ -354,9 +421,10 @@ pre.log .stage { color: var(--accent); }
 .modecards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
 .modecard {
   text-align: left; border: 1px solid var(--border); background: var(--panel);
-  border-radius: 10px; padding: 11px 13px; cursor: pointer; font: inherit; color: inherit;
+  border-radius: var(--r-lg); padding: 11px 13px; cursor: pointer; font: inherit; color: inherit;
+  transition: border-color var(--t), background var(--t), box-shadow var(--t);
 }
-.modecard:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); }
+.modecard:hover { border-color: color-mix(in srgb, var(--accent) 45%, var(--border)); box-shadow: var(--shadow); }
 .modecard.on { border-color: var(--accent); background: var(--accent-soft); }
 .modecard.danger.on { border-color: var(--danger); background: var(--danger-soft); }
 .modecard b { display: flex; align-items: center; gap: 7px; font-size: 13px; }
@@ -365,7 +433,8 @@ pre.log .stage { color: var(--accent); }
 .modecard .dotno { width: 7px; height: 7px; border-radius: 50%; background: var(--muted); }
 
 .kv { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 9px; }
-.kv .cell { background: var(--panel-2); border: 1px solid var(--border); border-radius: 8px; padding: 8px 11px; }
+.kv .cell { background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--r-md); padding: 8px 11px; transition: border-color var(--t); }
+.kv .cell:hover { border-color: color-mix(in srgb, var(--muted) 40%, var(--border)); }
 .kv .cell .k { font-size: 10.5px; color: var(--muted); letter-spacing: .02em; }
 .kv .cell .v { font-size: 15px; font-weight: 640; font-variant-numeric: tabular-nums; margin-top: 2px; }
 .kv .cell .s { font-size: 10.5px; color: var(--muted); margin-top: 2px; }
@@ -386,7 +455,7 @@ pre.log .stage { color: var(--accent); }
 .lskew-net.short { color: var(--down); }
 
 .gates { display: flex; flex-direction: column; gap: 7px; }
-.gate { display: flex; gap: 9px; align-items: flex-start; font-size: 12.5px; padding: 9px 11px; border-radius: 8px; }
+.gate { display: flex; gap: 9px; align-items: flex-start; font-size: 12.5px; padding: 9px 11px; border-radius: var(--r-md); }
 .gate.block { background: var(--danger-soft); color: var(--danger); }
 .gate.warn { background: var(--warn-soft); color: var(--warn); }
 .gate.ok { background: var(--ok-soft); color: var(--ok); }
@@ -413,15 +482,18 @@ pre.log .stage { color: var(--accent); }
 
 .liveinput, .liveselect {
   border: 1px solid var(--border); background: var(--panel-2); color: var(--text);
-  border-radius: 7px; padding: 6px 9px; font: inherit; font-size: 12.5px;
+  border-radius: var(--r-sm); padding: 6px 9px; font: inherit; font-size: 12.5px;
+  transition: border-color var(--t), box-shadow var(--t);
 }
-.liveinput:focus, .liveselect:focus { outline: 2px solid color-mix(in srgb, var(--accent) 45%, transparent); outline-offset: -1px; }
+.liveinput:focus, .liveselect:focus {
+  outline: none;
+  border-color: color-mix(in srgb, var(--accent) 55%, var(--border));
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
+}
 .confirmbox {
   border: 1px dashed var(--danger); background: var(--danger-soft);
   border-radius: 9px; padding: 11px 13px; font-size: 12.5px;
 }
-.btn.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
-.btn.danger:hover { background: color-mix(in srgb, var(--danger) 85%, #000); }
 .seg.sm .segbtn { padding: 4px 10px; font-size: 12px; }
 .spin { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
   border: 2px solid color-mix(in srgb, var(--accent) 30%, transparent);
@@ -433,8 +505,12 @@ pre.log .stage { color: var(--accent); }
 .filt label { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
 .filt label.inline { display: flex; align-items: center; gap: 4px; cursor: pointer; }
 .filt select, .filt input[type=text], .filt input:not([type]) {
-  height: 28px; padding: 0 7px; border: 1px solid var(--border); border-radius: 7px;
+  height: 28px; padding: 0 7px; border: 1px solid var(--border); border-radius: var(--r-sm);
   background: var(--panel); font-size: 12.5px; max-width: 210px;
+  transition: border-color var(--t);
+}
+.filt select:hover, .filt input[type=text]:hover, .filt input:not([type]):hover {
+  border-color: color-mix(in srgb, var(--muted) 45%, var(--border));
 }
 .filt input[type=checkbox] { accent-color: var(--accent); }
 .pager {
@@ -473,9 +549,13 @@ pre.log .stage { color: var(--accent); }
   position: sticky; top: 0; z-index: 20;
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   padding: 9px 12px; margin: 0 0 14px;
-  background: var(--panel-2);
-  border: 1px solid var(--border); border-radius: 10px;
-  box-shadow: 0 2px 10px color-mix(in srgb, var(--shadow, #000) 18%, transparent);
+  background: color-mix(in srgb, var(--panel) 88%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid var(--border); border-radius: var(--r-lg);
+  /* 🔴 曾写成 color-mix(in srgb, var(--shadow) 18%, transparent) —— 把一个完整
+   * box-shadow 值当颜色用，声明整体无效，吸顶条其实从来没阴影。 */
+  box-shadow: var(--shadow-pop);
 }
 .livebar .lbmode { font-weight: 700; font-size: 13px; }
 .livebar .lbstate { font-size: 12px; color: var(--muted); }
@@ -483,8 +563,8 @@ pre.log .stage { color: var(--accent); }
 
 /* 交易台次要面板折叠：模式/自动任务/执行日志默认收起，主流程（账户/信号/计划/闸门）突出 */
 details.livefold {
-  border: 1px solid var(--border); border-radius: 10px; background: var(--panel);
-  overflow: hidden;
+  border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--panel);
+  overflow: hidden; box-shadow: var(--shadow);
 }
 details.livefold > summary {
   cursor: pointer; list-style: none; user-select: none;
@@ -504,12 +584,12 @@ table.cmp { min-width: 560px; }
 table.cmp th, table.cmp td { padding: 6px 10px; text-align: left; font-size: 12.5px; }
 table.cmp td.num { text-align: right; font-variant-numeric: tabular-nums; }
 .sub { font-size: 12.5px; color: var(--text-2); margin-bottom: 6px; }
-.sub b { color: var(--text-1); }
+.sub b { color: var(--text); }
 .chart.small { width: 100%; height: 160px; display: block; }
 table.hm { border-collapse: collapse; font-size: 11px; font-variant-numeric: tabular-nums; }
 table.hm th { padding: 3px 6px; text-align: center; color: var(--muted); font-weight: 600; }
 table.hm td { padding: 3px 6px; text-align: center; min-width: 44px; }
-table.hm td.hmc { color: var(--text-1); border: 1px solid var(--border); }
+table.hm td.hmc { color: var(--text); border: 1px solid var(--border); }
 .chips { display: flex; gap: 6px; flex-wrap: wrap; }
 .chip {
   font-family: var(--mono); font-size: 11px; padding: 3px 8px; border-radius: 6px;
