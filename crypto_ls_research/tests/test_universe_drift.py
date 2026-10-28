@@ -313,7 +313,7 @@ let src = fs.readFileSync(APP, 'utf8');
 const entry = src.match(/\n(authRender|boot)\(\);\s*$/);
 if (!entry) throw new Error('app.js 末尾的入口调用未找到（authRender/boot）');
 src = src.slice(0, entry.index) + '\n';
-src += '\n;globalThis.__T = { S, esc, liveDriftHtml, liveSkeleton, liveBarHtml };\n';
+src += '\n;globalThis.__T = { S, esc, liveDriftHtml, liveSkeleton, liveBarHtml, liveJobHtml };\n';
 vm.createContext(sandbox);
 vm.runInContext(src, sandbox, { filename: 'app.js' });
 const T = sandbox.__T;
@@ -358,6 +358,19 @@ check('failed: 显示「宇宙体检不可用」', h3.includes('宇宙体检不�
 check('failed: stale 摘要可见', h3.includes(PAYLOAD.failed.summary));
 check('failed: 没有补齐按钮', !h3.includes('id="liveDriftUpgrade"'));
 { const b = divBalance(h3); check('failed: div 配平', b.depth === 0 && b.minDepth >= 0); }
+
+/* 跑着的任务必须报「已运行 Ns」：否则「刚点下去 3 秒」和「卡了 20 分钟」在界面上
+   完全一样 —— 用户只能猜它是不是死了（真实投诉：「几十分钟还没好」）。 */
+T.S.live.job = { status: 'running', kind: 'universe_upgrade', label: '补齐宇宙',
+                 started: Math.floor(Date.now() / 1000) - 95, elapsed: null,
+                 log: [{ t: 0, msg: '① 重建候选池并增量下载 …' }] };
+const hj = T.liveJobHtml();
+check('running job: 显示已运行时间', /已运行\s*9[0-9]s/.test(hj), hj.slice(0, 200));
+check('running job: 有进行中指示', hj.includes('spin'));
+check('running job: 日志行可见', hj.includes('重建候选池'));
+{ const b = divBalance(hj); check('running job: div 配平', b.depth === 0 && b.minDepth >= 0); }
+T.S.live.job = { status: 'done', elapsed: 42, label: 'x', log: [] };
+check('done job: 显示最终耗时', T.liveJobHtml().includes('42s'));
 
 /* 状态没回来时必须安静、不许报错 */
 T.S.live.status = null;

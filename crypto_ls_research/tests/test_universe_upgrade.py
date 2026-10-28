@@ -190,3 +190,123 @@ def test_frontend_binding_wired():
     assert re.search(r"if \(!window\.confirm\([\s\S]*?\)\) return;", body), \
         "确认框的结果没有 return 门控：确认被旁路了"
     assert "liveSubmit('/api/live/universe/upgrade'" in body
+
+
+# ---------------------------------------------------------------------------
+# 子进程输出必须**边跑边吐**（2026-10-28：用户报「补齐宇宙几十分钟还没好」）
+#
+# 根因不是任务坏了，而是 `_default_runner` 当时用 `subprocess.run(capture_output=True)`
+# ——子进程 stdout 被整段缓冲到结束才返回。① 下载（~30 分钟）和 ④ funding（~15 分钟）
+# 恰恰是最长的两步 ⇒ 界面上只有一行「…」，和卡死长得一模一样。
+#
+# 这一组守卫钉死三件事：① 有输出立刻转发（且强制子进程无缓冲）；② 没输出时发心跳；
+# ③ 超时真的杀进程（不然「卡死」会一直挂着）。
+# ---------------------------------------------------------------------------
+import ast
+import os
+import time
+
+import pytest
+
+from crypto_ls_research.execution import universe_upgrade as U
+
+
+def _run(code: str, timeout: float, sink):
+    return U._default_runner([sys.executable, "-c", code], timeout, sink)
+
+
+def test_child_output_is_forwarded_before_the_child_exits():
+    """🔴 第一行必须在子进程**结束之前**到达 progress。
+
+    子进程用**不带 flush 的 print**，靠 `PYTHONUNBUFFERED=1` 立即吐出——
+    少了那个环境变量，print 会攒满缓冲区，逐行转发就退化回「最后一次性倒出来」。
+    """
+    seen, stamps = [], []
+
+    def sink(msg):
+        seen.append(msg)
+        stamps.append(time.time())
+
+    code = ("import time\n"
+            "print('first-line')\n"          # 故意不 flush
+            "time.sleep(2.0)\n"
+            "print('second-line')\n")
+    rc, _ = _run(code, 30, sink)
+    t_end = time.time()
+    assert rc == 0
+    assert any("first-line" in m for m in seen), f"第一行没被转发：{seen}"
+    assert stamps[0] < t_end - 1.0, (
+        "第一行是等到子进程结束才到达的 —— 说明仍在整段缓冲（capture_output 的回潮）")
+
+
+def test_silent_child_gets_a_heartbeat(monkeypatch):
+    """没有任何输出的步骤（比如分类快照）也必须自证「还活着」。"""
+    monkeypatch.setattr(U, "HEARTBEAT_EVERY", 0.4)
+    seen = []
+    rc, _ = _run("import time; time.sleep(1.6)", 30, seen.append)
+    assert rc == 0
+    assert any("运行中" in m for m in seen), f"没有心跳：{seen}"
+
+
+def test_timeout_kills_the_child_instead_of_hanging(tmp_path):
+    """超时必须**真的把子进程杀掉**。
+
+    只断言「抛了 TimeoutExpired」是不够的：把 `proc.kill()` 换成 `pass` 变异后
+    异常照样抛出来、测试照样绿，而子进程会一直在后台跑（变异当场抓过）。
+    所以让子进程先写下自己的 pid，事后确认它已经不存在（僵尸也不行 ——
+    那说明没 wait，父进程退出后它会被 init 收走、但在本进程里仍是残留）。
+    """
+    pidfile = tmp_path / "child.pid"
+    code = ("import os, time\n"
+            f"open({str(pidfile)!r}, 'w').write(str(os.getpid()))\n"
+            "time.sleep(30)\n")
+    t0 = time.time()
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run(code, 1.5, lambda m: None)
+    assert time.time() - t0 < 15, "超时后没有及时返回"
+    pid = int(pidfile.read_text())
+    for _ in range(50):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return                       # 已死且已被回收 ⇒ 正确
+        time.sleep(0.1)
+    pytest.fail(f"超时后子进程 {pid} 仍存在（kill/wait 没执行）")
+
+
+def test_failure_returns_exit_code_and_tail():
+    code = "for i in range(12): print('line-%02d' % i)\nraise SystemExit(3)\n"
+    rc, tail = _run(code, 30, lambda m: None)
+    assert rc == 3
+    assert "line-11" in tail, f"失败回报里没有尾部输出：{tail!r}"
+
+
+def test_runner_never_buffers_the_whole_child(  ):
+    """静态：函数体里不许再出现 `subprocess.run(...)`（用 ast 跳过文档字符串）。"""
+    src = (ROOT / "crypto_ls_research" / "execution" / "universe_upgrade.py"
+           ).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    fn = next(n for n in tree.body
+              if isinstance(n, ast.FunctionDef) and n.name == "_default_runner")
+    calls = [n for n in ast.walk(fn) if isinstance(n, ast.Call)]
+    names = []
+    for c in calls:
+        f = c.func
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name):
+            names.append(f"{f.value.id}.{f.attr}")
+        elif isinstance(f, ast.Name):
+            names.append(f.id)
+    assert "subprocess.run" not in names, \
+        "又用回 subprocess.run（整段缓冲 ⇒ 长步骤看起来像卡死）"
+    assert "subprocess.Popen" in names
+    assert "PYTHONUNBUFFERED" in src
+
+
+def test_each_step_announces_its_expected_duration():
+    """长步骤必须先说清「大概多久」——否则用户只能猜它是不是死了。"""
+    msgs = []
+    upgrade_universe(runner=FakeRunner(), specs_fn=lambda: 1,
+                     drift_fn=make_drift(), progress=msgs.append)
+    for label in ("①", "④"):
+        i = next(k for k, m in enumerate(msgs) if m.startswith(label))
+        assert "分钟" in msgs[i + 1], f"{label} 步没有时长提示：{msgs[i:i + 2]}"

@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import threading
 import time
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -31,22 +32,78 @@ DOWNLOAD_TIMEOUT = 2 * 3600.0       # 新合约多、网络差时可能很慢；
 STEP_TIMEOUT = 1800.0
 
 
+STREAM_MIN_GAP = 1.5        # 秒：两条流式行之间的最小间隔（防止刷屏）
+STREAM_MAX_LINES = 120      # 每个子进程最多转发这么多行（之后只发心跳）
+HEARTBEAT_EVERY = 30.0      # 秒：无输出时的心跳，证明还活着
+
+
 def _default_runner(argv: List[str], timeout: float,
                     progress: Callable[[str], None]) -> Tuple[int, str]:
-    """跑一个子进程，返回 (exit_code, stdout 尾部若干行)。
+    """跑一个子进程，**边跑边把输出转发给 progress**，返回 (exit_code, 尾部若干行)。
+
+    🔴 这里曾经是 `subprocess.run(capture_output=True)`：子进程的 stdout 被
+    **整段缓冲**，直到它结束才一次性返回。而 ① 下载（十几分钟）与 ④ 重建
+    funding（十几分钟）恰恰是最长的两步 ⇒ 界面上只有一行「…」，和卡死长得
+    一模一样（用户实测：「几十分钟还没好」）。**没有输出的长任务必须能自证
+    还活着**：这里改成 Popen + 逐行转发 + 30 秒心跳。
 
     环境处理与 `engine.refresh_market_data` 相同：清掉会劫持 127.0.0.1 的
     HTTP(S)_PROXY（沙箱遗留物），保留显式的 `OKX_PROXY`（三个客户端都读它）。
+    `PYTHONUNBUFFERED=1` 是必须的：否则子进程的 print 仍会攒满 8KB 才吐出来，
+    逐行转发就退化成「最后一次性倒出来」。
     """
-    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8:replace"}
+    env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8:replace",
+           "PYTHONUNBUFFERED": "1"}
     for k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
         env.pop(k, None)
-    r = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8",
-                       errors="replace", env=env, timeout=timeout)
-    tail = "\n".join((r.stdout or "").strip().splitlines()[-8:])
-    if r.returncode != 0 and r.stderr:
-        tail += "\n[stderr] " + (r.stderr or "")[-400:]
-    return r.returncode, tail
+
+    t0 = time.time()
+    tail: List[str] = []
+    state = {"last": 0.0, "n": 0}
+
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace",
+                            env=env, bufsize=1)
+
+    def pump() -> None:
+        assert proc.stdout is not None
+        for raw in proc.stdout:                    # 行缓冲：子进程一吐就拿到
+            line = raw.rstrip("\n").strip()
+            if not line:
+                continue
+            tail.append(line)
+            del tail[:-40]                          # 只留尾部，供失败时回报
+            now = time.time()
+            if state["n"] >= STREAM_MAX_LINES:
+                continue
+            if now - state["last"] < STREAM_MIN_GAP:
+                continue
+            state["last"] = now
+            state["n"] += 1
+            progress("  " + line[-180:])
+
+    th = threading.Thread(target=pump, daemon=True)
+    th.start()
+    deadline = t0 + timeout
+    beat = time.time()
+    while True:
+        rc = proc.poll()
+        if rc is not None:
+            break
+        if time.time() > deadline:
+            proc.kill()
+            proc.wait()
+            raise subprocess.TimeoutExpired(argv, timeout)
+        if time.time() - beat >= HEARTBEAT_EVERY:
+            beat = time.time()
+            progress(f"  … 运行中 {int(time.time() - t0)}s（尚未结束）")
+        time.sleep(0.5)
+    th.join(timeout=5)
+
+    out = "\n".join(tail[-8:])
+    if rc != 0:
+        out += f"\n[exit {rc}] 见上方日志"
+    return rc, out
 
 
 def _steps(bars: Tuple[str, ...], end: str) -> List[dict]:
@@ -55,16 +112,21 @@ def _steps(bars: Tuple[str, ...], end: str) -> List[dict]:
         {"label": "① 重建候选池并增量下载 K 线 + OKX 资金费率",
          "argv": [sys.executable, "-m", "crypto_ls_research.data.download",
                   "--bars", *bars, "--incremental", "--end", end],
+         "hint": "新合约拉全史，通常 10–30 分钟（取决于新合约数量与网络）",
          "timeout": DOWNLOAD_TIMEOUT},
         {"label": "② 重建合约分类快照",
          "argv": [sys.executable, "-m", "crypto_ls_research.data.asset_class",
                   "--build"],
+         "hint": "通常几秒",
          "timeout": STEP_TIMEOUT},
         {"label": "③ 刷新合约规格快照",
-         "fn": "specs"},
+         "fn": "specs",
+         "hint": "通常几秒"},
         {"label": "④ 重建拼接资金费率（funding_hyb）",
          "argv": [sys.executable, "-m", "crypto_ls_research.data.funding_build",
                   "--end", end],
+         "hint": ("全量重建：要拉全部合约的 Binance funding 历史，"
+                  "通常 5–20 分钟，且产物在**最后一次性**写出"),
          "timeout": STEP_TIMEOUT},
     ]
 
@@ -95,6 +157,8 @@ def upgrade_universe(progress: Optional[Callable[[str], None]] = None, *,
 
     for st in _steps(bars, end):
         p(st["label"] + " …")
+        if st.get("hint"):
+            p("  " + st["hint"])       # 先说清「大概多久」，否则长步骤像卡死
         rec: Dict = {"label": st["label"], "exit_code": None, "tail": ""}
         if st.get("fn") == "specs":
             try:

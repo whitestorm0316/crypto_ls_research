@@ -2077,7 +2077,7 @@ function liveDriftHtml() {
     <p style="margin:4px 0 0">${rows.join('；')}</p>
     ${fixable ? `<div class="split" style="margin-top:8px;align-items:center">
       <button class="btn sm primary" id="liveDriftUpgrade">⚡ 补齐宇宙（重建池 + 快照 + funding）</button>
-      <span class="muted" style="font-size:11.5px">重建候选池 → 分类/规格快照 → funding_hyb，约几分钟；完成后需重算信号、重新验收数字</span>
+      <span class="muted" style="font-size:11.5px">重建候选池 → 分类/规格快照 → funding_hyb，通常 15–50 分钟（新合约多、网络慢更久）；期间日志会实时滚动，完成后需重算信号、重新验收数字</span>
     </div>`
       : `<p class="desc" style="margin:4px 0 0">余下缺口（退市残留）无害：旧 parquet 不会进新仓。重算信号即可。</p>`}
   </div></div>`;
@@ -3092,10 +3092,14 @@ function liveJobHtml() {
   const j = L.job;
   if (!j) return `<div class="empty">还没有执行记录</div>`;
   const run = j.status === 'running' || j.status === 'queued';
+  /* 跑着的任务也要报时间：以前只在结束时才有 elapsed，于是「跑了 20 分钟」
+     和「刚点下去 3 秒」在界面上完全一样 —— 用户只能猜它是不是死了。 */
+  const el = (j.elapsed != null) ? j.elapsed
+    : (j.started ? Math.max(0, Math.round(Date.now() / 1000 - j.started)) : null);
   let h = `<div class="split" style="margin-bottom:8px">
     <span class="pill ${j.status === 'done' ? 'ok' : (j.status === 'failed' ? 'danger' : 'accent')}">
       ${run ? '<span class="spin"></span> ' : ''}${esc(j.status)}</span>
-    <span class="muted" style="font-size:11.5px">${esc(j.label || j.kind)}${j.elapsed ? ' · ' + j.elapsed + 's' : ''}</span>
+    <span class="muted" style="font-size:11.5px">${esc(j.label || j.kind)}${el != null ? ' · 已运行 ' + el + 's' : ''}</span>
     <span class="spacer"></span>
     <button class="btn sm ghost" id="liveJobClear">清空</button></div>`;
   h += `<div class="joblog" id="liveJobLog">` + (j.log || []).map((l) =>
