@@ -87,9 +87,19 @@ const realFetch = globalThis.fetch;
 sandbox.fetch = (u, o) => realFetch(String(u).startsWith('/') ? BASE + u : u, o);
 
 /* ---------------- 执行真实源码 ---------------- */
-let src = fs.readFileSync(APP, 'utf8');
-if (!/\nboot\(\);\s*$/.test(src)) throw new Error('app.js 末尾的 boot() 调用没找到，stub 需要更新');
-src = src.replace(/\nboot\(\);\s*$/, '\n');
+/* `ui.js` 必须先加载：`app.js` 的组件调用依赖它，而且它是 IIFE（只暴露 `ui`），
+ * 两个文件拼接后仍与浏览器里的加载顺序一致。漏掉这一句会让 `ui` 变成
+ * ReferenceError —— 且只在渲染到那一行时才炸。 */
+const UI = path.join(__dirname, '..', 'webapp', 'static', 'ui.js');
+let src = fs.readFileSync(UI, 'utf8') + '\n';
+src += fs.readFileSync(APP, 'utf8');
+/* 入口调用被 `authRender()` 包了一层（未登录时不能直接跑 boot()），所以这里
+ * 必须两种结尾都认。此前只认 `boot();`，而 app.js 早已改成 `authRender();`
+ * —— 这个冒烟测试从那一天起就一直在**第一行抛异常**，等于没有守卫。
+ * 与 `test_universe_drift.py` 的写法保持一致，别再各写一套。 */
+const entry = src.match(/\n(authRender|boot)\(\);\s*$/);
+if (!entry) throw new Error('app.js 末尾的入口调用没找到（authRender/boot），stub 需要更新');
+src = src.slice(0, entry.index) + '\n';
 src += `
 ;globalThis.__T = { S, drawChart, curveValues, tickLabel, chartCandidates, initChartOff, PALETTE,
                     liveSkeleton, liveBarHtml, liveNavHtml, navCandles, navSourceLabel, drawNavChart,
@@ -99,9 +109,53 @@ vm.createContext(sandbox);
 vm.runInContext(src, sandbox, { filename: 'app.js' });
 const T = sandbox.__T;
 
+/* ---------------- 鉴权 ----------------
+ * 2026-10-16 起服务端默认拒绝一切 `/api/`，而这个冒烟测试要读 /api/spec、
+ * /api/runs、/api/equity。此前它**没有任何登录代码**，于是鉴权一打开就再也
+ * 跑不通 —— 和末尾的 `boot();` 断言一起，把它变成了一个纯装饰品。
+ *
+ * 凭据从环境变量来，与 `smoke_live.js` 同一套（`LS_TEST_USER` /
+ * `LS_TEST_PASSWORD`）。TOTP 直接从服务端密钥算 —— 只在测试进程内、且只在
+ * 同一台机器上，不硬编码任何会话 token（否则"鉴权坏了"就测不出来）。
+ */
+let AUTH_COOKIE = null;
+
+async function authLogin() {
+  const st = await realFetch(BASE + '/api/auth/status').then((r) => r.json());
+  if (!st.configured) return;                 // 没建账号：公开路径就够跑
+  const user = process.env.LS_TEST_USER || '';
+  const pw = process.env.LS_TEST_PASSWORD || '';
+  if (!user || !pw) {
+    throw new Error('控制台已启用登录：请设 LS_TEST_USER 与 LS_TEST_PASSWORD 再跑冒烟测试');
+  }
+  const r1 = await realFetch(BASE + '/api/auth/login', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ user, password: pw }),
+  }).then((r) => r.json());
+  if (!r1.ticket) throw new Error('登录第一步失败：' + (r1.error || '未知'));
+
+  const { execFileSync } = require('child_process');
+  const py = [
+    'import sys;sys.path.insert(0,sys.argv[1])',
+    'from webapp.auth import AuthStore,totp_at',
+    'print(totp_at(AuthStore().user()["totp"]))',
+  ].join(';');
+  const code = execFileSync(process.env.PY || 'python3', ['-c', py,
+    path.resolve(__dirname, '..')], { encoding: 'utf8' }).trim();
+
+  const res = await realFetch(BASE + '/api/auth/verify', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ticket: r1.ticket, code }),
+  });
+  const m = (res.headers.get('set-cookie') || '').match(/ls_session=[^;]+/);
+  if (!m) throw new Error('登录第二阶段没拿到会话 cookie');
+  AUTH_COOKIE = m[0];
+}
+
 /* ---------------- 取真实数据 ---------------- */
 async function getJson(p) {
-  const r = await realFetch(BASE + p);
+  const opt = AUTH_COOKIE ? { headers: { Cookie: AUTH_COOKIE } } : {};
+  const r = await realFetch(BASE + p, opt);
   if (!r.ok) throw new Error(`${p} -> HTTP ${r.status}`);
   return r.json();
 }
@@ -113,9 +167,12 @@ function check(name, ok, extra) {
 }
 
 (async () => {
+  await authLogin();
   const spec = await getJson('/api/spec');
   const runs = await getJson('/api/runs');
-  const eq = await getJson('/api/equity/v3');
+  /* tag 从 /api/spec 取，别写死：验收口径已经换过一次（v3 → v4_1d → v5_1d_all5），
+   * 写死 `v3` 会让这个冒烟测试在换口径那天静默 404。 */
+  const eq = await getJson('/api/equity/' + encodeURIComponent(spec.optimal_tag));
 
   const done = runs.runs.filter((r) => r.status === 'done' || r.status === 'partial');
   const cur = done[0];

@@ -313,6 +313,11 @@ let src = fs.readFileSync(APP, 'utf8');
 const entry = src.match(/\n(authRender|boot)\(\);\s*$/);
 if (!entry) throw new Error('app.js 末尾的入口调用未找到（authRender/boot）');
 src = src.slice(0, entry.index) + '\n';
+/* ui.js 先于 app.js 加载，拼接顺序必须与 index.html 一致 ——
+ * app.js 里调用 ui.*，漏掉它这里会以 ReferenceError 失败（而不是静默）。 */
+const UI = require('path').join(require('path').dirname(APP), 'ui.js');
+if (!fs.existsSync(UI)) throw new Error('找不到 ui.js：' + UI);
+src = fs.readFileSync(UI, 'utf8') + '\n' + src;
 src += '\n;globalThis.__T = { S, esc, liveDriftHtml, liveSkeleton, liveBarHtml, liveJobHtml };\n';
 vm.createContext(sandbox);
 vm.runInContext(src, sandbox, { filename: 'app.js' });

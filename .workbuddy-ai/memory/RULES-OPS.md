@@ -1150,3 +1150,28 @@ mw_ret_names = pool_mean + excess_select + excess_weight
 - ⚠️ **改完 `.py` 第一件事是 `ast.parse`**（我 Edit 时把两行粘成一行，靠它抓到）。
 - ⚠️ 临时看日志用 `... 2>&1 | tee logs/x.log`（**必须 tee**）。
 
+---
+
+## 新机器初始化 + 内存（Q58–Q66 细节）
+
+## 新机器 / 产物初始化 + 内存（Q58–Q62）——**细节在 `RULES-OPS.md`**
+- 入口 `scripts/init_linux.sh`（幂等）→ `download` → `asset_class --build` → `funding_build`
+  → **5b 重建基线产物** + **内存体检**。⚠️ **数据/产物/凭据全被 gitignore**。
+- 🔴 **代理端口写在默认值里**：三客户端读同一个 `OKX_PROXY`（**默认 `127.0.0.1:7897`**）
+  ⇒ 换机器报 **`[Errno 111] Connection refused`**（**看不出是代理问题**）。
+  `export OKX_PROXY=...`；空 ⇒ 直连。⚠️ **模块导入时**求值 ⇒ **必须先 export**。
+- 🔴 **`--end` 默认硬编码 `2026-09-26`（排他上界）** ⇒ 照默认跑**静静少二十来天、不报错**。
+- 🔴 **页头「基线数据缺失」是必然**。重建 **10 秒**：`rebuild_optimal_baseline.py`（只跑
+  `base`；参数**从 `webapp/spec.py` 派生**）。⚠️ **`--override` 走 `json.loads`** ⇒ 列表须写
+  **JSON 数组**；`asset_class` 缺新合约 **fail-loud 退出**。
+- 🔴 **重建的数字 ≠ 记录值，不可修复**（`--end` 被刻意忽略 + 候选池是「今天的挂单」）。
+  **记录值只是某时点快照。** 🔴 **别覆盖已验收基线**（默认拒绝，要 `--force`）。
+- 🔴 **`-9` / `137` = SIGKILL = OOM**（不是报错）⇒ 日志**无 traceback**。三处都会撞：
+  命令行回测（`-9`）、**控制台「⚡ 一键准备」**（`137`；= 刷新 + **跑一次完整回测**，
+  控制台 182 MB + 计划 1.8 GB）、**「仅刷新行情」安全**（不跑回测）。
+  ✅ 已降 **2193→1758 MB**（`_read_one` 转 float32 + `del raw` + **`wide()` 一步构造**
+  `DataFrame(cols, index=grid, dtype="float32")`；原先是**三次全量拷贝**，省 **418 MB**），
+  **数值逐位不变**。⇒ **2GB 机器仍建议加 swap**。⚠️ 不是泄漏。
+- ⚠️ **从缓存/产物里看到的配置可能是旧的** ⇒ 报"配置是什么"直接读 `DEFAULT_SIGNAL` /
+  `spec.OPTIMAL_CLI`，别读某次运行的快照。
+
