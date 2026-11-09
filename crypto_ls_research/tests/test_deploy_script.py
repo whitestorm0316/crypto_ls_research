@@ -507,6 +507,12 @@ scoped = sorted(filter_insts(list_cached_insts("1h"), cats, "crypto")[0])[:40]
 if not scoped:
     print("SKIP")
     sys.exit(0)
+# 基准必须在 panel 里，否则 engine 直接 ValueError。宇宙涨到 258 只之后
+# 字母序前 40 已经不含 BTC（它排第 43），切片悄悄把前提破坏了 ——
+# 补进去只改样本，不改断言（f32 仍须逐位等于 f64）。
+BENCH = "BTC-USDT-SWAP"
+if BENCH not in scoped:
+    scoped = sorted(set(scoped) | {BENCH})
 R.BASE_OVERRIDES.update({
     "factors.subset": ["momentum", "flow", "range_pos", "hitrate", "rev_short"],
     "portfolio.max_weight_per_instrument": 0.20,
