@@ -55,12 +55,19 @@
   直接读取 ⇒ **拆文件会让它们静默失效**，必须先改 harness 再搬。②`/static/` 走
   `os.path.basename()`（`server.py:830`）**扁平化** ⇒ 新 JS 必须平铺，子目录 404；
   该前缀免登录。③登录页渲染进 `#content` ⇒ 未登录时顶栏（含「运行回测」）与空侧栏仍可见。
-- 三个「后端有、前端没接」的缺口（Q73 实测）：回测取消 `POST /api/runs/<id>/cancel`
-  （`server.py:946`）前端 0 调用；**撤单** `okx_private` 的 `cancel_order/cancel_all/
-  orders_pending` **全仓零调用点**（死代码，挂单看不到也撤不掉）；**暂停 ≠ 停止** 未区分。
-- 设计系统现状（改造前基线）：12 种字号、9 种 `margin-top`、200 处内联 style、
-  1 个断点、0 骨架屏、33 处纯文本空态、`confirm()`×3/`alert()`×5；
-  canvas 图表只有 `window.resize`、**无 ResizeObserver**。方案见 `docs/UI_UX_REFACTOR_PLAN.md`。
+- 三个「后端有、前端没接」的缺口（Q73）：回测取消**已接**（P0-5）；**撤单**
+  `okx_private` 的 `cancel_order/cancel_all/orders_pending` **全仓零调用点**（死代码，
+  挂单看不到也撤不掉）；**暂停 ≠ 停止** 未区分。
+- 🔴 **P0 已落地**（Q73 实施，6 个 commit，细节 `2026-11-09.md`）：tokens + `ui.js` 组件库、
+  回测取消接线、订单枚举翻译、三处 canvas `ResizeObserver`、登录页整屏独立
+  （`body.authmode`）、参数面板可收起（`body.sidecollapsed`，内容区 868→1280px）、
+  原生 `confirm/alert` 全退场、加载骨架。**「64px 图标导航」故意没做**：7 个模块里
+  4 个页面 P1 才建，现在放就是死按钮。方案见 `docs/UI_UX_REFACTOR_PLAN.md`。
+- 🔴 换壳三条铁律：①**文案一个字都不能改** —— `smoke_live` 用 `includes('正在读取账户')`
+  /`includes('点「生成下单计划」开始')`/`includes('尚未生成计划')` 判状态，`verify_auto_panel`
+  用 `!includes('正在读取')` ⇒ 纯骨架会让断言静默失效。②`.skel` 是 flex column 且高度 auto
+  ⇒ `.skbar` 的 `flex:1`＝`flex-basis:0` **塌成 0 高**，表格形态有 `.skrow` 固定高才没露
+  出来 ⇒ 骨架必须**真渲染看竖排**。③`git commit -m` 含反引号会被 zsh 命令替换 ⇒ 写文件 `-F`。
 
 ## 数据源可切换（Q40）——表格在 `RULES-OPS.md`
 - 缓存目录唯一来源 = `settings.CACHE_DIR`（`CRYPTO_CACHE_DIR`）；store/download 的 CACHE 都从它派生。
