@@ -66,11 +66,11 @@
 - 🔴 换壳四条铁律：①**文案一个字都不能改** —— `smoke_live` 用 `includes('正在读取账户')`
   /`includes('点「生成下单计划」开始')`/`includes('尚未生成计划')` 判状态，`verify_auto_panel`
   用 `!includes('正在读取')` ⇒ 纯骨架会让断言静默失效。②`.skel` 是 flex column 且高度 auto
-  ⇒ `.skbar` 的 `flex:1`＝`flex-basis:0` **塌成 0 高**（表格有 `.skrow` 固定高才没露）⇒ 骨架
-  必须**真渲染看竖排**。③`git commit -m` 含反引号会被 zsh 替换 ⇒ 写文件 `-F`。④`display:none`
-  的元素**退出栅格** ⇒ 收起侧栏时 `.content` 变成第一个栅格项、掉进 `0` 宽那列，整页压成
-  **40px 缝**（`gridTemplateColumns` 仍显示 `0px 1280px`「看着正常」）⇒ 藏侧栏的状态必须配
-  **单列** `.main`，判据量 `getBoundingClientRect().width` 而不是模板字符串。
+  ⇒ `.skbar` 的 `flex:1`＝`flex-basis:0` **塌成 0 高** ⇒ 骨架必须**真渲染看竖排**。
+  ③`git commit -m` 含反引号会被 zsh 替换 ⇒ 写文件 `-F`。④`display:none`
+  退出栅格 ⇒ 收起侧栏时 `.content` 掉进 `0` 宽那列、整页压成 **40px 缝**
+  （`gridTemplateColumns` 仍显示 `0px 1280px`「看着正常」）⇒ 藏侧栏必须配**单列** `.main`，
+  判据量 `getBoundingClientRect().width` 而非模板字符串。
 
 ## 数据源可切换（Q40）——表格在 `RULES-OPS.md`
 - 缓存目录唯一来源 = `settings.CACHE_DIR`（`CRYPTO_CACHE_DIR`）；store/download 的 CACHE 都从它派生。
@@ -113,7 +113,7 @@
   15 分钟；快照是 body 包裹结构——**失败不能覆盖上次成功体**（stale 兜底靠它）。
 - 接线：status 加 `universe_drift` 键、plan preview 后附加；前端 `liveDriftHtml()` 挂
   `#liveDrift`（liveBar 下）、`livePaintAll` 重绘。守卫 `test_universe_drift.py`（13 条，
-  前端 node vm 真渲染；app.js 末尾入口是 `authRender();` 不是 `boot();`）。7 变异全抓。
+  node vm 真渲染；app.js 末尾入口是 `authRender();` 不是 `boot();`）。7 变异全抓。
 - **补齐按钮**（Q67.1）：`universe_upgrade.py::upgrade_universe()` 四步（download 重建池
   **不带 --reuse-pool** + `--incremental` → asset_class --build → refresh_specs →
   funding_build），失败即停；前后各跑一次体检。路由 `/api/live/universe/upgrade` 走任务
@@ -195,6 +195,10 @@
 - 重测试主动缩小输入（pytest 单进程跑到底、主进程常驻 ⇒ 137 且无失败信息）；
   制造失败挑最便宜路径；只验机制加 --max-insts 12。
 - 解析文本先确认真解析到了内容（续行、前提断言）；扫全文件会扫到自己注释 ⇒ 只看非 # 行。
+- 🔴 **行为测试不许把被测组件本身 stub 掉**（`ui.modal = async () => true` 只证明「拿到
+  true 之后干什么」）⇒ 交互层用 **jsdom 真 click**（托管 node 的 `node_modules` 里有，
+  `NODE_PATH` 指过去）。组件库生成 `data-*` 必须 **kebab-case**（`data-uimOk` 被解析器
+  小写成 `data-uimok`，选择器 `[data-uim-ok]` 匹配不上 ⇒ 按钮静默无响应）。
 
 ## 通知 / OKX
 细节在 `RULES-OPS.md`。必记：配完不重启 → 静默不发（按 mtime 热读）；send() 永不抛；

@@ -33,12 +33,19 @@ const ui = (() => {
   /* ---------------- 按钮 ---------------- */
   /* kind: primary | secondary(默认) | ghost | danger
    * size: '' | sm
-   * 只生成 `<button>`，事件由调用方用 data-* 绑定（与现有 `bindSide` 一致）。 */
+   * 只生成 `<button>`，事件由调用方用 data-* 绑定（与现有 `bindSide` 一致）。
+   *
+   * 🔴 `data` 的键必须转成 **kebab-case** 再写进属性。
+   * 写成 `data-${k}` 时，`{ uimOk: '1' }` 会生成 `data-uimOk="1"`；HTML 解析器把
+   * 属性名小写成 `data-uimok`，而 modal 里找的是 `[data-uim-ok]` —— **永远匹配不上**
+   * ⇒ 弹层的「确认」「取消」两个按钮都没绑上事件，只有 × / Esc / 点背景能关。
+   * 用户看到的正是「二次确认点了没用」，而且不报错。 */
+  const kebab = (k) => String(k).replace(/[A-Z]/g, (c) => '-' + c.toLowerCase());
   function btn(o) {
     o = o || {};
     const attrs = [
       o.id ? `id="${esc(o.id)}"` : '',
-      o.data ? Object.keys(o.data).map((k) => `data-${esc(k)}="${esc(o.data[k])}"`).join(' ') : '',
+      o.data ? Object.keys(o.data).map((k) => `data-${esc(kebab(k))}="${esc(o.data[k])}"`).join(' ') : '',
       o.title ? `title="${esc(o.title)}"` : '',
       o.disabled ? 'disabled' : '',
       o.type ? `type="${esc(o.type)}"` : 'type="button"',
