@@ -179,16 +179,22 @@ def test_route_wired():
 
 
 def test_frontend_binding_wired():
-    import re
     src = (ROOT / "webapp" / "static" / "app.js").read_text(encoding="utf-8")
     i = src.find("const up = $('#liveDriftUpgrade');")
     assert i > 0, "liveBind 里没有补齐按钮的绑定"
     body = src[i:src.find("\n  }", i)]
-    # 相邻对：confirm 的结果必须真的在**门控** liveSubmit——只查「包含
-    # window.confirm」抓不到「!false && confirm(...)」这类旁路（变异当场抓过）。
-    # confirm 的文案字符串会跨行，用 [\s\S]*? 而非 [^\n]*。
-    assert re.search(r"if \(!window\.confirm\([\s\S]*?\)\) return;", body), \
-        "确认框的结果没有 return 门控：确认被旁路了"
+    # 相邻对：确认的结果必须真的在**门控** liveSubmit——只查「包含确认框」抓不到
+    # 「!false && confirm(...)」这类旁路（变异当场抓过）。
+    #
+    # 2026-11-09：确认框从原生 `window.confirm` 换成了 `ui.modal`（原生对话框会
+    # 阻塞整个 JS 线程，把 2.5s 的轮询一起冻住）。断言改成新形态，强度不变：
+    # ① 必须取到结果（`const ok = await ui.modal(`），② 必须有 `if (!ok) return;`，
+    # ③ 门控必须在调用**之前**，④ 整个块里只能有**一次**调用（多一条就是旁路）。
+    assert "const ok = await ui.modal(" in body, "确认框的结果没被接住"
+    assert "if (!ok) return;" in body, "确认框的结果没有 return 门控：确认被旁路了"
+    assert body.index("if (!ok) return;") < body.index("liveSubmit("), \
+        "门控写在调用之后，等于没门控"
+    assert body.count("liveSubmit(") == 1, "出现了第二条绕过门控的调用路径"
     assert "liveSubmit('/api/live/universe/upgrade'" in body
 
 
