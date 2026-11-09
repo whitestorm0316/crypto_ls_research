@@ -175,6 +175,7 @@ const fmt = {
 
 /* ============================== 启动 ============================== */
 async function boot() {
+  authMode(false);
   try {
     const r = await fetch('/api/spec');
     if (r.status === 401) {
@@ -205,6 +206,7 @@ async function boot() {
   if (wantTrades) S.tab = 'trades';
   if (wantLive) S.tab = 'live';
   try {
+    bindSideToggle();
     renderSide();
     renderContent();
     refreshWarnings();
@@ -254,6 +256,40 @@ function applyPreset(id) {
 }
 
 /* ============================== 侧边栏 ============================== */
+/* ============================== 壳：参数面板收起 ============================== */
+/* 侧栏是**常驻**的（`.main` 固定 `412px 1fr`），但交易台与交易记录页一个回测
+ * 参数都用不到 —— 那两页上它白占 32% 宽度。给一个开关，选择记在 localStorage。
+ *
+ * 默认值按页走：回测结果页展开（要在那儿调参数），另两页收起。一旦用户自己
+ * 点过开关，`sidePref()` 就有值，此后永远听用户的（切 tab 不再自动改）。 */
+const SIDE_KEY = 'ls.side.collapsed';
+function sidePref() {
+  try { return localStorage.getItem(SIDE_KEY); } catch { return null; }
+}
+function setSide(collapsed) {
+  document.body.classList.toggle('sidecollapsed', !!collapsed);
+  const b = $('#sideBtn');
+  if (!b) return;
+  b.textContent = collapsed ? '◨' : '◧';
+  b.title = collapsed ? '展开参数面板' : '收起参数面板（交易台与交易记录页用不到它）';
+  b.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+}
+function syncSideForTab() {
+  if (sidePref() !== null) return;        // 用户自己定过，别抢
+  setSide(S.tab !== 'result');
+}
+function bindSideToggle() {
+  const b = $('#sideBtn');
+  if (!b) return;
+  b.onclick = () => {
+    const next = !document.body.classList.contains('sidecollapsed');
+    setSide(next);
+    try { localStorage.setItem(SIDE_KEY, next ? '1' : '0'); } catch { }
+  };
+  const pref = sidePref();
+  setSide(pref === null ? S.tab !== 'result' : pref === '1');
+}
+
 function renderSide() {
   const el = $('#side');
   let h = '';
@@ -698,6 +734,7 @@ function renderContent() {
   $$('[data-tab]').forEach((t) => t.onclick = () => {
     if (S.tab === t.dataset.tab) return;
     S.tab = t.dataset.tab;
+    syncSideForTab();          // 交易台/交易记录用不到参数面板
     const hash = S.tab === 'trades' ? '#trades' : (S.tab === 'live' ? '#live' : '#result');
     try { history.replaceState(null, '', hash); } catch { }
     renderContent();
@@ -4296,14 +4333,24 @@ async function authFetch(path, body) {
   return { status: r.status, d };
 }
 
+/* 未登录时把整个壳收起来。登录前不存在「运行回测」这个动作，空侧栏也不该
+ * 占 412px —— 以前这两样在登录页上是可见的。`body.authmode` 负责隐藏（见 CSS）。
+ * 用 try 包住：node 里的渲染 harness 只给了 `document.body = {}`。 */
+function authMode(on) {
+  try {
+    if (on) document.body.classList.add('authmode');
+    else document.body.classList.remove('authmode');
+  } catch { /* 无 DOM 的 harness 里忽略 */ }
+}
+
 function authShell(inner) {
-  return `<div style="max-width:420px;margin:8vh auto;padding:0 16px">
-    <div class="banner" style="display:block">
-      <h2 style="margin:0 0 4px">LS 交易台</h2>
-      <p class="muted" style="margin:0 0 14px;font-size:12px">
-        横截面市场中性 · 需登录</p>
-      ${inner}
-    </div></div>`;
+  return `<div class="authwrap"><div class="authcard">
+    <div class="authhead">
+      <img class="logo" src="/static/logo.svg" alt="" width="26" height="26">
+      <h2>LS 交易台</h2>
+      <p class="muted">横截面市场中性 · 需登录</p>
+    </div>
+    ${inner}</div></div>`;
 }
 
 function authErr(msg) {
@@ -4329,6 +4376,7 @@ function authBind(id, fn) {
 }
 
 function authLogin(lockedFor) {
+  authMode(true);
   $('#content').innerHTML = authShell(`
     <label style="display:block"><span class="muted" style="font-size:11.5px">用户名</span>
       <input id="auName" class="liveinput" style="width:100%" autocomplete="username"></label>
@@ -4384,6 +4432,7 @@ function authLogin(lockedFor) {
 }
 
 function authSetup() {
+  authMode(true);
   $('#content').innerHTML = authShell(`
     <p style="margin:0 0 12px"><b>首次使用，先建一个账号。</b></p>
     <label style="display:block"><span class="muted" style="font-size:11.5px">用户名</span>
