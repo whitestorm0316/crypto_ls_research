@@ -47,6 +47,8 @@ const BUILTIN = new Set([
   'decodeURIComponent', 'encodeURI', 'decodeURI', 'setTimeout', 'setInterval',
   'clearTimeout', 'clearInterval', 'requestAnimationFrame', 'cancelAnimationFrame',
   'structuredClone', 'queueMicrotask', 'alert', 'confirm', 'prompt',
+  // 观察者与画布相关：浏览器全局，不是本项目定义的函数
+  'ResizeObserver', 'IntersectionObserver', 'MutationObserver', 'matchMedia',
   'URLSearchParams', 'URL', 'Blob', 'FileReader', 'Image', 'AbortController',
   'TextEncoder', 'TextDecoder', 'document', 'window', 'globalThis',
   'getComputedStyle', 'localStorage', 'sessionStorage', 'navigator', 'location',

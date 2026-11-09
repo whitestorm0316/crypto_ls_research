@@ -1372,9 +1372,43 @@ function paintLegend(cands, shown, view) {
   bindLegend();
 }
 
+/* ---- 画布重绘：只听 window.resize 会漏 ---- */
+/* `window.resize` 只在窗口尺寸变化时发。但画布拿不到宽度还有别的原因：
+ * 侧栏折叠、切回 tab（display:none 期间 clientWidth 是 0，切回来才拿到宽度）、
+ * 异步内容把容器撑开 —— 这些都不发 resize，画布就停在 0 宽或旧尺寸上，
+ * 界面上看到的就是「曲线是空白的」。ResizeObserver 盯容器尺寸，变了就重画。
+ *
+ * 观察**父元素**而不是 canvas 自己：drawXxx 会写 cv.width / cv.height 属性，
+ * 盯 canvas 容易被自己的写入触成回环。再加一道「尺寸真的变了才画」的闸门，
+ * 即使某些浏览器把属性写入算进观察盒，也只空转一次。
+ *
+ * 注册发生在「尺寸为 0 就早退」**之前**：隐藏时早退，可见时由观察者补画。 */
+const _chartRO = new WeakMap();
+function autoRedraw(cv, fn) {
+  if (!cv || typeof ResizeObserver === 'undefined') return;
+  const host = cv.parentElement || cv;
+  const prev = _chartRO.get(cv);
+  if (prev) {
+    prev.fn = fn;                        // 数据变了（换曲线/换运行），换掉回调
+    if (prev.host === host) return;      // 容器没换就不重建观察者
+    prev.ro.disconnect();
+  }
+  const ent = { host, fn, w: cv.clientWidth, h: cv.clientHeight, ro: null };
+  ent.ro = new ResizeObserver(() => {
+    // 隐藏时 clientWidth 为 0，画出来全是 NaN —— 等它可见再画
+    if (!cv.clientWidth || !cv.clientHeight) return;
+    if (cv.clientWidth === ent.w && cv.clientHeight === ent.h) return;  // 回环保险
+    ent.w = cv.clientWidth; ent.h = cv.clientHeight;
+    ent.fn();
+  });
+  ent.ro.observe(host);
+  _chartRO.set(cv, ent);
+}
+
 async function drawChart() {
   const cv = $('#chart');
   if (!cv) return;
+  autoRedraw(cv, () => drawChart());
   // The canvas is hidden while the 交易记录 tab is up, and a hidden canvas has
   // clientWidth 0 -> every coordinate is NaN.  Bail out instead of drawing garbage.
   if (!cv.clientWidth || !cv.clientHeight) return;
@@ -1663,7 +1697,9 @@ function monthlyHeatmap(rows) {
 
 function drawExposure(d) {
   const cv = $('#expChart');
-  if (!cv || !cv.clientWidth) return;
+  if (!cv) return;
+  autoRedraw(cv, () => drawExposure(d));
+  if (!cv.clientWidth) return;
   const ctx = cv.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
   const W = cv.clientWidth, H = cv.clientHeight;
@@ -2864,6 +2900,7 @@ function drawNavChart() {
   const L = S.live;
   const d = L.nav;
   if (!cv || !d || !d.n || d.n < 2) return;
+  autoRedraw(cv, () => drawNavChart());
   /* 交易台不在当前 tab 时画布 clientWidth 为 0，任何坐标都是 NaN。 */
   if (!cv.clientWidth || !cv.clientHeight) return;
   const ctx = cv.getContext('2d');
