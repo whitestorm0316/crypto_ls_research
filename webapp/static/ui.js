@@ -200,7 +200,8 @@ const ui = (() => {
             + '<input class="liveinput" id="uimPhrase" autocomplete="off" spellcheck="false"></div>'
           : '')
         + `<div class="uimodal-foot">`
-        + btn({ label: o.cancelText || '取消', kind: 'ghost', data: { uimCancel: '1' } })
+        + (o.hideCancel ? ''
+          : btn({ label: o.cancelText || '取消', kind: 'ghost', data: { uimCancel: '1' } }))
         + btn({
           label: o.confirmText || '确认', kind: danger ? 'danger' : 'primary',
           data: { uimOk: '1' }, disabled: !!phrase,
@@ -233,7 +234,9 @@ const ui = (() => {
         setTimeout(() => okBtn.focus(), 0);
       }
       okBtn && okBtn.addEventListener('click', doOk);
-      back.querySelector('[data-uim-cancel]').addEventListener('click', () => finish(phrase ? null : false));
+      const cancelBtn = back.querySelector('[data-uim-cancel]');
+      /* `hideCancel` 时没有这个按钮 —— 只读对话框不该有两个都能关掉它的按钮。 */
+      cancelBtn && cancelBtn.addEventListener('click', () => finish(phrase ? null : false));
       back.querySelector('.uimodal-x').addEventListener('click', () => finish(phrase ? null : false));
       back.addEventListener('mousedown', (e) => { if (e.target === back) finish(phrase ? null : false); });
       document.addEventListener('keydown', onKey, true);

@@ -647,13 +647,21 @@ function renderContent() {
   /* --- 增强分析：回撤区间 / 月度热力图 / 敞口序列 --- */
   h += `<div class="panel" style="margin-top:14px"><div class="head"><h3>增强分析</h3>
       <span class="spacer"></span><span class="muted" style="font-size:11.5px" id="detailNote">数据来自产物 baseline.pkl，与报告同源</span></div>
-      <div class="body" id="detailBody"><div class="empty">运行一次回测后显示回撤区间、月度收益与敞口序列。</div></div></div>`;
+      <div class="body" id="detailBody">${ui.empty({
+        icon: '▤', title: '还没有可分析的结果',
+        desc: '跑完一次回测后，这里显示回撤区间、月度收益热力图与敞口序列。',
+      })}</div></div>`;
 
   /* --- 运行记录：只在「回测结果」页显示。以前它在三个 tab 之外、到处都跟着，
    * 交易台/交易记录页下方挂着一份，看起来像页面串了。 --- */
   h += `<h2 class="sec">运行记录 <small>${S.runs.length} 条 · 串行执行，不会抢核 · 勾选「对比」可叠加曲线</small></h2>`;
   h += `<div class="runs">`;
-  if (!S.runs.length) h += `<div class="empty">还没有运行过。点右上角「运行回测」，快速档约 50 秒。</div>`;
+  if (!S.runs.length) {
+    h += ui.empty({
+      icon: '▶', title: '还没有运行过回测',
+      desc: '点右上角「运行回测」，快速档约 50 秒；也可以直接按 R。',
+    });
+  }
   for (const run of S.runs) {
     const su = run.summary || {};
     const done = run.status === 'done' || run.status === 'partial';
@@ -894,7 +902,18 @@ function tradesHtml() {
     <div class="panel"><div class="body" id="trBody" style="padding:14px">${trLoading()}</div></div>`;
 }
 
-const trLoading = () => `<div class="empty">正在读取回测结果与交易记录…</div>`;
+/* 加载占位：骨架条 + 一句说明。
+ *
+ * 为什么**保留那句文字**：`smoke_live.js` 用 `includes('正在读取账户')` 判断
+ * 「切模式期间有没有显示旧模式的净值」，`verify_auto_panel.js` 用
+ * `!includes('正在读取')` 判断「加载完了没有」。纯骨架会让这两条断言静默失效。
+ * 所以文字留着，只是从「一句孤零零的占位」降级为骨架下方的说明。 */
+function loadPh(msg, kind) {
+  return `<div class="uiload" aria-busy="true">`
+    + ui.skeleton({ kind: kind || 'lines', rows: 3 })
+    + `<div class="uiload-cap">${esc(msg)}</div></div>`;
+}
+const trLoading = () => loadPh('正在读取回测结果与交易记录…', 'table');
 
 function trErrHtml(msg) {
   return `<div class="banner danger"><div class="ico">!</div><div>
@@ -1800,10 +1819,23 @@ function drawExposure(d) {
 async function runNow() {
   const btn = $('#runBtn');
   const diffs = diffFromOptimal();
-  if (diffs.length && !confirm(
-    `当前参数与已验收最优有 ${diffs.length} 处不同：\n\n`
-    + diffs.map((d) => `  ${d.k}: ${d.want} → ${d.got}`).join('\n')
-    + `\n\n仍然要跑吗？`)) return;
+  /* 原生 `confirm()` 会阻塞整个 JS 线程：轮询停摆、按钮停在「提交中…」，
+   * 而且差异只能挤在纯文本里。改成不阻塞的模态框，差异直接列成表。 */
+  if (diffs.length) {
+    const ok = await ui.modal({
+      title: `参数与已验收最优有 ${diffs.length} 处不同`,
+      body: `<p class="muted" style="margin:0 0 8px">这次跑出来的数字不能和基线直接比。</p>`
+        + `<div class="tblwrap" style="max-height:240px"><table class="cmp">`
+        + `<thead><tr><th>参数</th><th>基线</th><th>当前</th></tr></thead><tbody>`
+        + diffs.map((d) => `<tr><td class="mono">${esc(d.k)}</td>`
+          + `<td class="num">${esc(d.want)}</td>`
+          + `<td class="num" style="color:var(--warn)">${esc(d.got)}</td></tr>`).join('')
+        + `</tbody></table></div>`,
+      confirmText: '按当前参数跑',
+      cancelText: '回去改',
+    });
+    if (!ok) return;
+  }
 
   const overrides = {};
   for (const k in S.ov) if (!eq(S.ov[k], S.lib[k])) overrides[k] = S.ov[k];
@@ -1819,7 +1851,7 @@ async function runNow() {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ overrides, cli, stages: S.stages, preset: S.preset, label, tag }),
     })).json();
-    if (res.error) { alert(res.error); return; }
+    if (res.error) { ui.toast('提交失败：' + res.error, 'danger'); return; }
     S.selected = res.id; S.logOffset = 0;
     await pollRuns();
     await selectRun(res.id);
@@ -2128,7 +2160,19 @@ function initHotkeys() {
     else if (k === 'r' || k === 'R') { e.preventDefault(); runNow(); }
     else if (k === '?') {
       e.preventDefault();
-      alert('快捷键：\n  1 / 2 / 3 — 结果 / 交易记录 / 交易台\n  R — 运行回测\n  ? — 本帮助');
+      ui.modal({
+        title: '快捷键',
+        body: `<table class="cmp" style="width:100%"><tbody>`
+          + `<tr><td class="mono">1</td><td>回测结果</td></tr>`
+          + `<tr><td class="mono">2</td><td>交易记录</td></tr>`
+          + `<tr><td class="mono">3</td><td>交易台</td></tr>`
+          + `<tr><td class="mono">R</td><td>运行回测</td></tr>`
+          + `<tr><td class="mono">?</td><td>本帮助</td></tr>`
+          + `</tbody></table><p class="muted" style="margin:10px 0 0">`
+          + `在输入框里打字时快捷键不生效。</p>`,
+        confirmText: '知道了',
+        hideCancel: true,
+      });
     }
   });
 }
@@ -2274,10 +2318,10 @@ function liveSkeleton() {
     <div class="panel"><div class="head"><h3>账户与连接</h3><span class="spacer"></span>
       <button class="btn sm ghost" id="liveAcctRefresh" title="重新读取净值与持仓，并记一个净值点（不下单、也不对账）">↻ 刷新账户</button>
       <span class="muted" style="font-size:11.5px" id="liveConnPill"></span></div>
-      <div class="body" id="liveAcct"><div class="empty">正在读取…</div></div></div>
+      <div class="body" id="liveAcct">${loadPh('正在读取…')}</div></div>
     <div class="panel"><div class="head"><h3>信号</h3><span class="spacer"></span>
       <span class="muted" style="font-size:11.5px">与报告同一套引擎</span></div>
-      <div class="body" id="liveSignal"><div class="empty">正在读取…</div></div></div>
+      <div class="body" id="liveSignal">${loadPh('正在读取…', 'table')}</div></div>
   </div>
 
   <div class="panel" style="margin-top:14px"><div class="head"><h3>账户净值历史</h3>
@@ -2294,29 +2338,38 @@ function liveSkeleton() {
     </div>
     <span class="muted" style="font-size:11.5px" id="navMeta"></span>
     <button class="btn sm ghost" id="navReload" title="按当前区间重新重建净值历史">↻ 重建</button></div>
-    <div class="body" id="liveNav"><div class="empty">正在重建…</div></div></div>
+    <div class="body" id="liveNav">${loadPh('正在重建…')}</div></div>
 
   <div class="panel" style="margin-top:14px"><div class="head"><h3>下单计划</h3>
     <span class="spacer"></span><span class="muted" style="font-size:11.5px" id="livePlanMeta"></span></div>
-    <div class="body" id="livePlan"><div class="empty">点「生成下单计划」开始</div></div></div>
+    <div class="body" id="livePlan">${ui.empty({
+      icon: '▤', title: '点「生成下单计划」开始',
+      desc: '只算目标仓位与差额，不碰交易所；要真发单还得再点一次「执行」。',
+    })}</div></div>
 
   <div class="panel" style="margin-top:14px"><div class="head"><h3>风控闸门</h3>
     <span class="spacer"></span><span class="muted" style="font-size:11.5px">任何一条「拦截」都会让整批订单不发出</span></div>
-    <div class="body" id="liveGates"><div class="empty">尚未生成计划</div></div></div>
+    <div class="body" id="liveGates">${ui.empty({
+      icon: '⚖', title: '尚未生成计划',
+      desc: '任何一条「拦截」都会让整批订单不发出。',
+    })}</div></div>
 
   <details class="livefold" style="margin-top:14px">
     <summary>模式与交易场所 <small>模式决定密钥槽与是否真实成交；通常设一次就不动</small></summary>
-    <div class="body" id="liveMode">${L.meta ? '' : '<div class="empty">正在读取…</div>'}</div>
+    <div class="body" id="liveMode">${L.meta ? '' : loadPh('正在读取…')}</div>
   </details>
 
   <details class="livefold" style="margin-top:10px">
     <summary>自动任务 <small>独立进程运行，关掉本页面也继续；只按调仓日下单</small></summary>
-    <div class="body" id="liveAuto"><div class="empty">正在读取…</div></div>
+    <div class="body" id="liveAuto">${loadPh('正在读取…')}</div>
   </details>
 
   <details class="livefold" style="margin-top:10px">
     <summary>执行日志 <small id="liveJobMeta"></small></summary>
-    <div class="body" id="liveJob"><div class="empty">还没有执行记录</div></div>
+    <div class="body" id="liveJob">${ui.empty({
+      icon: '≡', title: '还没有执行记录',
+      desc: '执行、拦截、失败都会记在这里；日志随任务结束而定格。',
+    })}</div>
   </details>
 
   <div class="panel" style="margin-top:14px"><div class="head">
@@ -2327,7 +2380,7 @@ function liveSkeleton() {
       <button class="segbtn ${L.sub === 'limits' ? 'on' : ''}" data-lsub="limits">风控限额</button>
     </div><span class="spacer"></span>
     <button class="btn sm ghost" id="liveExport">导出 CSV</button></div>
-    <div class="body" id="liveHist"><div class="empty">正在读取…</div></div></div>`;
+    <div class="body" id="liveHist">${loadPh('正在读取…', 'table')}</div></div>`;
 }
 
 async function liveApi(path, opts) {
@@ -2678,9 +2731,9 @@ function liveAcctHtml() {
   /* 加载中且还没有本模式的账户快照时，宁可说「正在读取」也不要画一排「—」：
    * 一排 0/— 看起来像"账户是空的"，比空白更容易被当真。 */
   if (L.statusLoading && !(st && st.account)) {
-    return `<div class="empty">正在读取账户…（模拟盘约 1 秒）</div>`;
+    return loadPh('正在读取账户…（模拟盘约 1 秒）');
   }
-  if (!st) return `<div class="empty">正在读取账户…</div>`;
+  if (!st) return loadPh('正在读取账户…');
   if (st.account_error) {
     return `<div class="banner warn"><div class="ico">!</div><div><b>账户不可用</b>
       <p>${esc(st.account_error)}</p></div></div>`;
@@ -2845,10 +2898,10 @@ function liveNavHtml() {
       </div></div>`;
   }
   if (L.navLoading && !L.nav) {
-    return `<div class="empty">正在重建净值历史…（读本地流水＋K线，必要时走一趟 OKX）</div>`;
+    return loadPh('正在重建净值历史…（读本地流水＋K线，必要时走一趟 OKX）');
   }
   const d = L.nav;
-  if (!d) return `<div class="empty">正在读取…</div>`;
+  if (!d) return loadPh('正在读取…');
 
   const warns = (d.warnings || []).filter(Boolean);
   const warnHtml = warns.length
@@ -3127,7 +3180,12 @@ function liveSignalHtml() {
 function liveGatesHtml() {
   const L = S.live;
   const pl = L.plan;
-  if (!pl) return `<div class="empty">尚未生成计划</div>`;
+  if (!pl) {
+    return ui.empty({
+      icon: '⚖', title: '尚未生成计划',
+      desc: '任何一条「拦截」都会让整批订单不发出。',
+    });
+  }
   const vs = pl.violations || [];
   if (!vs.length) {
     return `<div class="gates"><div class="gate ok"><span class="ico2">✓</span>
@@ -3146,7 +3204,12 @@ function liveGatesHtml() {
 function livePlanHtml() {
   const L = S.live;
   const pl = L.plan;
-  if (!pl || !pl.plan) return `<div class="empty">点「生成下单计划」开始</div>`;
+  if (!pl || !pl.plan) {
+    return ui.empty({
+      icon: '▤', title: '点「生成下单计划」开始',
+      desc: '只算目标仓位与差额，不碰交易所；要真发单还得再点一次「执行」。',
+    });
+  }
   const p = pl.plan;
   const blocked = !!pl.blocked || (pl.violations || []).some((v) => v.sev === 'block');
   const res = {};
@@ -3269,7 +3332,7 @@ function livePlanHtml() {
 function liveJobHtml() {
   const L = S.live;
   const j = L.job;
-  if (!j) return `<div class="empty">还没有执行记录</div>`;
+  if (!j) return ui.empty({ icon: '≡', title: '还没有执行记录', desc: '执行、拦截、失败都会记在这里。' });
   const run = j.status === 'running' || j.status === 'queued';
   /* 跑着的任务也要报时间：以前只在结束时才有 elapsed，于是「跑了 20 分钟」
      和「刚点下去 3 秒」在界面上完全一样 —— 用户只能猜它是不是死了。 */
@@ -3349,7 +3412,7 @@ function dueHint(last) {
 function liveAutoHtml() {
   const L = S.live;
   const A = L.auto;
-  if (A == null) return `<div class="empty">正在读取…</div>`;
+  if (A == null) return loadPh('正在读取…');
   const st = A.state || {};
   const grid = A.grid || {};
   const running = !!A.running;
@@ -3500,7 +3563,7 @@ function liveHistHtml() {
   if (L.sub === 'limits') return liveLimitsHtml();
   const key = L.sub === 'fills' ? 'fills' : (L.sub === 'runs' ? 'runs' : 'orders');
   const rows = L[key];
-  if (rows == null) return `<div class="empty">正在读取…</div>`;
+  if (rows == null) return loadPh('正在读取…', 'table');
   if (!rows.length) return `<div class="empty">暂无记录</div>`;
   if (key === 'orders') {
     /* limit=300，所以这里必须包 .tblwrap 限高：否则三张表能撑到 8000px，
@@ -3745,9 +3808,19 @@ function liveBind() {
    * 这是**有副作用**的动作——宇宙因此改变，所以必须确认，且完成后
    * 用户要自己重算信号、重新验收（服务端故意不自动重建基线）。 */
   const up = $('#liveDriftUpgrade');
-  if (up) up.onclick = () => {
-    if (!window.confirm('补齐宇宙会重建候选池并下载数据（不带 --reuse-pool）：\n'
-      + '自动交易的宇宙会因此改变，完成后必须重算信号、重新验收数字。\n\n继续？')) return;
+  if (up) up.onclick = async () => {
+    const ok = await ui.modal({
+      title: '补齐宇宙？',
+      danger: true,
+      body: `<p>会重建候选池并下载行情（<span class="mono">不带 --reuse-pool</span>），
+        然后重算分类、规格与 funding。</p>
+        <p><b>自动交易的宇宙会因此改变。</b>完成后必须自己重算信号、重新跑验收 ——
+        服务端故意不会自动重建基线。</p>
+        <p class="muted">这一步要几分钟，期间不要关控制台。</p>`,
+      confirmText: '补齐宇宙',
+      cancelText: '取消',
+    });
+    if (!ok) return;
     liveSubmit('/api/live/universe/upgrade', {}, '补齐宇宙（重建池 + 快照 + funding）');
   };
   const bp = $('#liveBarPrepare');
