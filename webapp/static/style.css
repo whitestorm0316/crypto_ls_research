@@ -775,3 +775,11 @@ ul.navlist { margin: 0; padding-left: 18px; font-size: 12px; color: var(--text-2
   display: flex; justify-content: flex-end; gap: var(--sp-3);
   padding: var(--sp-4) var(--sp-6); border-top: 1px solid var(--border-2);
 }
+
+/* --- 订单状态：未成交必须与已成交一眼可分 --- */
+/* 一张挂着没成交的单还占着敞口但可以撤；一张已成交的单已经进了持仓。
+ * 以前两行长得完全一样，只能靠读英文单词区分。 */
+.ostate { font-weight: 500; }
+.ostate.ok     { color: var(--ok); }
+.ostate.warn   { color: var(--warn); }
+.ostate.danger { color: var(--danger); }

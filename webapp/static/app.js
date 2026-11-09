@@ -2087,6 +2087,28 @@ const LIVE_SKIP_LABEL = {
   not_due: '未到可执行窗口', busy: '另一进程正在调仓', risk_gate: '风控闸门拦截',
   confirm_failed: '确认短语不符', no_orders: '目标与持仓一致，无单可发',
   dry_run: '预演模式', executed: '已执行' };
+
+/* 订单表的 `state` / `action` 也是代码常量，但这两列以前**原样铺出去**了 ——
+ * 用户在订单表里读到的是 `filled` / `flip_close` / `increase`。
+ * 同一个毛病项目已经为自动任务修过一次（上面那张 LIVE_ACTION_LABEL），
+ * 订单表漏了。这里把同一纪律补齐。
+ *
+ * 三条规则：
+ *  1. **未知值原样显示，不要显示成「—」或「未知」。** 交易所新增一个状态时，
+ *     把真值露出来才能发现；吞掉它等于让一个新状态永远隐形。
+ *  2. 翻译的是**含义**，不是字面（`increase` 是「加仓」不是「增加」；
+ *     `flip_close` 是「反手平」——它是反手两笔里的第一笔，和第二笔
+ *     `flip_open` 必须能区分开，否则一笔反手会看起来像重复下单）。
+ *  3. 金额与张数一律不在这里算，仍然由 `fmt` 负责（唯一来源）。 */
+const ORDER_STATE_LABEL = {
+  filled: '已成交', live: '挂单中', partially_filled: '部分成交',
+  canceled: '已撤销', mmp_canceled: '已撤销（风控）', failed: '失败',
+};
+const ORDER_ACTION_LABEL = {
+  open: '开仓', close: '平仓', increase: '加仓', reduce: '减仓',
+  flip_close: '反手平', flip_open: '反手开',
+};
+const labelOf = (map, v) => (v == null || v === '' ? '—' : (map[v] || String(v)));
 const LIVE_LIMIT_FIELDS = [
   ['max_gross_notional', '总名义额上限 (USD)', '绝对上限，不随本金缩放——唯一能挡住「连错账户」的闸门'],
   /* `max_gross_frac` 是**比例**那一半，也是「想放大收益」时真正要动的那一个。
@@ -3412,12 +3434,18 @@ function liveHistHtml() {
     let h = `<div class="tblwrap"><table class="ordtable"><thead><tr><th>时间</th><th>合约</th><th>方向</th>
       <th>动作</th><th>张数</th><th>名义额</th><th>状态</th><th>clOrdId</th></tr></thead><tbody>`;
     for (const r of rows) {
+      /* 未成交的单必须**看起来**和已成交的不一样：一张挂着没成交的单
+       * 和一张成交了的单，在盘面上是完全不同的两件事（前者还占着敞口
+       * 但可以撤，后者已经进了持仓）。以前两行长得一模一样。 */
+      const st = labelOf(ORDER_STATE_LABEL, r.state);
+      const stCls = (r.state === 'live' || r.state === 'partially_filled')
+        ? 'warn' : (r.state === 'failed' ? 'danger' : (r.state === 'filled' ? 'ok' : ''));
       h += `<tr><td class="mono">${r.ts ? fmtCN(r.ts, 'sec') : '—'}</td>
         <td class="mono">${esc(r.instId)}</td>
         <td class="${r.side === 'buy' ? 'long' : 'short'}">${r.side === 'buy' ? '买' : '卖'}</td>
-        <td>${esc(r.action || '')}</td><td class="num">${fmt.n(r.sz, 5)}</td>
+        <td>${esc(labelOf(ORDER_ACTION_LABEL, r.action))}</td><td class="num">${fmt.n(r.sz, 5)}</td>
         <td class="num">${fmt.dol(r.notional)}</td>
-        <td>${esc(r.state || '')}${r.error ? ` <span class="muted" title="${esc(r.error)}">!</span>` : ''}</td>
+        <td>${stCls ? `<span class="ostate ${stCls}">${esc(st)}</span>` : esc(st)}${r.error ? ` <span class="muted" title="${esc(r.error)}">!</span>` : ''}</td>
         <td class="mono muted">${esc(r.clOrdId || '')}</td></tr>`;
     }
     return h + `</tbody></table></div>`;
