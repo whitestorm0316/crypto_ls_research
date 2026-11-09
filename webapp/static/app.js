@@ -623,6 +623,10 @@ function renderContent() {
     const done = run.status === 'done' || run.status === 'partial';
     const on = done && !S.chartOff[run.tag];
     const delable = run.status !== 'queued' && run.status !== 'running';
+    /* 排队/运行中的任务给「取消」，已结束的给「删除」—— 两者是互斥的：
+     * 后端 `_delete_run` 明确拒绝删除未结束的任务（要求先取消），
+     * 而取消一个已结束的任务没有意义。 */
+    const cancelable = !delable;
     h += `<div class="runrow ${S.selected === run.id ? 'sel' : ''}" data-run="${esc(run.id)}">
       <div class="cmp" title="叠加到回测曲线">
         <input type="checkbox" data-cmp="${esc(run.id)}" ${done && on ? 'checked' : ''} ${done ? '' : 'disabled'}></div>
@@ -632,6 +636,7 @@ function renderContent() {
       <div class="m">${su.cagr != null ? 'CAGR ' + fmt.pct(su.cagr) : ''}</div>
       <div class="state ${esc(run.status)}"><span class="dot2"></span>${esc(statusText(run.status))}</div>
       ${delable ? `<button class="btn sm ghost delrun" data-delrun="${esc(run.id)}" title="删除这条运行记录${run.tag === S.optimalTag ? '（该 tag 是验收基线，仅移除列表，保留盘上产物）' : ''}">删除</button>` : ''}
+      ${cancelable ? `<button class="btn sm ghost cancelrun" data-cancelrun="${esc(run.id)}" title="中止这个任务（已写出的产物不会自动清理）">取消</button>` : ''}
     </div>`;
   }
   h += `</div>`;
@@ -667,12 +672,19 @@ function renderContent() {
   const bo = $('#backOpt');
   if (bo) bo.onclick = () => { applyPreset('v3_optimal'); renderSide(); renderContent(); refreshWarnings(); };
   $$('[data-run]').forEach((row) => row.onclick = (e) => {
-    // 勾选框在行内，点它不该触发「选中运行」；删除按钮同理
-    if (e.target && (e.target.tagName === 'INPUT' || e.target.closest('.delrun'))) return;
+    // 勾选框在行内，点它不该触发「选中运行」；删除/取消按钮同理
+    if (e.target && (e.target.tagName === 'INPUT'
+      || e.target.closest('.delrun') || e.target.closest('.cancelrun'))) return;
     selectRun(row.dataset.run);
   });
   $$('[data-delrun]').forEach((btn) => btn.onclick = async () => {
     await deleteRun(btn.dataset.delrun);
+  });
+  $$('[data-cancelrun]').forEach((btn) => btn.onclick = async (e) => {
+    /* 行本身有 onclick（选中该运行）。按钮必须自己 stopPropagation，
+     * 否则「点取消」会先选中这条运行、再弹出取消框 —— 两次副作用。 */
+    e.stopPropagation();
+    await cancelRun(btn.dataset.cancelrun);
   });
   $$('[data-cmp]').forEach((cb) => cb.onchange = () => {
     const run = S.runs.find((r) => r.id === cb.dataset.cmp);
@@ -1852,15 +1864,86 @@ async function selectRun(id) {
   renderContent();
 }
 
+/* 取消一条正在排队/运行的回测。
+ *
+ * 后端 `POST /api/runs/<id>/cancel` 一直存在（`server.py::_cancel`，约 946 行
+ * 的路由 + 1358 行的实现），但**前端从来没有接过** —— 于是用户点了「运行回测」
+ * 之后只能等它跑完，慢档要几十分钟，中途想换参数只能重启控制台。这是操作
+ * 缺陷，不是体验问题：一个不能中止的长任务，等于逼用户去杀进程。
+ *
+ * 两个容易踩的点：
+ *  1. 服务端「取消不了」时回的是 **HTTP 200 + `note`**（例如任务已经结束），
+ *     不是 4xx。所以不能只看 `resp.ok`，必须读 `note` 并如实说出来。
+ *  2. 和 `deleteRun` 一样先取 `text()` 再 `JSON.parse` —— 控制台没重启时
+ *     `BaseHTTPRequestHandler` 会回 501 + HTML，`resp.json()` 只会抛一句
+ *     `Unexpected token '<'`，把真正的原因（路由不存在）藏起来。
+ */
+async function cancelRun(id) {
+  const run = S.runs.find((r) => r.id === id);
+  if (!run) return;
+  const running = run.status === 'running';
+  const ok = await ui.modal({
+    title: running ? '取消正在运行的回测？' : '取消排队的回测？',
+    danger: true,
+    body: `<p>任务 <b>${esc(run.label || run.id)}</b>`
+      + `（tag <span class="mono">${esc(run.tag)}</span>）</p>`
+      + (running
+        ? '<p>工作进程会被<b>终止</b>：本次产物不完整，记录会标为「已取消」。'
+          + '已经写出的表<b>不会</b>自动清理。</p>'
+        : '<p>它还没开始跑，取消后不会产生任何产物。</p>'),
+    confirmText: '确认取消',
+    cancelText: '继续跑',
+  });
+  if (!ok) return;
+  try {
+    const resp = await fetch('/api/runs/' + encodeURIComponent(id) + '/cancel',
+      { method: 'POST' });
+    const raw = await resp.text();
+    let d = null;
+    try { d = JSON.parse(raw); } catch { d = null; }
+    if (!resp.ok) {
+      const hint = resp.status === 501
+        ? '服务端不支持这个路由 —— 控制台多半没重启（改过 webapp/ 之后必须重启 8790）。'
+        : (d && d.error) || raw.slice(0, 300);
+      ui.toast('取消失败 HTTP ' + resp.status + '：' + hint, 'danger');
+      return;
+    }
+    if (!d) {
+      ui.toast('取消失败：服务端返回的不是 JSON', 'danger');
+      return;
+    }
+    /* 200 + note = 服务端明确说「取消不了」。必须说出来，不能静默当成功。 */
+    if (d.note) {
+      ui.toast(d.note, 'warn');
+    } else {
+      ui.toast(d.status === 'cancelled' ? '已取消：' + (run.label || run.id) : '已请求取消',
+        'ok');
+    }
+    await pollRuns();
+    renderContent();
+  } catch (e) {
+    ui.toast('取消失败：' + (e && e.message || e), 'danger');
+  }
+}
+
 async function deleteRun(id) {
   const run = S.runs.find((r) => r.id === id);
   if (!run) return;
   const tag = run.tag || run.id;
-  const ok = confirm(`删除运行记录「${run.label || id}」（tag: ${tag}）？\n\n` +
-    (run.tag === S.optimalTag
-      ? '该 tag 是验收基线，只会移除列表与日志，盘上产物会保留。\n\n'
-      : '删除后会同时清理盘上产物目录（若该 tag 未被其他记录共用）。\n\n') +
-    '此操作不可撤销。');
+  /* 原生 `confirm()` 会阻塞整个 JS 线程 —— 轮询停摆、动画冻结；而且它只有
+   * 一个字符串，装不下「哪些产物会被删、哪些会保留」。换成 ui.modal 之后，
+   * 这段说明可以排版，按钮也能明确写「删除 / 保留」。 */
+  const ok = await ui.modal({
+    title: '删除这条运行记录？',
+    danger: true,
+    body: `<p><b>${esc(run.label || id)}</b>（tag <span class="mono">${esc(tag)}</span>）</p>`
+      + (run.tag === S.optimalTag
+        ? '<p>该 tag 是<b>验收基线</b>：只会移除列表与日志，盘上产物<b>会保留</b>。</p>'
+        : '<p>会同时清理盘上产物目录（若该 tag 未被其他记录共用）。</p>')
+      + '<p class="muted">此操作不可撤销。</p>',
+    confirmText: '删除',
+    cancelText: '保留',
+  });
   if (!ok) return;
   try {
     const resp = await fetch('/api/runs/' + encodeURIComponent(id), { method: 'DELETE' });
@@ -1880,15 +1963,15 @@ async function deleteRun(id) {
       const hint = resp.status === 501
         ? '服务端不支持 DELETE —— 控制台多半没重启（改过 webapp/ 之后必须重启 8790）。'
         : (d && d.error) || raw.slice(0, 300);
-      alert('删除失败 HTTP ' + resp.status + '\n\n' + hint);
+      ui.toast('删除失败 HTTP ' + resp.status + '：' + hint, 'danger');
       return;
     }
-    if (!d) { alert('删除失败：服务端返回的不是 JSON\n\n' + raw.slice(0, 300)); return; }
+    if (!d) { ui.toast('删除失败：服务端返回的不是 JSON', 'danger'); return; }
     if (S.selected === id) { S.selected = null; S.detail = null; S.trTag = null; }
     await pollRuns();
     renderContent();
   } catch (e) {
-    alert('删除失败：' + (e && e.message || e));
+    ui.toast('删除失败：' + (e && e.message || e), 'danger');
   }
 }
 
