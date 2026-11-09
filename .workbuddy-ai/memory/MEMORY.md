@@ -5,12 +5,12 @@
 
 ## 环境 / 沙箱 / 进程
 - Python：`~/.workbuddy-ai/binaries/python/envs/default/bin/python`。
-- `grep '\|'` 静默返 0 行 → 用 `grep -E`/Grep 工具；**无 `timeout`**；`ps` 禁 →
-  探活 `kill -0 $(cat <pidfile>)`；**`/tmp` 两次调用间被清空** → pidfile/log 放仓库内。
+- `grep '\|'` 静默返 0 行 → 用 `grep -E`/Grep 工具；**无 `timeout`**；`ps` 禁（`pgrep`/`lsof`
+  可用）→ 探活 `kill -0 $(cat <pidfile>)`；**`/tmp` 两次调用间被清空** → pidfile/log 放仓库内。
 - 控制台 **8790**；`server.py::main()` 默认 8770 → **必须位置参数** `python -m webapp.server 8790`。
 - 沙箱里 curl 探活不可信（127.0.0.1 被代理接管）→ 判活/读 API 用**裸 socket**。
-- 长任务用 `persistent-background-process/scripts/daemon_run.py`（位置参数 `<cwd> <log> <pid> <cmd...>`）；
-  `nohup ... &` 活不过一轮调用。
+- 长任务用 `persistent-background-process/scripts/daemon_run.py`（位置参数
+  `<cwd> <log> <pid> <cmd...>`）；`nohup ... &` 活不过一轮调用。`echo ===` 在 zsh 报错。
 - 数据流水线：`download --bars 1h 15m 5m` → `asset_class --build` → `funding_build`。
   改 `webapp/*.py` 或 `crypto_ls_research/**` **必须重启 8790**；静态文件每请求读盘不用重启。
 
@@ -20,10 +20,10 @@
 
 ## 验收口径 = 1 天网格 + 五因子（`v5_1d_all5`）——数字在 `FINDINGS.md`
 - 唯一来源 `settings.ACCEPTED_FACTORS`/`ACCEPTED_REBALANCE_DAYS`，派生到
-  `engine.DEFAULT_SIGNAL` 与 `webapp.spec.OPTIMAL_OVERRIDES`，**都不许写字面量**（同一套：1h/1.0/crypto+五因子）。
-- 三档必须一起报（1d ≠ 更优：拿 2.22×回撤深度、2.94×换手换的）。
-- 完整全阶段 = **19 行 = 16 门禁 + 3 条 `pass=None` 信息行**；「没评估」不许长得像
-  「通过」。守卫 `test_acceptance_completeness.py`。
+  `engine.DEFAULT_SIGNAL` 与 `webapp.spec.OPTIMAL_OVERRIDES`，**都不许写字面量**（1h/1.0/crypto+五因子）。
+- 三档必须一起报（1d ≠ 更优：拿 2.22× 回撤深度、2.94× 换手换的）。
+- 完整全阶段 = **19 行 = 16 门禁 + 3 条 `pass=None` 信息行**；「没评估」不许长得像「通过」。
+  守卫 `test_acceptance_completeness.py`。
 
 ## 网格 / 因子集：唯一来源
 - `ACCEPTED_REBALANCE_DAYS`（1.0）**五处引用**（DEFAULT_SIGNAL、auto_ctl.start、
@@ -31,9 +31,10 @@
 - 换口径最先坏前端拷贝（OPT.cli 曾硬编码 ⇒ 连 Sharpe 都不印）⇒ `diffFromOptimal()`/`gridDaysText()` 收口。
   比因子集先查选名中位数；叫「不成立」先算 σ；`deflated_haircut` 按 tag 读。
 
-## 检验结论（Q32–Q35）——推导/数字在 `FINDINGS.md`
-- Q33：自写估计量必须先验证再信（`_ols_nw` 曾 t 虚高 ~45×）；条件子集「年化收益」无意义；
+## 检验结论（Q32–Q35）/ 失效归因（Q41–Q43）——细节在 `FINDINGS.md`、`RULES-OPS.md`
+- 自写估计量必须先验证再信（`_ols_nw` 曾 t 虚高 ~45×）；条件子集「年化收益」无意义；
   必须披露熊市 0.898、高波动 0.118。
+- 归因只诊断未优化；**头号反复缺陷「算不出来」被静默丢掉**。
 
 ## 保证金模式（Q44–Q47）——细节在 `RULES-OPS.md`
 - 单源 `settings.MARGIN_MODE`=isolated；模式必须和杠杆一起动 ⇒ 强平频率 3×→29.5/年、
@@ -42,47 +43,48 @@
 - ⚠️ 杠杆是账户级配置、订单不带；`td_mode` 只读（写死标签显示相反模式）。
 - 🔴 Q44（未修）：`account()` 的 `cur_sz` 跨模式求和 ⇒ 另一种腿永久冻结、被拒单。改需授权。
 
-## 展示层 / 控制台（Q39）
+## 展示层 / 控制台（Q39 / Q73 / Q74–Q76）
 - 禁止在 app.js/spec.py 写死指标、禁止前端留最优参数拷贝；唯一来源 `/api/spec` 四 headline。
   页面提到一个控件就必须真有那个控件。
 - 判据坏了不许靠改判据变绿（加 `pass=None` 行不计门禁）；警告理由必须和用户做的事是同一件事；
-  禁止「整文件不含某字符串」→切定义块；**相邻对断言**优于「包含某数」。纪律见 `dashboard-data-consistency`。
+  禁止「整文件不含某字符串」→ 切定义块；**相邻对断言**优于「包含某数」。纪律见 `dashboard-data-consistency`。
 - `/api/` 错误必须是 JSON（没实现的方法回 501+HTML ⇒ 前端根因全藏住）。`fmt.dol` 两位小数、
   负号在 `$` 前。变异脚本：解释器要能 import numpy/pandas；bash 写 `${VAR}`；还原放 `finally`。
-- 🔴 **改前端先看这三个约束**（Q73）：①`app.js`（4300 行/140 函数）被 **8 个 harness**
+- 🔴 **改前端先看这三个约束**（Q73）：①`app.js`（~4500 行/140 函数）被 **8 个 harness**
   （`scripts/smoke_ui|smoke_live|check_dom_refs|check_js|verify_*`）+ **2 个守卫**
   （`test_console_api_contract` 正则抓 `deleteRun()`、`test_universe_drift` node vm 真渲染）
   直接读取 ⇒ **拆文件会让它们静默失效**，必须先改 harness 再搬。②`/static/` 走
-  `os.path.basename()`（`server.py:830`）**扁平化** ⇒ 新 JS 必须平铺，子目录 404；
-  该前缀免登录。③登录页渲染进 `#content` ⇒ 未登录时顶栏（含「运行回测」）与空侧栏仍可见。
+  `os.path.basename()`（`server.py:830`）**扁平化** ⇒ 新 JS 必须平铺，子目录 404；该前缀免登录。
+  ③登录页渲染进 `#content` ⇒ 未登录时顶栏（含「运行回测」）与空侧栏仍可见。
 - 三个「后端有、前端没接」的缺口（Q73）：回测取消**已接**（P0-5）；**撤单**
-  `okx_private` 的 `cancel_order/cancel_all/orders_pending` **全仓零调用点**（死代码，
-  挂单看不到也撤不掉）；**暂停 ≠ 停止** 未区分。
-- 🔴 **P0 已落地**（Q73 实施，7 个 commit，细节 `2026-11-09.md`）：tokens + `ui.js` 组件库、
-  回测取消接线、订单枚举翻译、三处 canvas `ResizeObserver`、登录页整屏独立
-  （`body.authmode`）、侧栏开关（**常驻**，切 tab 不改布局）、原生 `confirm/alert` 全退场、
-  加载骨架。**「64px 图标导航」故意没做**：7 个模块里
-  4 个页面 P1 才建，现在放就是死按钮。方案见 `docs/UI_UX_REFACTOR_PLAN.md`。
+  `okx_private` 的 `cancel_order/cancel_all/orders_pending` **全仓零调用点**（挂单看不到也
+  撤不掉）；**暂停 ≠ 停止** 未区分。
+- 🔴 **P0 已落地**（Q73，细节 `2026-11-09.md`，方案 `docs/UI_UX_REFACTOR_PLAN.md`）：
+  tokens + `ui.js`、回测取消接线、订单枚举翻译、三处 canvas `ResizeObserver`、登录页整屏独立
+  （`body.authmode`）、侧栏开关（**常驻**，切 tab 不改布局）、原生 `confirm/alert` 全退场、加载骨架。
+  **「64px 图标导航」故意没做**：7 个模块里 4 个页面 P1 才建，现在放就是死按钮。
+- 🔴 **Q76 三件事**（运行记录页）：①任务进入终态必须**重拉一次详情**——`S.detail` 是 running
+  时抓的，没有 `result/metrics`，只改 `status` 再重绘就全是「—」；终态 `RUN_TERMINAL` =
+  `done/partial/failed/cancelled`，只在**跃迁那一刻**拉，否则每 2.5s 打一次接口。
+  ②批量删除**逐条** `DELETE /api/runs/<id>` 复用服务端安全规则（queued/running 回 409；
+  最优 tag 只删列表项+日志、产物保留；产物目录 **rename 进 `artifacts/.trash/`** 不是 rmtree）；
+  勾选态放 `S`（`pollRuns` 每 2.5s 整块重建列表），`syncBulkBar()` 只改两个节点；
+  `.runs.bulk` 的 grid 列数要 **+1**，否则第 7 个子元素换行。③基线重跑：tag 取
+  `/api/spec.optimal_tag`（**不许写死**，曾 v3→v4_1d→v5_1d_all5）、阶段取**最宽 bundle**
+  （`full`，15 段；面板选哪个无关）、参数取 spec 不取面板，弹窗写清会覆盖 `artifacts/<tag>/`。
 - 🔴 换壳四条铁律：①**文案一个字都不能改** —— `smoke_live` 用 `includes('正在读取账户')`
   /`includes('点「生成下单计划」开始')`/`includes('尚未生成计划')` 判状态，`verify_auto_panel`
   用 `!includes('正在读取')` ⇒ 纯骨架会让断言静默失效。②`.skel` 是 flex column 且高度 auto
   ⇒ `.skbar` 的 `flex:1`＝`flex-basis:0` **塌成 0 高** ⇒ 骨架必须**真渲染看竖排**。
-  ③`git commit -m` 含反引号会被 zsh 替换 ⇒ 写文件 `-F`。④`display:none`
-  退出栅格 ⇒ 收起侧栏时 `.content` 掉进 `0` 宽那列、整页压成 **40px 缝**
-  （`gridTemplateColumns` 仍显示 `0px 1280px`「看着正常」）⇒ 藏侧栏必须配**单列** `.main`，
-  判据量 `getBoundingClientRect().width` 而非模板字符串。
+  ③`git commit -m` 含反引号会被 zsh 替换 ⇒ 写文件 `-F`。④`display:none` 退出栅格 ⇒ 收起侧栏时
+  `.content` 掉进 `0` 宽那列、整页压成 **40px 缝**（`gridTemplateColumns` 仍显示 `0px 1280px`
+  「看着正常」）⇒ 藏侧栏必须配**单列** `.main`，判据量 `getBoundingClientRect().width`。
 
 ## 数据源可切换（Q40）——表格在 `RULES-OPS.md`
 - 缓存目录唯一来源 = `settings.CACHE_DIR`（`CRYPTO_CACHE_DIR`）；store/download 的 CACHE 都从它派生。
 - 字段映射最贵的坑：`vol_ccy`←基础币量、`amount`←计价币额（写反不报错，vwap 变价格²）。
-  守卫 `test_data_source_switch.py`。
-- `min_avg_amount_usd` 是绝对美元阈值（币安成交额 3.67×OKX ⇒ 换源先看横截面宽度）；
-  比价前除掉固定面值因子；验收 1.94 落在 ADV 门槛尖峰上（关门槛 1.93→0.07）；
-  两场所 panel 同持会 OOM ⇒ 用完即 del。
-
-## 失效归因（Q41–Q43）——只诊断未优化；细节整节在 `RULES-OPS.md`
-（funding 符号、5 个回撤窗口边界、同期 IC 拿结果解释结果、空腿亏损三分、
-**头号反复缺陷「算不出来」被静默丢掉**）
+- `min_avg_amount_usd` 是绝对美元阈值（币安成交额 3.67×OKX ⇒ 换源先看横截面宽度）；验收 1.94
+  落在 ADV 门槛尖峰上（关门槛 1.93→0.07）；两场所 panel 同持会 OOM。守卫 `test_data_source_switch.py`。
 
 ## 订单方向
 - `posSide`=动哪个仓、`side`=方向：加多 buy/long、减多 sell/long、**加空 sell/short、减空 buy/short**；flip=两腿。
@@ -90,117 +92,97 @@
 
 ## 自动交易 / 设置持久化 ——完整规则在 `RULES-OPS.md`
 - `not_due` 是 warn 不是 block ⇒ 到期判定写进调度器（断言 execute 没被调用）、绝不传 force；
-  闸门顺序：熔断 → 数据新鲜度 → 到期 → 风控上限。
-- 到期闸门是「边沿」：`rebalance_window_open(since)==(since==1)`；「还差几根」=R−since；
-  刷新间隔必须小于一根 bar。
+  闸门顺序：熔断 → 数据新鲜度 → 到期 → 风控上限。到期闸门是「边沿」：
+  `rebalance_window_open(since)==(since==1)`；「还差几根」=R−since；刷新间隔必须小于一根 bar。
 - 保存必须落盘收尾；`load_limits()` 的 None（从未配置）≠ {}（全零拒每笔）。
-- `set_leverage` 不改订单、放大敞口无效——硬不变量别「修」（build_plan 无 leverage 参数）。
-  唯一有效旋钮 `max_daily_turnover`，放开会打坏策略（1.82→1.10→0.46）。
+- `set_leverage` 不改订单、放大敞口无效——硬不变量别「修」；唯一有效旋钮
+  `max_daily_turnover`，放开会打坏策略（1.82→1.10→0.46）。
 
-## 合约宇宙：新合约不自动算上、退市不自动剔（Q66）
+## 合约宇宙（Q66）——新合约不自动算上、退市不自动剔
 - 宇宙 = `list_cached_insts()` = 盘上 parquet，不是 OKX 实时列表；刷新走 `--reuse-pool`
-  冻结池 ⇒ 新合约永远没 parquet（实测 OKX 494、盘上缺 299/crypto 133）。
-- 退市残留有兜底（无 bar ⇒ 因子 NaN ⇒ 不进新仓；有持仓 planner 市价平）。
+  冻结池 ⇒ 新合约永远没 parquet（实测 OKX 494、盘上缺 299/crypto 133）。退市残留有兜底
+  （无 bar ⇒ 因子 NaN ⇒ 不进新仓；有持仓 planner 市价平）。
 - 跟上要三件一起：①download 不带 --reuse-pool ②asset_class --build ③specs.refresh_specs()。
   少② ⇒ resolve_insts fail-loud；换池=换宇宙不可比。
-- 🔴 SystemExit 不是 Exception 子类 ⇒ except Exception 抓不到 ⇒ 曾杀守护进程
-  （auto_trader.once、auto_schedule._run_once 已降级：本轮失败+不写幂等账+下轮重试）。
+- 🔴 SystemExit 不是 Exception 子类 ⇒ except Exception 抓不到 ⇒ 曾杀守护进程（auto_trader.once、
+  auto_schedule._run_once 已降级：本轮失败+不写幂等账+下轮重试）。
 
 ## 宇宙体检（Q67）
 - `execution/universe_drift.py::drift_report()`：只读比对盘上 vs OKX 实时（新达标/退市残留/
-  缺分类/缺规格；池规则**复用** `build_candidate_pool` 不许抄第二遍）。**永不抛**——挂在
-  `/api/live/status` 轮询上的前提。TTL 6h 落盘 `<CACHE>/meta/universe_drift.json`；失败退避
-  15 分钟；快照是 body 包裹结构——**失败不能覆盖上次成功体**（stale 兜底靠它）。
-- 接线：status 加 `universe_drift` 键、plan preview 后附加；前端 `liveDriftHtml()` 挂
-  `#liveDrift`（liveBar 下）、`livePaintAll` 重绘。守卫 `test_universe_drift.py`（13 条，
-  node vm 真渲染；app.js 末尾入口是 `authRender();` 不是 `boot();`）。7 变异全抓。
+  缺分类/缺规格；池规则**复用** `build_candidate_pool`）。**永不抛**——它挂在 `/api/live/status`
+  轮询上。TTL 6h 落盘、失败退避 15 分钟；快照是 body 包裹结构——**失败不能覆盖上次成功体**
+  （stale 兜底靠它）。前端 `liveDriftHtml()` 挂 `#liveDrift`；守卫 `test_universe_drift.py`。
 - **补齐按钮**（Q67.1）：`universe_upgrade.py::upgrade_universe()` 四步（download 重建池
   **不带 --reuse-pool** + `--incremental` → asset_class --build → refresh_specs →
-  funding_build），失败即停；前后各跑一次体检。路由 `/api/live/universe/upgrade` 走任务
-  队列；前端横幅内有可修缺口才显示、confirm 门控（相邻对 regex 钉死，变异抓过旁路）。
-  **故意不自动重建基线/重算信号**——那是验收决定。🔴 `funding_build` 的 end 曾硬编码
-  2026-09-26（Q58 同族坑、现网 funding_hyb 停在那天）→ 已改 `default_end()`。
+  funding_build），失败即停；前后各跑一次体检。路由 `/api/live/universe/upgrade` 走任务队列；
+  前端有可修缺口才显示、confirm 门控。**故意不自动重建基线/重算信号**——那是验收决定。
+  🔴 `funding_build` 的 end 曾硬编码 2026-09-26（Q58 同族坑）→ 已改 `default_end()`。
 - 🔴 **长任务的子进程必须流式**（Q71）：`subprocess.run(capture_output=True)` 把 stdout
-  整段缓冲到结束 ⇒ ①下载(30min)/④funding(17min) 在界面上只有一行「…」，和卡死长得
-  一样。改 Popen 逐行转发 + **`PYTHONUNBUFFERED=1`**（否则 print 攒满 8KB）+ 30s 心跳
-  + 超时 **kill 且 wait**。诊断手法：`pgrep` 找子进程、`lsof` 采样 TCP（有=在下载）、
-  产物 mtime 重建时间线（drift 快照=开始、inst_category/swap_specs=②③、funding_hyb=④）。
-  **`ps` 仍被禁**，`pgrep`/`lsof` 可用；`echo ===` 在 zsh 会报错（等号展开），要加引号。
+  整段缓冲到结束 ⇒ ①下载(30min)/④funding(17min) 在界面上只有一行「…」，和卡死长得一样。
+  改 Popen 逐行转发 + **`PYTHONUNBUFFERED=1`** + 30s 心跳 + 超时 **kill 且 wait**。
+  诊断：`pgrep` 找子进程、`lsof` 采样 TCP（有=在下载）、产物 mtime 重建时间线。
 
 ## 无人值守 + 通知（Q49–Q53）——细节在 `RULES-OPS.md`
 - 执行者是控制台自己（auto_schedule，启动自恢复），走和网页按钮同一队列；到点是窗口不是
   阈值、错过不补；enabled/running 两个量、派生 will_trade。
 - 通知要和「执行」一起搬；action 恒为 rebalance 必须翻译；拦截原因填 blocked_by；
-  返回嵌套 vs 格式化器读扁平 ⇒ 消息全是「—」。
-- 沙箱代理只在工具调用期间存活 ⇒ 定时通知 Errno 61 而订单照下；修法
-  `build_opener(ProxyHandler({}))`；通知结果落 runs.jsonl（写回 reversed()）。
-- 模块重复加载（import live_api vs from webapp import live_api）⇒ 线程建在 A、HTTP 读 B；
-  统一包路径导入。
-- 🔴 **三个执行体并存会双下单**（Q72）：①控制台调度器 `webapp/auto_schedule.py`（线程，
-  账=`auto_schedule.json`）②守护进程 `auto_trader`（launchd 拉起，**无独立账**）
-  ③launchd 定时器 `com.crypto-ls.auto-trader-live.plist`→`scripts/scheduled_tick.py`
-  （只保进程活着）。**守护进程的闸门是「网格边沿」不是「今天跑过了」**：
-  `rebalance_due=(bars_since_decision==1)`（`signal.py::rebalance_window_open`）——
-  面板停在决策点后一根 bar 期间**一直为真**，整个下午都成立 ⇒ ①调完仓，②再看到同一
-  个边沿又调一次。`not_due` 在 `check_plan` 里是 **warn 不是 block**（`limits.py:242`）
-  ⇒ 控制台路径（`auto_runner`→`preview(force=False)`→`execute(force=False)`）照样下单；
-  只有守护进程自己实现了那个 block。换手记账是**共享**的（`state.json`）⇒ 预算闸门
-  救不了这个场景。**区分来源**：`runs.jsonl`（引擎写）vs `auto.jsonl`（守护进程写）——
-  只在 `runs.jsonl` 里 ⇒ 走的是控制台/网页路径。日志：守护进程=
-  `artifacts/live/live/auto_stdout.log`，launchd 定时器=`logs/scheduler-live.out.log`，
-  控制台调度器=`logs/console_8790.log`（可能过期，看 mtime）。
-  历史 6 天都有双执行（第二次 n_orders=0 或 2 单才没出事）⇒ **大调仓那天必然重复下单**。
+  返回嵌套 vs 格式化器读扁平 ⇒ 消息全是「—」。沙箱代理只在工具调用期间存活 ⇒ 定时通知
+  Errno 61 而订单照下 ⇒ `build_opener(ProxyHandler({}))`。模块重复加载（`import live_api` vs
+  `from webapp import live_api`）⇒ 线程建在 A、HTTP 读 B ⇒ 统一包路径导入。
+- 🔴 **三个执行体并存会双下单**（Q72，细节 `RULES-OPS.md`）：①控制台调度器
+  `webapp/auto_schedule.py`（线程，账=`auto_schedule.json`）②守护进程 `auto_trader`
+  （launchd 拉起，**无独立账**）③launchd 定时器 →`scheduled_tick.py`（只保进程活着）。
+  守护进程的闸门是「**网格边沿**」不是「今天跑过了」：`rebalance_due=(bars_since_decision==1)`
+  ⇒ 决策点后一根 bar 期间**一直为真**；`not_due` 在 `check_plan` 里是 **warn 不是 block**
+  （`limits.py:242`）⇒ 控制台路径照样下单；换手账**共享**（`state.json`）⇒ 预算闸门救不了。
+  **区分来源**：`runs.jsonl`（引擎写）vs `auto.jsonl`（守护进程写）⇒ 大调仓那天必然重复下单。
 
 ## 鉴权 / 二重认证（Q54–Q57）——细节在 `RULES-OPS.md`
 - 闸门在唯一入口（_gate 挂 do_GET/POST/DELETE 开头、路由之前）；_PUBLIC_API 白名单用**前缀**
   （手写文件名 ⇒ 只剩空壳日志正常）；未登录回 JSON 401，存在/不存在同响应（防枚举）。
-- **前端改动必须真渲染再断言**（grep/裸 socket「通过」用户看空白页）；ROOT 从别的文件抄
-  会多爬一级。CSS 同理：起控制台 + 静态 harness（/static/ 免登录）+ agent-browser
-  **计算样式断言**（getComputedStyle）最硬；CSS 变量先定义再用（--text-1 曾未定义、
-  --shadow 曾被当颜色用 ⇒ 声明整体失效不报错）。
-- `==` 与 compare_digest 行为相同 ⇒ 只验 True/False 的测试抓不到替换。明文绑非本机拒绝启动；
-  隧道 ≠ TLS 解决 ⇒ 绑 127.0.0.1；Host 头校验回 421。门禁测试两个方向都要验。
+- **前端改动必须真渲染再断言**（grep/裸 socket「通过」用户看空白页）；ROOT 从别的文件抄会多
+  爬一级。CSS 同理：控制台 + 静态 harness + agent-browser **计算样式断言**最硬；CSS 变量先定义
+  再用（--text-1 曾未定义、--shadow 被当颜色 ⇒ 整条声明静默失效）。
+- `==` 与 compare_digest 行为相同 ⇒ 只验 True/False 抓不到替换。明文绑非本机拒绝启动；
+  隧道 ≠ TLS ⇒ 绑 127.0.0.1；Host 头校验回 421。门禁测试两个方向都要验。
 
 ## 新机器 / 产物初始化 + 内存（Q58–Q62）——细节在 `RULES-OPS.md`
-- 入口 `scripts/init_linux.sh`（幂等）→ download → asset_class → funding → 5b 重建基线 + 内存体检。
-  数据/产物/凭据全 gitignore。
+- 入口 `scripts/init_linux.sh`（幂等）→ download → asset_class → funding → 5b 重建基线 + 内存体检；
+  数据/产物/凭据全 gitignore。页头「基线数据缺失」是必然，重建 10 秒
+  `rebuild_optimal_baseline.py`（默认拒绝覆盖）。
 - 🔴 代理默认值 `OKX_PROXY=127.0.0.1:7897` 写在代码里、模块导入时求值 ⇒ 换机器 Errno 111；
   必须先 export（空=直连）。🔴 `--end` 默认硬编码 2026-09-26 排他 ⇒ 静静少二十来天。
-- 页头「基线数据缺失」是必然；重建 10 秒 `rebuild_optimal_baseline.py`（默认拒绝覆盖；
-  --override 走 json.loads）。
 - 🔴 `-9`/137 = SIGKILL = OOM、无 traceback；三处撞：命令行回测、控制台「一键准备」
   （182MB+1.8GB）、「仅刷新行情」安全。2GB 机器必须加 swap（峰值 ~2.0GB）。
-- 🔴 **性能红线（Q68，2026-10-20 实测撤销）**：`wide()` 的「一步构造」
-  `DataFrame(cols, index=grid, dtype=...)` 是逐列对齐慢路径——**慢 8.6 倍**
-  （109.8s vs 12.8s）、峰值反而更高。快路径 = `DataFrame(cols).astype("float32").reindex(grid)`
-  （先转再对齐数值逐位不变）。守卫双向钉死，**禁止回潮**；性能改动必须当场 A/B 计时，
-  只测内存不测时间会带着 8.6× 倒退上线。
+- 🔴 **性能红线（Q68）**：`wide()` 的「一步构造」`DataFrame(cols, index=grid, dtype=...)`
+  是逐列对齐慢路径——**慢 8.6 倍**（109.8s vs 12.8s）、峰值反而更高。快路径 =
+  `DataFrame(cols).astype("float32").reindex(grid)`。守卫双向钉死，**禁止回潮**；
+  性能改动必须当场 A/B 计时，只测内存不测时间会带着 8.6× 倒退上线。
 
-## 飞书通知配置（Q63）——细节在 `RULES-OPS.md`
+## 飞书通知 / OKX（Q63）——细节在 `RULES-OPS.md`
 - `config/notify.json` gitignore（webhook=凭据）⇒ 每台机器都要配。内置 CLI：
   `python -m crypto_ls_research.execution.notify --show/--test/--set-url/--set-secret/--set-keyword`
   （--set-url 自动写 enabled:true；手改最易漏）。安全设置必须对上（否则 code 19024）。
-- notify_on 默认 traded/blocked/error（not_due 刻意不推）；modes 默认 demo/live。
-  改配置不用重启控制台。
-
-## 回测日志 / 退出码（Q61）
-- `--log` 默认开（logs/research-<tag>-<时间戳>.log）；阶段失败收尾 sys.exit(1)+### FAILED
-  （原先退出码 0 ⇒ init 脚本把失败当成功）。改完 .py 第一件事 ast.parse。
+- notify_on 默认 traded/blocked/error（not_due 刻意不推）；modes 默认 demo/live。改配置不用重启。
+- send() 永不抛、配完不重启就静默不发（按 mtime 热读）；HTTP 200 不是结论；OKX envelope code
+  与逐行 sCode 两层。仓位 USD 名义只能读 notional（sz×markPx 差合约面值倍数，不报错、看着合理）。
 
 ## 测试约定——细则在 `RULES-OPS.md`
-- 期望值从 fixture 派生；断言用页面同一格式化器推导；断言用性质不用秒表；
-  pytest 必须 `TMPDIR="$(mktemp -d)"`。
+- `--log` 默认开（logs/research-<tag>-<时间戳>.log）；阶段失败收尾 sys.exit(1)+### FAILED
+  （原先退出码 0 ⇒ init 脚本把失败当成功）。改完 .py 第一件事 ast.parse。
+- 期望值从 fixture 派生；断言用页面同一格式化器推导；用性质不用秒表；pytest 必须
+  `TMPDIR="$(mktemp -d)"`。
 - 对账断言要有「独立算一遍」的量钉口径（引擎自己的量只钉分组）。新断言必须变异测试
-  + sha 验证真的注入；变异 -k 选错 ⇒ 0 selected 被当成「抓到」。
-- 重测试主动缩小输入（pytest 单进程跑到底、主进程常驻 ⇒ 137 且无失败信息）；
-  制造失败挑最便宜路径；只验机制加 --max-insts 12。
-- 解析文本先确认真解析到了内容（续行、前提断言）；扫全文件会扫到自己注释 ⇒ 只看非 # 行。
+  + sha 验证真的注入；变异 -k 选错 ⇒ 0 selected 被当成「抓到」；**一次只注入一个**，
+  OOM 被 kill 时 `finally` 不执行会留下残留变异（用 `git status` + sha 复核）。
+- 重测试主动缩小输入（单进程跑到底 + 主进程常驻 ⇒ 137 且无失败信息）；只验机制加
+  `--max-insts 12`。解析文本先确认真解析到内容（续行、前提断言）；扫全文件会扫到自己注释。
 - 🔴 **行为测试不许把被测组件本身 stub 掉**（`ui.modal = async () => true` 只证明「拿到
   true 之后干什么」）⇒ 交互层用 **jsdom 真 click**（托管 node 的 `node_modules` 里有，
-  `NODE_PATH` 指过去）。组件库生成 `data-*` 必须 **kebab-case**（`data-uimOk` 被解析器
-  小写成 `data-uimok`，选择器 `[data-uim-ok]` 匹配不上 ⇒ 按钮静默无响应）。
-
-## 通知 / OKX
-细节在 `RULES-OPS.md`。必记：配完不重启 → 静默不发（按 mtime 热读）；send() 永不抛；
-HTTP 200 不是结论；OKX envelope code 与逐行 sCode 两层。仓位 USD 名义只能读 notional
-（sz×markPx 差合约面值倍数，不报错、看着合理）。
+  `NODE_PATH` 指过去；eval 出的 `const ui` 不进全局 ⇒ 同一段脚本末尾 `globalThis.ui = ui`）。
+  组件库生成 `data-*` 必须 **kebab-case**（`data-uimOk` 被解析器小写成 `data-uimok`，
+  选择器 `[data-uim-ok]` 匹配不上 ⇒ 按钮静默无响应）。
+- 🔴 **`smoke_ui`/`smoke_live` 必须先加载 `ui.js`**（app.js 依赖 `ui`，漏了就是
+  `ui is not defined`；smoke_live 里要单独 `vm.runInContext` 跑 ui.js 再跑 app.js）。
+  无 TOTP 时可用 `LS_TEST_COOKIE=ls_session=...` 逃生口，但它**绕过登录流程**
+  ⇒ 只能调试脚本本身，不能当日常验证。

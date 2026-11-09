@@ -504,8 +504,33 @@ if (typeof AUTO_GRID_CHOICES !== 'undefined') globalThis.__T.AUTO_GRID_CHOICES =
 if (typeof marginCell === 'function') globalThis.__T.marginCell = marginCell;
 `;
 vm.createContext(sandbox);
+/* 🔴 `ui.js` 必须**先**单独跑一遍，并把 `ui` 挂到全局。
+ *
+ * 组件库是在 P0 引入的：`deleteRun()` / `cancelRun()` / 「补齐宇宙」都从原生
+ * `confirm()` 换成了 `ui.modal()`。以前这里只加载 app.js，于是这些函数一被调用就
+ * `ui is not defined` —— 删除那一段从 P0 起就再也测不到了（而且不会报「测试失败」，
+ * 是直接抛错/卡住）。
+ *
+ * 单独 runInContext 而不是拼进 src：ui.js 首行是 `'use strict'`，拼进去会把
+ * **整个 app.js 也变成严格模式**（浏览器里它们是两个独立脚本，app.js 是宽松的）。
+ * 单独跑完再 `globalThis.ui = ui`，app.js 作为宽松脚本从全局对象上就能找到 `ui`，
+ * 两边的语义都和浏览器一致。 */
+const UI = path.join(ROOT, 'webapp', 'static', 'ui.js');
+if (!fs.existsSync(UI)) throw new Error('找不到 ui.js：' + UI);
+vm.runInContext(fs.readFileSync(UI, 'utf8') + '\n;globalThis.ui = ui;', sandbox,
+                { filename: 'ui.js' });
 vm.runInContext(src, sandbox, { filename: 'app.js' });
 const T = sandbox.__T;
+
+/* 弹层与 toast 的桩。
+ *
+ * 沙箱里没有真人点按钮 ⇒ 不桩 `ui.modal` 的话 `await deleteRun(...)` **永远不返回**，
+ * 整个脚本卡死在那儿（比失败更难查）。断言看的是「弹了什么」，所以把 modal 的
+ * 标题/正文一起收进 MODALS，toast 的文案收进 ALERTS（删除失败原本就是走 alert，
+ * 现在走 toast，两者的断言可以共用一份记录）。 */
+const MODALS = [];
+sandbox.ui.modal = async (o) => { MODALS.push(o || {}); return true; };
+sandbox.ui.toast = (m) => { ALERTS.push(String(m)); };
 
 /* ---------------- 鉴权（2026-10-16 起服务端默认拒绝一切 /api/） ----------------
  * 冒烟测的是**登录之后**的界面，所以得先真的登一次，而不是把鉴权绕过去。
@@ -516,6 +541,18 @@ const T = sandbox.__T;
 let AUTH_COOKIE = null;
 
 async function authLogin() {
+  /* 逃生口：`LS_TEST_COOKIE=ls_session=...` 直接给一个会话。
+   * 用来在没有口令的机器上跑冒烟（例如 agent / CI），**不替代**登录流程本身的
+   * 覆盖 —— 给了凭据时仍然走下面那套完整的两步登录。 */
+  const preset = (process.env.LS_TEST_COOKIE || '').trim();
+  if (preset) {
+    if (!/^ls_session=/.test(preset)) {
+      throw new Error('LS_TEST_COOKIE 应形如 ls_session=...');
+    }
+    AUTH_COOKIE = preset;
+    console.log('⚠️  用 LS_TEST_COOKIE 直接带会话：本次**没有**覆盖登录流程');
+    return;
+  }
   const user = process.env.LS_TEST_USER || '';
   const pw = process.env.LS_TEST_PASSWORD || '';
   const st = await realFetch(BASE + '/api/auth/status').then((r) => r.json());

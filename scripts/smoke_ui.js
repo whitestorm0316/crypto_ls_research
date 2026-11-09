@@ -121,6 +121,17 @@ const T = sandbox.__T;
 let AUTH_COOKIE = null;
 
 async function authLogin() {
+  /* 逃生口：`LS_TEST_COOKIE=ls_session=...` 直接带会话。
+   * 用途是**调试冒烟脚本本身**（比如服务端没配 TOTP、或临时诊断），日常跑请
+   * 走下面的完整登录 —— 因为这条路径**完全绕过登录流程**，鉴权坏了它照样绿。
+   * 和 `smoke_live.js` 里的那一份保持同一套语义。 */
+  const preset = (process.env.LS_TEST_COOKIE || '').trim();
+  if (preset) {
+    if (!/^ls_session=/.test(preset)) throw new Error('LS_TEST_COOKIE 应形如 ls_session=...');
+    AUTH_COOKIE = preset;
+    console.log('⚠️  用 LS_TEST_COOKIE 直接带会话：本次**没有**覆盖登录流程');
+    return;
+  }
   const st = await realFetch(BASE + '/api/auth/status').then((r) => r.json());
   if (!st.configured) return;                 // 没建账号：公开路径就够跑
   const user = process.env.LS_TEST_USER || '';

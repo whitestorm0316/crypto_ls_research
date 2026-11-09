@@ -102,6 +102,9 @@ const S = {
   cli: {}, ov: {}, stages: ['base', 'charts'], bundleId: 'fast', preset: 'custom',
   warnings: [], runs: [], active: null, queued: [],
   selected: null, detail: null, logOffset: 0, logTimer: null, logRunId: null, chartTimer: null,
+  /* 运行记录的「批量删除」选择模式。状态必须放在这里而不是 DOM 里 ——
+   * `pollRuns()` 每 2.5s 会整块重建列表，放 DOM 里一刷新就丢。 */
+  bulk: false, picked: {},
   /* 回测曲线：视图（净值 / 对数净值 / 回撤）+ 每条曲线的显隐 */
   chartView: 'equity', chartOff: {}, chartOffInit: false,
   equity: {}, equityErr: {},
@@ -651,8 +654,21 @@ function renderContent() {
 
   /* --- 运行记录：只在「回测结果」页显示。以前它在三个 tab 之外、到处都跟着，
    * 交易台/交易记录页下方挂着一份，看起来像页面串了。 --- */
-  h += `<h2 class="sec">运行记录 <small>${S.runs.length} 条 · 串行执行，不会抢核 · 勾选「对比」可叠加曲线</small></h2>`;
-  h += `<div class="runs">`;
+  const picked = bulkPicked();
+  const canBulk = S.runs.some((r) => r.status !== 'queued' && r.status !== 'running');
+  h += `<h2 class="sec">运行记录 <small>${S.runs.length} 条 · 串行执行，不会抢核 · 勾选「对比」可叠加曲线</small>
+    <span class="spacer"></span>
+    ${S.bulk
+      ? `<span class="muted" id="bulkCount">已选 ${picked.length} 条</span>
+         <button class="btn sm danger" id="bulkDel" ${picked.length ? '' : 'disabled'}
+                 title="逐条删除，服务端的安全规则照旧生效">删除选中</button>
+         <button class="btn sm ghost" id="bulkExit">退出选择</button>`
+      : `<button class="btn sm ghost" id="bulkStart" ${canBulk ? '' : 'disabled'}
+                 title="勾选多条运行记录一起删掉">批量删除</button>`}
+    <button class="btn sm" id="runBaseline"
+            title="用已验收参数与完整阶段重跑基线，产物写到 artifacts/${esc(optTagLabel())}/">▶ 重跑基线 ${esc(optTagLabel())}</button>
+  </h2>`;
+  h += `<div class="runs${S.bulk ? ' bulk' : ''}">`;
   if (!S.runs.length) {
     h += ui.empty({
       icon: '▶', title: '还没有运行过回测',
@@ -669,6 +685,9 @@ function renderContent() {
      * 而取消一个已结束的任务没有意义。 */
     const cancelable = !delable;
     h += `<div class="runrow ${S.selected === run.id ? 'sel' : ''}" data-run="${esc(run.id)}">
+      ${S.bulk ? `<div class="pick"><input type="checkbox" data-pick="${esc(run.id)}"
+        ${S.picked[run.id] ? 'checked' : ''} ${delable ? '' : 'disabled'}
+        title="${delable ? '勾选这条' : '运行中的任务先取消才能删'}"></div>` : ''}
       <div class="cmp" title="叠加到回测曲线">
         <input type="checkbox" data-cmp="${esc(run.id)}" ${done && on ? 'checked' : ''} ${done ? '' : 'disabled'}></div>
       <div class="lbl"><b>${esc(run.label || run.id)}</b>
@@ -727,6 +746,23 @@ function renderContent() {
     e.stopPropagation();
     await cancelRun(btn.dataset.cancelrun);
   });
+  /* --- 批量删除 --- */
+  const bStart = $('#bulkStart');
+  if (bStart) bStart.onclick = () => { S.bulk = true; S.picked = {}; renderContent(); };
+  const bExit = $('#bulkExit');
+  if (bExit) bExit.onclick = () => { S.bulk = false; S.picked = {}; renderContent(); };
+  const bDel = $('#bulkDel');
+  if (bDel) bDel.onclick = () => deleteMany(bulkPicked());
+  $$('[data-pick]').forEach((cb) => cb.onchange = () => {
+    if (cb.checked) S.picked[cb.dataset.pick] = 1;
+    else delete S.picked[cb.dataset.pick];
+    /* 只更新计数与按钮可用态，**不整块重绘** —— 重绘会把用户刚勾的那一下连同
+     * 滚动位置一起抖掉，而这里要改的只有两个节点。 */
+    syncBulkBar();
+  });
+  /* --- 一键重跑基线 --- */
+  const bBase = $('#runBaseline');
+  if (bBase) bBase.onclick = () => runBaseline();
   $$('[data-cmp]').forEach((cb) => cb.onchange = () => {
     const run = S.runs.find((r) => r.id === cb.dataset.cmp);
     if (!run) return;
@@ -1920,7 +1956,20 @@ async function pollRunsOnce() {
   } else q.style.display = 'none';
   if (S.detail) {
     const cur = S.runs.find((r) => r.id === S.selected);
-    if (cur) S.detail.status = cur.status;
+    if (cur) {
+      /* 🔴 任务**刚结束**的那一刻必须重新拉一次详情。
+       *
+       * 选中一条正在跑的任务时，`S.detail` 是那一刻的快照 —— 里面没有 result /
+       * metrics / charts，只有空壳。以前这里只把 `status` 改掉就重绘，于是任务
+       * 跑完后核心指标全是「—」，用户必须手动刷新整页才看得到数字（本次报的就是
+       * 这个）。判断条件是「新状态是终态、且和手里这份详情的状态不同」——只补一次，
+       * 不会每 2.5s 重拉。 */
+      if (RUN_TERMINAL.has(cur.status) && S.detail.status !== cur.status) {
+        await reloadDetail(S.selected);
+      } else {
+        S.detail.status = cur.status;
+      }
+    }
     startLog(S.detail);
   }
   if (isTyping(document.activeElement)) return;   /* 用户正在输入：别动 DOM */
@@ -1936,6 +1985,22 @@ async function pollRunsOnce() {
   if (!S.active && !S.queued.length && sig === S.runsSig) return;
   S.runsSig = sig;
   renderContent();
+}
+
+/* 任务走到这些状态就不会再变。`cancelled` 也算终态：产物不完整，但记录要定格。 */
+const RUN_TERMINAL = new Set(['done', 'partial', 'failed', 'cancelled']);
+
+/* 只重拉详情，不切选中、不切 tab —— 给轮询在「任务刚结束」时补数据用。
+ * 保留 `_log`：日志面板由 startLog() 自己的定时器按 offset 增量追加，这里清空会让
+ * 用户正看着的日志整块消失。 */
+async function reloadDetail(id) {
+  try {
+    const d = await (await fetch('/api/runs/' + encodeURIComponent(id))).json();
+    if (!d || d.error) return false;
+    d._log = (S.detail && S.detail._log) || '';
+    S.detail = d;
+    return true;
+  } catch { return false; }
 }
 
 async function selectRun(id) {
@@ -2024,6 +2089,154 @@ async function cancelRun(id) {
     renderContent();
   } catch (e) {
     ui.toast('取消失败：' + (e && e.message || e), 'danger');
+  }
+}
+
+/* ============================== 批量删除 ============================== */
+/* 只返回**当前还能删**的那些 id。
+ * `S.picked` 是纯选择状态，会在轮询之间保留；但一条正在跑的任务被勾上之后
+ * （理论上勾不到，勾选框是 disabled）仍然要在这里再挡一次 —— 服务端 `_delete_run`
+ * 对 queued/running 回 409，前端不该把它算进「已选 N 条」让用户以为能删。 */
+function bulkPicked() {
+  const out = [];
+  for (const id in S.picked) {
+    if (!S.picked[id]) continue;
+    const r = S.runs.find((x) => x.id === id);
+    if (r && r.status !== 'queued' && r.status !== 'running') out.push(id);
+  }
+  return out;
+}
+
+/* 只改计数与「删除选中」的可用态。勾选时不做整块重绘。 */
+function syncBulkBar() {
+  const n = bulkPicked().length;
+  const c = $('#bulkCount');
+  if (c) c.textContent = `已选 ${n} 条`;
+  const b = $('#bulkDel');
+  if (b) b.disabled = !n;
+}
+
+async function deleteMany(ids) {
+  const runs = ids.map((id) => S.runs.find((r) => r.id === id)).filter(Boolean);
+  if (!runs.length) return;
+  const hasOptimal = runs.some((r) => r.tag === S.optimalTag);
+  const ok = await ui.modal({
+    title: `删除 ${runs.length} 条运行记录？`,
+    danger: true,
+    body: `<ul class="bulklist">`
+      + runs.map((r) => `<li><b>${esc(r.tag)}</b>`
+        + `<span class="muted">${esc(r.label || r.id)}</span></li>`).join('')
+      + `</ul>`
+      + (hasOptimal
+        ? '<p>其中含<b>验收基线</b>：只会移除列表与日志，盘上产物<b>会保留</b>。</p>'
+        : '')
+      + '<p class="muted">会同时清理各自未被其他记录共用的产物目录。此操作不可撤销。</p>',
+    confirmText: `删除 ${runs.length} 条`,
+    cancelText: '保留',
+  });
+  if (!ok) return;
+
+  let done = 0;
+  const fails = [];
+  /* 逐条发 DELETE，而不是让服务端做批处理：
+   * 后端的安全规则（拒绝未结束的任务、基线产物只摘列表不删目录、产物 rename 进
+   * `.trash`）都是按单条写的，复用它比自己再实现一遍批处理可靠。 */
+  for (const r of runs) {
+    try {
+      const resp = await fetch('/api/runs/' + encodeURIComponent(r.id), { method: 'DELETE' });
+      /* 和 deleteRun 一样：先 text() 再 parse，501+HTML 时 `resp.json()` 会把
+       * 真正的原因藏成 `Unexpected token '<'`。 */
+      const raw = await resp.text();
+      let d = null;
+      try { d = JSON.parse(raw); } catch { d = null; }
+      if (!resp.ok) {
+        fails.push(`${r.tag}：HTTP ${resp.status} ${(d && d.error) || raw.slice(0, 80)}`);
+        continue;
+      }
+      done += 1;
+      delete S.picked[r.id];
+      if (S.selected === r.id) { S.selected = null; S.detail = null; S.trTag = null; }
+    } catch (e) {
+      fails.push(`${r.tag}：${(e && e.message) || e}`);
+    }
+  }
+  S.bulk = false;
+  S.picked = {};
+  await pollRuns();
+  renderContent();
+  if (fails.length) {
+    ui.toast(`已删除 ${done} 条，${fails.length} 条失败：` + fails.slice(0, 3).join('；'), 'danger');
+  } else {
+    ui.toast(`已删除 ${done} 条运行记录`, 'ok');
+  }
+}
+
+/* ============================== 重跑基线 ============================== */
+/* 验收基线需要**完整阶段**（16 条判据来自 decomp/exec/funding/… 各 stage 的产物）。
+ * 面板上当前选的 bundle 可能只是「快速回测」，照它跑出来的东西不足以重算判据 ——
+ * 所以这里固定取阶段最多的那个 bundle，而不是 S.stages。 */
+function baselineStages() {
+  const full = S.bundles.find((b) => b.id === 'full');
+  if (full && full.stages && full.stages.length) return { stages: full.stages.slice(), label: full.label || '完整验收' };
+  let best = null;
+  for (const b of S.bundles) {
+    if (b.stages && (!best || b.stages.length > best.stages.length)) best = b;
+  }
+  if (best) return { stages: best.stages.slice(), label: best.label || best.id };
+  return { stages: ['base', 'charts'], label: '快速回测' };
+}
+
+/* 一键用**已验收参数**重跑基线。
+ *
+ * 参数一律取自 `/api/spec`（各字段 `default` 即最优值、`optimal_cli` 即验收 CLI），
+ * **完全不看当前面板上的值** —— 用户把参数改花了也应该能一键复现基线。tag 用
+ * `optimal_tag`，前端不写死版本号（换口径时写死的文案会继续断言旧口径）。
+ *
+ * ⚠️ 产物写到 `artifacts/<tag>/`，**会覆盖同名目录**；页头指标与验收判据随后自动
+ * 跟着变。所以要先确认一次 —— 这是会改动「别人拿来对比的基准」的动作。 */
+async function runBaseline() {
+  const tag = S.optimalTag;
+  if (!tag) { ui.toast('服务端没下发 optimal_tag，无法确定基线', 'danger'); return; }
+  const d = defaults();
+  const overrides = {};
+  for (const k in d.ov) if (!eq(d.ov[k], S.lib[k])) overrides[k] = d.ov[k];
+  const cli = {};
+  for (const k of ['bar', 'rebalance_days', 'asset_class', 'start', 'end', 'capital']) {
+    const v = (S.optimalCli || {})[k];
+    cli[k] = v == null ? d.cli[k] : v;
+  }
+  const bs = baselineStages();
+  const diffs = diffFromOptimal();
+  const ok = await ui.modal({
+    title: `用验收参数重跑基线 ${tag}？`,
+    body: `<p>参数取自 <span class="mono">/api/spec</span> 的已验收配置，`
+      + `<b>不看当前面板上的值</b>（当前有 ${diffs.length} 处偏离）。</p>`
+      + `<p>阶段用「${esc(bs.label)}」共 ${bs.stages.length} 个 —— 少了这些跑不出验收判据。</p>`
+      + `<p>产物会写到 <span class="mono">artifacts/${esc(tag)}/</span>：`
+      + `<b>同名目录会被覆盖</b>，页头指标与验收判据随后跟着变。</p>`,
+    confirmText: '开始重跑',
+    cancelText: '取消',
+  });
+  if (!ok) return;
+
+  const btn = $('#runBaseline');
+  if (btn) { btn.disabled = true; btn.textContent = '提交中…'; }
+  try {
+    const res = await (await fetch('/api/run', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        overrides, cli, stages: bs.stages,
+        preset: 'baseline', label: `基线 ${tag}`, tag,
+      }),
+    })).json();
+    if (res.error) { ui.toast('提交失败：' + res.error, 'danger'); return; }
+    S.selected = res.id; S.logOffset = 0;
+    await pollRuns();
+    await selectRun(res.id);
+  } catch (e) {
+    ui.toast('提交失败：' + ((e && e.message) || e), 'danger');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = `▶ 重跑基线 ${tag}`; }
   }
 }
 
