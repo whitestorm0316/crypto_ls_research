@@ -257,11 +257,12 @@ function applyPreset(id) {
 
 /* ============================== 侧边栏 ============================== */
 /* ============================== 壳：参数面板收起 ============================== */
-/* 侧栏是**常驻**的（`.main` 固定 `412px 1fr`），但交易台与交易记录页一个回测
- * 参数都用不到 —— 那两页上它白占 32% 宽度。给一个开关，选择记在 localStorage。
+/* 侧栏**常驻**（`.main` 固定 `412px 1fr`）。开关是给「今天想临时多看点表格」
+ * 用的，不是按页切换的布局规则：
  *
- * 默认值按页走：回测结果页展开（要在那儿调参数），另两页收起。一旦用户自己
- * 点过开关，`sidePref()` 就有值，此后永远听用户的（切 tab 不再自动改）。 */
+ * - 默认展开，**切 tab 不自动收起**（原先按 tab 自动收，交易台一进去就是收起态，
+ *   用户明确要求改回常驻）；
+ * - 只有用户自己点过开关，`sidePref()` 才有值，且此后一直听用户的。 */
 const SIDE_KEY = 'ls.side.collapsed';
 function sidePref() {
   try { return localStorage.getItem(SIDE_KEY); } catch { return null; }
@@ -271,12 +272,8 @@ function setSide(collapsed) {
   const b = $('#sideBtn');
   if (!b) return;
   b.textContent = collapsed ? '◨' : '◧';
-  b.title = collapsed ? '展开参数面板' : '收起参数面板（交易台与交易记录页用不到它）';
+  b.title = collapsed ? '展开参数面板' : '收起参数面板（想临时多看一列表格时用）';
   b.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-}
-function syncSideForTab() {
-  if (sidePref() !== null) return;        // 用户自己定过，别抢
-  setSide(S.tab !== 'result');
 }
 function bindSideToggle() {
   const b = $('#sideBtn');
@@ -286,8 +283,8 @@ function bindSideToggle() {
     setSide(next);
     try { localStorage.setItem(SIDE_KEY, next ? '1' : '0'); } catch { }
   };
-  const pref = sidePref();
-  setSide(pref === null ? S.tab !== 'result' : pref === '1');
+  // 常驻：没点过就是展开。不看 S.tab —— 换页不改布局。
+  setSide(sidePref() === '1');
 }
 
 function renderSide() {
@@ -742,7 +739,6 @@ function renderContent() {
   $$('[data-tab]').forEach((t) => t.onclick = () => {
     if (S.tab === t.dataset.tab) return;
     S.tab = t.dataset.tab;
-    syncSideForTab();          // 交易台/交易记录用不到参数面板
     const hash = S.tab === 'trades' ? '#trades' : (S.tab === 'live' ? '#live' : '#result');
     try { history.replaceState(null, '', hash); } catch { }
     renderContent();

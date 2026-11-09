@@ -185,7 +185,14 @@ button, input, select { font-family: inherit; font-size: inherit; color: inherit
 /* ---------- 壳：参数面板可收起 ---------- */
 /* `.main` 是固定的 `412px 1fr`，侧栏**常驻所有页面**。可是交易台和交易记录页
  * 一个回测参数都用不到 —— 那两页上它白占 32% 宽度。收起后内容区拿到全部宽度。 */
-body.sidecollapsed .main { grid-template-columns: 0 1fr; }
+/* ⚠️ 收起时必须把栅格改成**单列**，不能只把第一列写成 0。
+ * `display:none` 的元素会**退出栅格**，于是 `.content` 变成第一个栅格项、被自动
+ * 放进第 1 列 —— 那一列正是 0px。结果是整页被压成 40px 宽的一条缝：横幅只剩
+ * 一个浅绿边、正文全被裁掉，页面看上去就是**一片空白**，而且不报任何错。
+ * 交易台（#live）默认收起侧栏 ⇒ 一进这页就是空白页。
+ * 判据也必须量 `.content` 的 getBoundingClientRect().width，
+ * 量 `gridTemplateColumns` 这个字符串会显示 `0px 1280px`「看着正常」。 */
+body.sidecollapsed .main { grid-template-columns: 1fr; }
 body.sidecollapsed .side { display: none; }
 .btn.icon { width: 32px; padding: 0; font-size: 13px; line-height: 1; }
 
