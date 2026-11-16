@@ -293,7 +293,16 @@ class PortfolioConfig:
 # ----------------------------------------------------------------------------
 @dataclass
 class RiskConfig:
-    target_vol_annual: float = 0.30
+    # 2026-11-16: raised 0.30 -> 0.50 by explicit request.  This is a
+    # **headline-moving** parameter: `vts = target_vol / realised_vol`, so a 50%
+    # target asks for ~1.67x the gross exposure the accepted baseline (Sharpe
+    # 1.937, MDD -13.3%, all measured at 0.30) was produced with.  The `v5_1d_all5`
+    # artifacts on disk were computed at 0.30 and are therefore **stale** until
+    # `scripts/rebuild_optimal_baseline.py` (or a full acceptance run) is redone.
+    # The live path is *not* affected by the baseline being stale: `DEFAULT_SIGNAL`
+    # carries no risk overrides, so `LiveEngine` and `AutoTrader` both inherit this
+    # default and will trade at 0.50 as soon as their process restarts.
+    target_vol_annual: float = 0.50
     min_gross_exposure: float = 0.30
     max_gross_exposure: float = 2.00
     vol_est_window_days: float = 10.0

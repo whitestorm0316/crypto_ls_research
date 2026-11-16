@@ -36,7 +36,11 @@ class LiveLimits:
     """Hard caps.  Defaults are deliberately tight for a first live run."""
 
     max_gross_notional: float = 5_000.0        # USD, sum |position notional|
-    max_gross_frac: float = 1.0                # gross / NAV
+    # gross / NAV.  Raised 1.0 -> 1.5 on 2026-11-16 together with the 50% vol
+    # target: measured on the rebuilt baseline the *realised* book (i.e. after
+    # the 20%/day turnover budget, which is what `check_plan` sees) averages
+    # 0.77x and reaches 1.21x at p95, so 1.0 would reject ~20% of rebalances.
+    max_gross_frac: float = 1.5                # gross / NAV
     max_order_notional: float = 1_000.0        # USD per single order
     max_orders: int = 60                       # per rebalance run
     max_turnover_frac: float = 1.0             # order notional / NAV
@@ -231,7 +235,8 @@ def check_plan(plan: Plan, limits: LiveLimits, *, mode: str, nav: float,
             v.append(Violation(
                 "block", "max_gross_frac",
                 f"总敞口 {gross / nav:.2f}× 净值，超过上限 {limits.max_gross_frac:.2f}×",
-                "策略正常毛敞口约 0.47×，超过 1× 说明杠杆或持仓读取异常。"))
+                "策略在 50% 波动目标下的**实际**毛敞口均值约 0.77×、p95 约 1.21×"
+                "（换手预算把它压在目标之下）；越过上限说明杠杆或持仓读取异常。"))
         if plan.turnover_frac > limits.max_turnover_frac + 1e-9:
             v.append(Violation(
                 "block", "max_turnover",

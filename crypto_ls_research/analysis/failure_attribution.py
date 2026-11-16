@@ -15,8 +15,12 @@
 ----------------------------
 用户给的 5 个窗口**不是同一套边界约定**：W1/W4/W5 = 峰→谷；W2 的第二个数是**恢复日**
 （真谷底 2023-12-18）；W3 的第一个数是**回撤内部的局部高点**（cummax 峰是 2023-01-25）。
-5 个深度数字**逐位吻合**，所以是同一批事件。因此本模块**同时**报两种切片：
+30% 口径下 5 个深度数字**逐位吻合**，所以是同一批事件。因此本模块**同时**报两种切片：
 `stated`（用户原样）与 `episode`（真实的 cummax 峰→谷）。
+
+⚠️ 2026-11-16 目标波动 30% → 50%，基线重建，同一批事件的深度整体加深约 3 个百分点，
+`dd_stated` 已按新基线重测（旧值留在 `WINDOWS` 上方注释里）。W5 的谷底在新基线上后移
+7 天、落到原窗口之外，窗口末端随之更新——这是**唯一**被改动过的边界，且只改末端。
 """
 from __future__ import annotations
 
@@ -31,14 +35,24 @@ from ..factors.engine import FACTOR_NAMES
 from .ic import _spearman
 
 # ---------------------------------------------------------------------------
-# 窗口定义：用户原样。`dd_stated` 是用户清单里的深度，用于对账。
+# 窗口定义：5 段**事件**来自用户清单，边界原样保留（W5 例外，见下）。
+# `dd_stated` 是这段窗口在当前基线上的深度，用于对账。
+#
+# 2026-11-16：目标年化波动 30% → 50%，基线整份重建 ⇒ 同一批事件的深度整体加深
+# 约 3 个百分点。下面的 dd 是**在新基线上重测的**；30% 口径的原值留在注释里，
+# 用来回答「换口径前是多少」：
+#     W1 -0.1331   W2 -0.1082   W3 -0.0998   W4 -0.0959   W5 -0.0942
+#
+# 🔴 W5 的 end 从 2022-09-21 挪到 2022-09-28：50% 口径下这段的谷底后移了 7 天。
+# 不挪的话窗口里只剩一个 1 根 bar 的噪声段（-0.0002），`dd_stated` 会被写成一个
+# **假数**——这段的真实回撤是 -0.12。事件没变，只是谷底日期变了。
 # ---------------------------------------------------------------------------
 WINDOWS: Tuple[Tuple[str, str, str, float], ...] = (
-    ("W1", "2024-07-05", "2024-11-01", -0.1331),
-    ("W2", "2023-11-09", "2024-03-03", -0.1082),
-    ("W3", "2023-02-22", "2023-05-03", -0.0998),
-    ("W4", "2021-02-01", "2021-04-10", -0.0959),
-    ("W5", "2022-08-04", "2022-09-21", -0.0942),
+    ("W1", "2024-07-05", "2024-11-01", -0.1553),
+    ("W2", "2023-11-09", "2024-03-03", -0.1407),
+    ("W3", "2023-02-22", "2023-05-03", -0.1315),
+    ("W4", "2021-02-01", "2021-04-10", -0.1117),
+    ("W5", "2022-08-04", "2022-09-28", -0.1224),
 )
 WINDOW_LABELS = tuple(w[0] for w in WINDOWS)
 
@@ -134,7 +148,11 @@ def match_windows(bars: pd.DataFrame, windows: Sequence = WINDOWS) -> pd.DataFra
     rows: List[dict] = []
     for label, s, e, dd in windows:
         hit = eps[window_mask(pd.DatetimeIndex(eps["trough"]), s, e)]
-        r = hit.iloc[0] if len(hit) else None
+        # 取**最深**的那一段，不是 `iloc[0]`。窗口边界是用户给的、谷底位置是
+        # 市场给的，两者不必重合：50% 口径下 W5 的真实谷底滑到窗口外 7 天，窗口
+        # 里只剩一个 1 根 bar 的噪声段（-0.0002），按时间取第一条会把它当成
+        # 「这一段」的深度，于是把一次 -12% 的回撤报成 0.02%。
+        r = hit.loc[hit["depth"].idxmin()] if len(hit) else None
         rows.append({
             "window": label, "start": s, "end": e, "dd_stated": float(dd),
             "peak": r["peak"] if r is not None else pd.NaT,
@@ -1042,6 +1060,8 @@ def short_book_table(sb: pd.DataFrame, windows: Sequence = WINDOWS,
             "long_pnl": float(seg["long_pnl"].sum()) if len(seg) else np.nan,
             "short_pnl_market": np.nan, "short_pnl_select": np.nan,
             "short_pnl_weight": np.nan,
+            # 分解**算不出来**的那些点：必须显性列出来，不能从三项之和里静默消失。
+            "n_unattributed": 0, "short_pnl_unattributed": np.nan,
         }
         if len(seg):
             # 空腿亏损的**归因分解**（逐点恒等，相加精确等于 `short_pnl`）：
@@ -1061,6 +1081,12 @@ def short_book_table(sb: pd.DataFrame, windows: Sequence = WINDOWS,
             row["short_pnl_market"] = float(-(sg[ok] * pm[ok]).sum())
             row["short_pnl_select"] = float(-(sg[ok] * sel[ok]).sum())
             row["short_pnl_weight"] = float(-(sg[ok] * wgt[ok]).sum())
+            # 三项只在 `ok` 上求和，`short_pnl` 是全量求和 —— 两者差的那一点就是
+            # 「分解不出来」的部分（实测 2021-05-20 02:00 一根 bar 的池子是空的）。
+            # 以前它静默消失，恒等式就在 REST 桶上差 0.006；现在单列一项披露。
+            row["n_unattributed"] = int((~ok).sum())
+            row["short_pnl_unattributed"] = float(
+                seg["short_pnl"].to_numpy(dtype="float64")[~ok].sum())
         if perm and label != str(rest_label) and len(seg) >= 3 and len(rest) >= 3:
             # ⚠️ 检验对象是 **`excess_select`（等权选股效应）**，不是 `excess_mw`：
             # 后者混了仓位加权，会把「最大那几笔空头涨得最多」当成「被挤压」。

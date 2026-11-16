@@ -189,8 +189,15 @@ def test_short_loss_decomposition_sums_to_the_short_pnl():
     sb_ep = sb.copy()
     sb_ep["window"] = fa.retag_episode(sb_ep, "ts", ep)
     t = fa.short_book_table(sb_ep, windows=ep, rest_label="REST")
-    got = t["short_pnl_market"] + t["short_pnl_select"] + t["short_pnl_weight"]
+    # 三项只在「分解得出来」的点上求和，`short_pnl` 是全量 ⇒ 恒等式必须带上
+    # `short_pnl_unattributed`（算不出来的那部分）。少了它，REST 桶会差 0.0062，
+    # 而差额从表里看不出来 —— 正是 Q42 那条「算不出来被静默丢掉」的老毛病。
+    got = (t["short_pnl_market"] + t["short_pnl_select"] + t["short_pnl_weight"]
+           + t["short_pnl_unattributed"])
     assert float((t["short_pnl"] - got).abs().max()) < 1e-9
+    # 有残差就必须有计数，两者不能只出现一个。
+    assert bool(((t["short_pnl_unattributed"].abs() > 0)
+                 == (t["n_unattributed"] > 0)).all())
 
 
 # ---------------------------------------------------------------------------

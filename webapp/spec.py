@@ -71,6 +71,14 @@ OPTIMAL_OVERRIDES = {
 # 2026-09-29 (b): the basis moved again, from the pruned two factors to all five
 # (`v5_1d_all5`).  The record below is that run.
 #
+# ⚠️ 2026-11-16: `risk.target_vol_annual` was raised 0.30 -> 0.50 and the `base`
+# stage was re-run, so the artifacts now read CAGR 48.79% / vol 23.04% /
+# Sharpe 1.828 / MDD -15.99% / 年换手 71.5.  The dict below is still the **30%
+# run's** record: `server._headline()` overrides every field it can measure from
+# the artifacts, so this only supplies what has no artifact (and the acceptance
+# string, which `_acceptance()` recomputes from the files anyway).  Do not quote
+# the 1.937 as "current" -- it is the 30% basis.
+#
 # The two earlier bases, for reference (same dataset):
 #   * 1 day, two factors (`v4_1d`): Sharpe 1.821 / CAGR 32.53% / MDD −16.79%
 #     / 年换手 70.23 / 成本拖累 6.05%.
@@ -275,8 +283,10 @@ SPEC: dict = {
             "label": "风控叠加",
             "desc": "全部是无状态纯函数，可直接复用到实时风控。",
             "items": [
+                # 默认值必须和 `settings.RiskConfig.target_vol_annual` 一致，否则
+                # 面板「恢复默认」会悄悄把 50% 改回 30% 再当作 override 发出去。
                 {"key": "risk.target_vol_annual", "label": "目标年化波动",
-                 "type": "number", "default": 0.30, "min": 0.05, "max": 1.0,
+                 "type": "number", "default": 0.50, "min": 0.05, "max": 1.0,
                  "step": 0.01, "level": "core", "format": "pct"},
                 {"key": "risk.min_gross_exposure", "label": "最小总敞口",
                  "type": "number", "default": 0.30, "min": 0.0, "max": 1.0,
