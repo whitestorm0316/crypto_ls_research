@@ -496,14 +496,50 @@ ul.bulklist li .muted { margin-left: 8px; font-size: 11.5px; }
   padding: 1px 7px; font-size: 10.5px; font-weight: 650;
   font-variant-numeric: tabular-nums;
 }
-.resultOnly, .tradesOnly, .liveOnly { display: block; }
-.tradesOnly, .liveOnly { display: none; }
+/* 四个 tab 的显隐。⚠️ 加新 tab 必须把 `.xxxOnly` 加进**下面每一条**规则 ——
+ * 漏一条的表现是「切到新页面，旧的也还挂着」，而不是报错。 */
+.resultOnly, .tradesOnly, .liveOnly, .universeOnly { display: block; }
+.tradesOnly, .liveOnly, .universeOnly { display: none; }
 #content.trades .resultOnly { display: none; }
 #content.trades .tradesOnly { display: block; }
 #content.trades .liveOnly { display: none; }
+#content.trades .universeOnly { display: none; }
 #content.live .resultOnly { display: none; }
 #content.live .tradesOnly { display: none; }
 #content.live .liveOnly { display: block; }
+#content.live .universeOnly { display: none; }
+#content.universe .resultOnly { display: none; }
+#content.universe .tradesOnly { display: none; }
+#content.universe .liveOnly { display: none; }
+#content.universe .universeOnly { display: block; }
+
+/* ============================== 标的池 ============================== */
+.unihd { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.unihd .spacer { flex: 1; }
+/* 10 列的宽表：窄视口下必须自己滚，否则会把整个 `.content` 撑破
+ * （`1fr` 是 `minmax(auto,1fr)`，宽内容会把栅格拉宽 —— 见 P1 遗留）。 */
+.uniwrap { overflow-x: auto; }
+table.uni { min-width: 760px; }
+table.uni th, table.uni td { padding: 5px 8px; }
+/* 表格里的 chip 必须**不换行**：`持仓` / `在池` 只有两个字，但列宽一紧就
+ * 被拆成上下两行，整张表的行高跟着翻倍（截图里一眼就能看出来）。 */
+table.uni .chip { white-space: nowrap; }
+table.uni td:nth-child(2) { white-space: nowrap; }
+table.uni tr.off td { color: var(--muted); }
+table.uni tr.off td .chip { opacity: .8; }
+.chip.ok { background: var(--ok-soft); color: var(--ok); border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
+/* 放量条：以 0 为中心。用 accent/muted 而不是涨跌色 —— 成交额放大 ≠ 价格上涨。 */
+.liqbar { display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
+.liqbar .lb {
+  position: relative; width: 64px; height: 9px; flex: none;
+  background: var(--border); border-radius: 4px;
+}
+.liqbar .lb::after {
+  content: ''; position: absolute; left: 50%; top: 0; bottom: 0;
+  width: 1px; background: var(--border);
+}
+.liqbar .lb i { position: absolute; top: 1px; bottom: 1px; border-radius: 2px; }
+.liqbar b { font-family: var(--mono); font-size: 11.5px; font-weight: 600; color: var(--text-2); }
 
 /* ============================== 交易台 ============================== */
 .modecards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }

@@ -57,37 +57,37 @@
 - ⚠️ 杠杆是账户级配置、订单不带；`td_mode` 只读（写死标签显示相反模式）。
 - 🔴 Q44（未修）：`account()` 的 `cur_sz` 跨模式求和 ⇒ 另一种腿永久冻结、被拒单。改需授权。
 
-## 展示层 / 控制台（Q39 / Q73 / Q74–Q76）
-- 禁止在 app.js/spec.py 写死指标、禁止前端留最优参数拷贝；唯一来源 `/api/spec` 四 headline。
-  页面提到一个控件就必须真有那个控件。
-- 判据坏了不许靠改判据变绿（加 `pass=None` 行不计门禁）；警告理由必须和用户做的事是同一件事；
-  禁止「整文件不含某字符串」→ 切定义块；**相邻对断言**优于「包含某数」。纪律见 `dashboard-data-consistency`。
-- `/api/` 错误必须是 JSON（没实现的方法回 501+HTML ⇒ 前端根因全藏住）。`fmt.dol` 两位小数、
-  负号在 `$` 前。变异脚本：解释器要能 import numpy/pandas；bash 写 `${VAR}`；还原放 `finally`。
-- 🔴 **改前端先看三个约束**（Q73）：①`app.js`（~4500 行）被 **8 个 harness**
-  （`smoke_ui|smoke_live|check_dom_refs|check_js|verify_*`）+ **2 个守卫**直接读取 ⇒ **拆文件
-  会让它们静默失效**，先改 harness 再搬。②`/static/` 走 `os.path.basename()` 扁平化 ⇒ 新 JS
-  必须平铺，子目录 404。③登录页渲染进 `#content` ⇒ 未登录时顶栏与空侧栏仍可见。
-- 三个「后端有、前端没接」的缺口（Q73）：回测取消**已接**；**撤单** `okx_private` 的
-  `cancel_order/cancel_all/orders_pending` **全仓零调用点**；**暂停 ≠ 停止** 未区分。
-- 🔴 **P0 已落地**（Q73，细节 `2026-11-09.md`，方案 `docs/UI_UX_REFACTOR_PLAN.md`）：
-  tokens + `ui.js`、回测取消接线、订单枚举翻译、三处 canvas `ResizeObserver`、登录页整屏独立
-  （`body.authmode`）、侧栏开关（**常驻**，切 tab 不改布局）、原生 `confirm/alert` 全退场、加载骨架。
-  **「64px 图标导航」故意没做**：7 个模块里 4 个页面 P1 才建，现在放就是死按钮。
-- 🔴 **Q76 三件事**（运行记录页）：①任务进入终态必须**重拉一次详情**（`S.detail` 是 running
-  时抓的，没有 `result/metrics`）；终态 `RUN_TERMINAL`=`done/partial/failed/cancelled`，只在
-  **跃迁那一刻**拉，否则每 2.5s 打一次接口。②批量删除**逐条** `DELETE /api/runs/<id>` 复用
-  服务端安全规则（queued/running 回 409；最优 tag 只删列表项+日志；产物目录 **rename 进
-  `artifacts/.trash/`** 不是 rmtree）；勾选态放 `S`（`pollRuns` 2.5s 重建列表）；`.runs.bulk`
-  的 grid 列数 **+1**。③基线重跑：tag 取 `/api/spec.optimal_tag`（**不许写死**）、阶段取
-  **最宽 bundle**（`full`）、参数取 spec 不取面板，弹窗写清会覆盖 `artifacts/<tag>/`。
-- 🔴 换壳四条铁律：①**文案一个字都不能改** —— `smoke_live` 用 `includes('正在读取账户')`
-  /`includes('点「生成下单计划」开始')`/`includes('尚未生成计划')` 判状态，`verify_auto_panel`
-  用 `!includes('正在读取')` ⇒ 纯骨架会让断言静默失效。②`.skel` 是 flex column 且高度 auto
-  ⇒ `.skbar` 的 `flex:1`＝`flex-basis:0` **塌成 0 高** ⇒ 骨架必须**真渲染看竖排**。
-  ③`git commit -m` 含反引号会被 zsh 替换 ⇒ 写文件 `-F`。④`display:none` 退出栅格 ⇒ 收起侧栏
-  时 `.content` 掉进 `0` 宽那列、压成 **40px 缝**（`gridTemplateColumns` 仍显示 `0px 1280px`
-  「看着正常」）⇒ 必须配**单列** `.main`，判据量 `getBoundingClientRect().width`。
+## 展示层 / 控制台（Q39 / Q73–Q78）
+- 禁止在 app.js/spec.py 写死指标或最优参数；唯一来源 `/api/spec`。页面提到一个控件就必须真有。
+- 判据坏了不许靠改判据变绿（`pass=None` 不计门禁）；警告理由必须和用户做的事同一件事；
+  禁止「整文件不含某字符串」→ 切定义块；**相邻对断言**优于「包含某数」。见 `dashboard-data-consistency`。
+- `/api/` 错误必须是 JSON（501+HTML ⇒ 前端根因全藏住）。`fmt.dol` 两位小数、负号在 `$` 前。
+  变异脚本：解释器要能 import numpy/pandas；bash 写 `${VAR}`；还原放 `finally`。
+- 🔴 **改前端先看三个约束**（Q73）：①`app.js`（~4900 行）被 8 个 harness（`smoke_ui|smoke_live|
+  check_dom_refs|check_js|verify_*`）+ 2 个守卫直接读取 ⇒ **拆文件会让它们静默失效**。②`/static/`
+  走 `os.path.basename()` 扁平化 ⇒ 新 JS 平铺，子目录 404。③登录页渲染进 `#content`。
+- 缺口（Q73）：回测取消**已接**；**撤单** `okx_private` 的 `cancel_order/cancel_all/orders_pending`
+  **全仓零调用点**；**暂停 ≠ 停止** 未区分。
+- 🔴 **P0 已落地**（Q73，方案 `docs/UI_UX_REFACTOR_PLAN.md`）：tokens + `ui.js`、取消接线、订单
+  枚举翻译、canvas `ResizeObserver`、登录页整屏（`body.authmode`）、侧栏**常驻**、原生
+  `confirm/alert` 全退场、加载骨架。**「64px 图标导航」故意没做**（4 个页面当时不存在）。
+- 🔴 **Q76 运行记录页**：①终态必须**重拉一次详情**（`S.detail` 是 running 时抓的，没有
+  `result/metrics`），`RUN_TERMINAL`=`done/partial/failed/cancelled`，只在跃迁那一刻拉。
+  ②批量删除**逐条** `DELETE /api/runs/<id>` 复用服务端规则（queued/running 回 409；最优 tag 只删
+  列表项+日志；产物 **rename 进 `artifacts/.trash/`**）；勾选态放 `S`；`.runs.bulk` 列数 **+1**。
+  ③基线重跑：tag 取 `optimal_tag`（不许写死）、阶段取**最宽 bundle**、参数取 spec 不取面板。
+- 🔴 **Q78 标的池页**（`/api/universe` → `universe/snapshot.py`）：①门槛的 `adv` 是**每根 bar 的
+  均成交额**（`amount.rolling(liq_window×bpd).mean()`），**不是日额**：$3M/1h ≈ $72M/天，按日算
+  过线 196 只、按 bar 算 16 只（差 12 倍）；`adv_cap`=`adv×5%` 同理。②加第 N 个 tab 必须把
+  `.xxxOnly` 加进**每一条** `#content.<tab>` 显隐规则（漏一条＝两页叠着）。③新面板每次
+  `renderContent` 都要从 `S` 重绘（`pollRuns` 2.5s）。④宽表配 `.uniwrap{overflow-x:auto}` 自己滚。
+  ⑤`_read_one` 的「空文件」≠「文件缺失」。
+- 🔴 换壳四条铁律：①**文案一个字都不能改**（`smoke_live`/`verify_auto_panel` 用 `includes('正在
+  读取账户')`/`!includes('正在读取')` 判状态）⇒ 纯骨架让断言静默失效。②`.skel` 是 flex column 且
+  高度 auto ⇒ `.skbar` 的 `flex:1`＝`flex-basis:0` 塌成 0 高 ⇒ 必须真渲染看竖排。③`git commit -m`
+  含反引号被 zsh 替换 ⇒ 写文件 `-F`。④`display:none` 退出栅格 ⇒ 收起侧栏时 `.content` 掉进 0 宽
+  那列压成 **40px 缝**（`gridTemplateColumns` 仍显示 `0px 1280px`）⇒ 配**单列** `.main`，判据量
+  `getBoundingClientRect().width`。
 
 ## 数据源可切换（Q40）——表格在 `RULES-OPS.md`
 - 缓存目录唯一来源 `settings.CACHE_DIR`（`CRYPTO_CACHE_DIR`）；字段映射最贵的坑：

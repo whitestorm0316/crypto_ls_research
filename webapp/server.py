@@ -858,6 +858,8 @@ class Handler(BaseHTTPRequestHandler):
                     "lib_defaults": lib_defaults(),
                     "python": PY,
                 })
+            if p == "/api/universe":
+                return self._json(self._universe(q))
             if p == "/api/runs":
                 with RUNS_LOCK:
                     out = [self._run_brief(r) for r in RUNS.values()]
@@ -982,6 +984,58 @@ class Handler(BaseHTTPRequestHandler):
                 pass
 
     # -- API pieces --------------------------------------------------------
+    def _universe(self, q):
+        """当前标的池 + 流动性强弱（只读）。
+
+        ⚠️ 这里的量必须和引擎**同一个定义**：门槛用的 `adv` 是
+        `amount.rolling(liq_window_days × bars_per_day).mean()` —— **每根 bar 的
+        平均成交额**，不是日成交额。3e6 在 1h 上等于「每小时 $3M ≈ 每天 $72M」。
+        按日算会得出 196 只过线，按每 bar 算是 16 只，差 12 倍。定义只写在
+        `universe/snapshot.py`，本方法只负责取参数、合并持仓、兜异常。
+        """
+        one = lambda k, d=None: (q.get(k) or [d])[0]      # noqa: E731
+        bar = str(one("bar", "1h") or "1h")
+        ac = str(one("asset_class", OPTIMAL_CLI.get("asset_class") or "crypto")
+                 or "crypto")
+        mode = str(one("mode", "live") or "live")
+        refresh = str(one("refresh", "")).lower() not in ("", "0", "false", "no")
+        try:
+            from crypto_ls_research.config.settings import UniverseConfig
+            from crypto_ls_research.universe.snapshot import snapshot
+            body = snapshot(bar=bar, asset_class=ac,
+                            ucfg=UniverseConfig(), refresh=refresh)
+        except BaseException:                                # noqa: BLE001
+            # 这个端点被页面当主内容用 —— 抛出去就是白屏。返回结构化错误，
+            # 前端能画出来是哪一步坏了。
+            return {"ok": False, "rows": [], "summary": {}, "notes": [],
+                    "error": traceback.format_exc()[-900:]}
+        if body.get("ok"):
+            body["held"] = self._held_positions(mode)
+            for r in body.get("rows") or []:
+                h = body["held"].get(r["inst"])
+                r["held_sz"] = h
+                r["held"] = bool(h)
+        return body
+
+    @staticmethod
+    def _held_positions(mode):
+        """该账户当前持仓 {instId: sz}。读不到就当没有 —— 这一列只是参考。"""
+        try:
+            from crypto_ls_research.execution.store import Store
+            st = Store(mode).read_state() or {}
+            pos = st.get("positions") or {}
+            out = {}
+            for k, v in pos.items():
+                sz = v.get("sz") if isinstance(v, dict) else None
+                if sz:
+                    try:
+                        out[k] = float(sz)
+                    except (TypeError, ValueError):
+                        continue
+            return out
+        except BaseException:                                # noqa: BLE001
+            return {}
+
     def _baseline(self):
         """The live headline for the optimal tag, read from its artifacts.
 

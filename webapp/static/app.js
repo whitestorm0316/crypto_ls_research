@@ -112,6 +112,10 @@ const S = {
   tab: 'result', tr: null, trErr: null, trTag: null, trInFlight: false,
   fills: null, fillsFilt: {}, fillsPage: 0, blotter: null, blotterPage: 0,
   attrSort: 'net',
+  /* 标的池页。`uni` 是 `/api/universe` 的整份载荷（含 rows）；`uniErr` 与
+   * `uniInFlight` 分开存，因为 `pollRuns()` 每 2.5s 会重建整块 #content ——
+   * 重建时必须能从内存里把它画回去，否则页面永远停在骨架。 */
+  uni: null, uniErr: null, uniInFlight: false, uniFilter: '', uniShowAll: false,
   /* 交易台 */
   live: {
     meta: null, status: null, statusErr: null, statusLoading: false,
@@ -206,8 +210,10 @@ async function boot() {
   // Deep link / screenshots: /#trades opens the trade-record tab directly.
   const wantTrades = location.hash === '#trades';
   const wantLive = location.hash === '#live';
+  const wantUni = location.hash === '#universe';
   if (wantTrades) S.tab = 'trades';
   if (wantLive) S.tab = 'live';
+  if (wantUni) S.tab = 'universe';
   try {
     bindSideToggle();
     renderSide();
@@ -219,6 +225,8 @@ async function boot() {
     initHotkeys();
     if (wantTrades) {
       ensureTrades();
+    } else if (wantUni) {
+      ensureUniverse();
     } else if (wantLive) {
       ensureLive();
       /* 自动任务的心跳按 30 秒量级更新（守护进程每 30 分钟检查一次，但心跳
@@ -564,6 +572,7 @@ function renderContent() {
   // class 也已经是正确状态，不会出现「切到交易记录却还残留交易台面板」。
   el.classList.toggle('trades', S.tab === 'trades');
   el.classList.toggle('live', S.tab === 'live');
+  el.classList.toggle('universe', S.tab === 'universe');
   let h = `<div class="banners">`;
 
   // 数据/产物没就绪时**先于一切**说清楚。放在最前面是因为下面那条「当前参数 =
@@ -723,6 +732,8 @@ function renderContent() {
 
   h += `<div class="liveOnly" id="liveRoot">${liveSkeleton()}</div>`;
 
+  h += `<div class="universeOnly" id="uniRoot">${universeSkeleton()}</div>`;
+
   // `pollRuns()` 每 2.5s 走到这里重建整块 #content。包进 preserveUi()，否则用户
   // 正在敲的任何输入框都会被丢回模板给的旧值——API Key 那种没有 value 回填的框
   // 就是直接变空。浏览器控制台一个报错都没有。
@@ -775,11 +786,12 @@ function renderContent() {
   $$('[data-tab]').forEach((t) => t.onclick = () => {
     if (S.tab === t.dataset.tab) return;
     S.tab = t.dataset.tab;
-    const hash = S.tab === 'trades' ? '#trades' : (S.tab === 'live' ? '#live' : '#result');
+    const hash = { trades: '#trades', live: '#live', universe: '#universe' }[S.tab] || '#result';
     try { history.replaceState(null, '', hash); } catch { }
     renderContent();
     if (S.tab === 'trades') ensureTrades();
     if (S.tab === 'live') ensureLive();
+    if (S.tab === 'universe') ensureUniverse();
   });
 
   const note = $('#chartNote');
@@ -811,6 +823,11 @@ function renderContent() {
     // 同样的坑：这里刚把 #liveRoot 重建过，必须把已加载的状态重新填回去，
     // 否则 pollRuns()（2.5s）会把交易台打回骨架。
     if (S.live.meta) livePaintAll(); else ensureLive();
+  }
+  if (S.tab === 'universe') {
+    /* 同上：`#uniRoot` 刚被 `el.innerHTML = h` 重建，必须从内存里的 S.uni
+     * 重新画一遍。少了这一行，页面每 2.5 秒退回骨架（而且不报错）。 */
+    if (S.uni || S.uniErr) paintUniverse(); else ensureUniverse();
   }
   // 结果页才有的视图切换按钮（交易记录页下 #chartSeg 不存在，函数自己会跳过）
   bindChartSeg();
@@ -910,11 +927,222 @@ function tabBar() {
       ${n != null ? `<span class="badge">${fmt.int(n)} 笔</span>` : ''}</button>
     <button class="tab ${S.tab === 'live' ? 'on' : ''}" data-tab="live">交易台
       ${st ? `<span class="badge">${esc(LIVE_LABEL[S.live.mode] || S.live.mode)}${esc(armed)}</span>` : ''}</button>
+    <button class="tab ${S.tab === 'universe' ? 'on' : ''}" data-tab="universe">标的池
+      ${uniBadge()}</button>
     <span class="spacer"></span>
     <span class="muted" style="font-size:11.5px">${S.tab === 'live'
     ? '信号与回测同源；下单前必过风控闸门'
-    : '全部数据来自已保存的 baseline.pkl'}</span>
+    : (S.tab === 'universe'
+      ? '门槛与排名规则和回测引擎同一份代码'
+      : '全部数据来自已保存的 baseline.pkl')}</span>
   </div>`;
+}
+
+/* tab 上的池子规模。只在已经取到快照时才显示 —— 没取到时**不要**显示 0，
+ * 那会被读成「池子是空的」。 */
+function uniBadge() {
+  const s = S.uni && S.uni.ok && S.uni.summary;
+  if (!s || s.n_pool == null) return '';
+  return `<span class="badge">${fmt.int(s.n_pool)} 只</span>`;
+}
+
+/* ============================== 标的池 ==============================
+ * 这一页回答两个问题：**现在池子里有谁**、**谁的流动性在变强/变弱**。
+ *
+ * ⚠️ 门槛用的量是「每根 1h bar 的平均成交额」，不是日成交额。$3M 的门槛
+ * 等价于每天 $72M —— 页面上必须把两个数一起印出来，否则会被读成日频门槛，
+ * 而按日算过线的会从 16 只变成 196 只，差 12 倍。这个口径来自
+ * `factors/engine.py` 的 `adv`，页面不自己定义。
+ * ================================================================== */
+function universeSkeleton() {
+  return `<h2 class="sec">标的池 <small>PIT 流动性筛选 · 规则与回测引擎同一份代码</small>
+    <span class="spacer"></span>
+    <button class="btn sm ghost" id="uniReload" title="跳过 5 分钟缓存，重新扫一遍盘上行情">↻ 重新计算</button>
+  </h2>
+  <div class="panel"><div class="body" id="uniBody" style="padding:14px">${loadPh('正在扫描盘上行情…', 'table')}</div></div>`;
+}
+
+async function ensureUniverse(force) {
+  if (S.uniInFlight) return;
+  S.uniInFlight = true;
+  S.uniErr = null;
+  if (force) S.uni = null;
+  paintUniverse();
+  try {
+    /* 参数走服务端默认（`UniverseConfig()`），资产类别取验收口径的
+     * `optimal_cli.asset_class` —— 与「交易台」用的是同一个池子。 */
+    const ac = (S.optimalCli && S.optimalCli.asset_class) || 'crypto';
+    const qs = `?asset_class=${encodeURIComponent(ac)}` + (force ? '&refresh=1' : '');
+    const r = await fetch('/api/universe' + qs);
+    /* 先读 text 再 parse：这个端点如果 501/500 回了 HTML，`resp.json()`
+     * 会抛 `Unexpected token '<'`，把真正的原因（没重启控制台）藏起来。 */
+    const raw = await r.text();
+    let d = null;
+    try { d = JSON.parse(raw); } catch { d = null; }
+    if (!r.ok || !d) {
+      throw new Error(`HTTP ${r.status} ${(d && d.error) || raw.slice(0, 160)}`);
+    }
+    if (!d.ok) throw new Error(d.error || '服务端返回 ok=false');
+    S.uni = d;
+  } catch (e) {
+    S.uniErr = String((e && e.message) || e);
+  } finally {
+    S.uniInFlight = false;
+  }
+  paintUniverse();
+}
+
+function paintUniverse() {
+  const el = $('#uniBody');
+  if (!el) return;
+  el.innerHTML = universeBodyHtml();
+  const b = $('#uniReload');
+  if (b) b.onclick = () => ensureUniverse(true);
+  const t = $('#uniShowAll');
+  if (t) t.onclick = () => { S.uniShowAll = !S.uniShowAll; paintUniverse(); };
+  const f = $('#uniFind');
+  if (f) f.oninput = () => { S.uniFilter = f.value; paintUniverse(); };
+}
+
+const UNI_REASON = {
+  ok: '在池', below_adv: '成交额不足', too_young: '上市太短',
+  rank_cut: '排名截断', no_data: '无行情',
+};
+
+/* 放量是**相对变化**（24h ÷ 30 日均值 − 1），不是百分点差 —— 用 `fmt.pp` 会印成
+ * `-21.24pp`，读起来像两个不同口径的百分比之差。统一走这个格式化器。 */
+const uniChg = (v) => (v == null || !isFinite(v))
+  ? '—' : (v >= 0 ? '+' : '') + (v * 100).toFixed(1) + '%';
+
+/* 放量条：以 0 为中心，右=放量、左=缩量。用中性色而不是涨跌色 ——
+ * 「成交额放大」和「价格上涨」是两件事，染成红绿会被读成后者。 */
+function liqBar(chg) {
+  if (chg == null || !isFinite(chg)) return '<span class="muted">—</span>';
+  /* ±25% 就把半格填满；最小 0.8% 保证「有变化」和「没变化」看得出来。
+   * 1:1 映射（±100% 填满）会让日常的 ±5% 缩成 1 像素，看起来像没画出来。 */
+  const half = Math.min(50, Math.max(0.8, Math.abs(chg) * 200));
+  const left = chg >= 0 ? 50 : 50 - half;
+  const col = chg >= 0 ? 'var(--accent)' : 'var(--warn)';
+  return `<div class="liqbar" title="最近 24h 成交额 / 30 日均值 − 1 = ${uniChg(chg)}">
+    <span class="lb"><i style="left:${left.toFixed(1)}%;width:${half.toFixed(1)}%;background:${col}"></i></span>
+    <b>${uniChg(chg)}</b></div>`;
+}
+
+function uniRowHtml(r, i) {
+  const ok = r.in_pool;
+  /* 状态不单独占一列：`在池` 这个 chip 在默认视图里每一行都重复，纯占宽度。
+   * 只在**被剔除**时标出原因，另外用 `持仓` 标出账户正在持有的那几只 ——
+   * 这两件事才是看这张表时要找的。 */
+  const tags = [
+    r.has_spec ? '' : '<span class="chip" title="swap_specs.json 缺这只，planner 会按 no_spec 跳过">缺规格</span>',
+    r.held ? `<span class="chip ok" title="当前账户持有 ${r.held_sz} 张">持仓</span>` : '',
+    ok ? '' : `<span class="chip" title="被剔除的原因">${esc(UNI_REASON[r.reason] || r.reason)}</span>`,
+  ].filter(Boolean).join(' ');
+  return `<tr class="${ok ? '' : 'off'}">
+    <td class="num">${r.rank == null ? '<span class="muted">—</span>' : r.rank}</td>
+    <td><b class="${ok ? '' : 'muted'}">${esc(r.inst)}</b>${tags ? ' ' + tags : ''}</td>
+    <td>${esc(r.cat)}</td>
+    <td class="num">${fmt.usd(r.adv)}</td>
+    <td class="num">${fmt.usd(r.adv_day)}</td>
+    <td class="num">${fmt.usd(r.turn_24h)}</td>
+    <td>${liqBar(r.chg)}</td>
+    <td class="num">${fmt.usd(r.adv_cap)}</td>
+    <td class="num">${fmt.dol(r.min_notional)}</td>
+  </tr>`;
+}
+
+function uniTableHtml(rows) {
+  if (!rows.length) {
+    return ui.empty({
+      icon: '▤', title: '没有匹配的标的',
+      desc: S.uniShowAll ? '换个关键词试试。' : '池子是空的 —— 检查行情缓存与门槛设置。',
+    });
+  }
+  return `<div class="uniwrap"><table class="uni"><thead><tr>
+    <th class="num">#</th><th>标的</th><th>类别</th>
+    <th class="num" title="30 日窗口内**每根 bar** 的平均成交额 —— 这就是门槛用的量">30 日均(每1h)</th>
+    <th class="num" title="上面那个数 × 24，方便和「日成交额」的直觉对齐">折日</th>
+    <th class="num" title="最近 24 根 bar 的实际成交额合计">最近 24h</th>
+    <th title="最近 24h ÷ 折日均值 − 1：右=放量，左=缩量">放量</th>
+    <th class="num" title="单次调仓的 ADV 上限 = adv × 5%（与 risk.adv_cap_delta 同口径）">5% 上限</th>
+    <th class="num" title="minSz × ctVal × 价格：资金再小也绕不过的下限">最小下单</th></tr></thead><tbody>
+    ${rows.map(uniRowHtml).join('')}
+  </tbody></table></div>`;
+}
+
+function universeBodyHtml() {
+  if (S.uniErr) {
+    return `<div class="banner danger"><div class="ico">!</div><div>
+      <b>标的池读取失败</b><p>${esc(S.uniErr)}</p>
+      <p class="desc" style="margin:6px 0 0">这个端点需要重启控制台才会出现：
+      <span class="mono">python -m webapp.server 8790</span>（静态文件不用重启，但路由要）。</p>
+    </div></div>`;
+  }
+  const u = S.uni;
+  if (!u) return loadPh('正在扫描盘上行情…', 'table');
+  if (!u.ok) {
+    return `<div class="banner danger"><div class="ico">!</div><div>
+      <b>标的池计算失败</b><p class="mono">${esc(u.error || '未知错误')}</p></div></div>`;
+  }
+  const s = u.summary || {};
+  const p = u.params || {};
+  const age = u.from_cache && u.age_sec > 1
+    ? ` · 缓存 ${u.age_sec < 90 ? Math.round(u.age_sec) + ' 秒' : Math.round(u.age_sec / 60) + ' 分钟'}前`
+    : '';
+  const bpd = p.bars_per_day || 24;
+  const rows = u.rows || [];
+  const find = (S.uniFilter || '').trim().toLowerCase();
+  const shown = rows.filter((r) => (S.uniShowAll || r.in_pool)
+    && (!find || r.inst.toLowerCase().includes(find)));
+
+  let h = `<div class="unihd">
+    <div><span class="muted">最后一根已收线的 bar</span>
+      <b class="mono">${esc(fmtCN(u.asof, 'min'))}</b>
+      <span class="muted">${TZ_LABEL}${esc(age)}</span></div>
+    <span class="spacer"></span>
+    <button class="btn sm ghost" id="uniShowAll">${S.uniShowAll
+    ? `只看在池（${s.n_pool} 只）` : `显示全部 ${rows.length} 只`}</button>
+    <input class="liveinput" id="uniFind" placeholder="筛选标的…" value="${esc(S.uniFilter || '')}"
+           style="width:150px">
+  </div>`;
+
+  /* 门槛说清楚：这是最容易读错的一处。 */
+  h += `<p class="desc" style="margin:10px 0 0">
+    门槛 <b>${fmt.usd(p.min_avg_amount_usd)}</b>/每根 ${esc(u.bar)} bar
+    ≈ <b>${fmt.usd(p.min_avg_amount_usd * bpd)}</b>/天
+    （窗口 ${p.liq_window_days} 天、排名取前 ${p.pit_topn}、上市满 ${p.min_history_days} 天）。
+    <span class="muted">盘上 ${u.n_on_disk != null ? u.n_on_disk : '—'} 只，按
+    <span class="mono">${esc(u.asset_class)}</span> 收窄后 ${s.n_cached} 只参与筛选。</span>
+  </p>`;
+
+  if ((u.notes || []).length) {
+    h += `<p class="desc" style="margin:6px 0 0;color:var(--warn)">${u.notes.map(esc).join('；')}</p>`;
+  }
+
+  const kpi = (k, v, sub) => `<div class="kpi"><div class="k">${esc(k)}</div>
+    <div class="v">${v}</div>${sub ? `<div class="d muted">${sub}</div>` : ''}</div>`;
+  h += `<div class="kpis" style="margin-top:12px">
+    ${kpi('在池', `${s.n_pool} <small class="muted">只</small>`, `过门槛 ${s.n_eligible} / 参与 ${s.n_cached}`)}
+    ${kpi('池内中位日成交额', fmt.usd(s.adv_day_median),
+    `p25 ${fmt.usd(s.adv_day_p25)} · p75 ${fmt.usd(s.adv_day_p75)}`)}
+    ${kpi('池内合计日成交额', fmt.usd(s.adv_day_total), `前 10 名占 ${fmt.pct(s.top10_share, 0)}`)}
+    ${kpi('24h 放量中位', uniChg(s.chg_median),
+    `${s.n_expanding} / ${s.n_pool} 只在放量`)}
+  </div>`;
+
+  const cats = s.cats || {};
+  const catTxt = Object.keys(cats).map((c) => `${c} ${cats[c]}`).join(' · ');
+  if (catTxt) h += `<p class="desc" style="margin:8px 0 0">池内类别：${esc(catTxt)}</p>`;
+
+  h += `<div style="margin-top:12px">${uniTableHtml(shown)}</div>`;
+
+  h += `<p class="desc" style="margin:10px 0 0">
+    池子按 <b>30 日平均成交额</b>排名取前 ${p.pit_topn}，且必须满 ${p.min_history_days} 天上市历史；
+    「放量」是最近 24h 实际成交额 ÷ 折日均值 − 1，正数代表资金在流入这个合约。
+    <span class="muted">这张表是**只读快照**：不刷新行情、不改任何引擎状态。
+    数字变了说明盘上 parquet 变了，要更新得跑「仅刷新行情」或「补齐宇宙」。</span>
+  </p>`;
+  return h;
 }
 
 function tradeTagChoices() {
